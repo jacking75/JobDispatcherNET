@@ -58,11 +58,11 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
             AddRef(); // Reference count +1 for this object
 
-            // Does any dispatcher exist occupying this worker-thread at this moment?
+            // 현재 이 작업 스레드를 차지하고 있는 디스패처가 존재하나요?
             var currentExecuter = ThreadContext.CurrentExecuter;
             if (currentExecuter is not null)
             {
-                // Just register this dispatcher in this worker-thread
+                // 이 디스패처를 이 워커 스레드에 등록하세요.
                 ThreadContext.ExecuterList.Add(this);
             }
             else
@@ -75,7 +75,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                     // Invoke all tasks of this dispatcher
                     Flush();
 
-                    // Invoke all tasks of other dispatchers registered in this thread
+                    // 이 스레드에 등록된 다른 디스패처의 모든 작업을 실행합니다.
                     while (ThreadContext.ExecuterList.Count > 0)
                     {
                         var dispatcher = ThreadContext.ExecuterList[0];
@@ -127,11 +127,10 @@ public abstract class AsyncExecutable : IAsyncDisposable
             }
 
             _jobQueue.Writer.Complete();
-            _disposeSignal.Dispose();
         }
         finally
         {
-            _disposeSignal.Release();
+            _disposeSignal.Dispose();
         }
     }
 }
