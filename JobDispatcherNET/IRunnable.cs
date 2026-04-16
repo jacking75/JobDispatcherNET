@@ -1,19 +1,15 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
 namespace JobDispatcherNET;
 
 /// <summary>
-/// Interface for objects that can be run in a worker thread
+/// Interface for objects that can be run in a dedicated worker thread.
+/// Runs on a real OS thread (not thread pool), so ThreadLocal state is preserved.
 /// </summary>
-public interface IRunnable : IAsyncDisposable
+public interface IRunnable : IDisposable
 {
     /// <summary>
-    /// Runs the work loop
+    /// Called repeatedly on the dedicated worker thread.
+    /// Use Thread.Sleep for yielding CPU instead of Task.Delay.
     /// </summary>
     /// <returns>True to continue running, false to stop</returns>
-    ValueTask<bool> RunAsync(CancellationToken cancellationToken);
+    bool Run(CancellationToken cancellationToken);
 }

@@ -1,81 +1,90 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
 namespace JobDispatcherNET;
 
 /// <summary>
-/// Manages worker threads for executing jobs
+/// Manages dedicated worker threads for executing jobs.
+/// Uses real OS threads (not thread pool) to guarantee ThreadLocal stability.
 /// </summary>
-public sealed class JobDispatcher<T> : IAsyncDisposable where T : IRunnable, new()
+public sealed class JobDispatcher<T> : IDisposable, IAsyncDisposable where T : IRunnable, new()
 {
     private readonly int _workerCount;
-    private readonly List<Task> _workerTasks = new();
+    private readonly Thread[] _threads;
     private readonly CancellationTokenSource _cts = new();
+    private int _disposed;
 
-    /// <summary>
-    /// Creates a new JobDispatcher with the specified number of worker threads
-    /// </summary>
-    /// <param name="workerCount">Number of worker threads to create</param>
     public JobDispatcher(int workerCount)
     {
         _workerCount = workerCount;
+        _threads = new Thread[workerCount];
     }
 
     /// <summary>
-    /// Starts all worker threads
+    /// Starts all worker threads and returns a Task that completes when all workers exit.
     /// </summary>
-    public async Task RunWorkerThreadsAsync()
+    public Task RunWorkerThreadsAsync()
     {
+        var tcs = new TaskCompletionSource();
+        int completed = 0;
+
         for (int i = 0; i < _workerCount; i++)
         {
-            _workerTasks.Add(RunWorkerAsync());
+            _threads[i] = new Thread(() =>
+            {
+                RunWorker();
+                if (Interlocked.Increment(ref completed) == _workerCount)
+                    tcs.TrySetResult();
+            })
+            {
+                IsBackground = true,
+                Name = $"JobWorker-{i}"
+            };
+            _threads[i].Start();
         }
 
-        await Task.WhenAll(_workerTasks);
+        return tcs.Task;
     }
 
-    private async Task RunWorkerAsync()
+    private void RunWorker()
     {
-        await using var runner = new T();
-
+        using var runner = new T();
         try
         {
             while (!_cts.Token.IsCancellationRequested)
             {
-                bool shouldContinue = await runner.RunAsync(_cts.Token);
-                if (!shouldContinue)
-                    break;
+                ThreadContext.TickCount = ThreadContext.Timer.GetCurrentTick();
 
-                // Process timer tasks
-                await Task.Delay(1, _cts.Token);
+                if (!runner.Run(_cts.Token))
+                    break;
             }
         }
-        catch (OperationCanceledException) when (_cts.Token.IsCancellationRequested)
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
         {
-            // Normal cancellation, ignore
+            // 예기치 않은 예외 — 워커가 죽기 전에 반드시 알린다
+            AsyncExecutable.OnError?.Invoke(ex);
+        }
+        finally
+        {
+            ThreadContext.Timer.Dispose();
         }
     }
 
-    /// <summary>
-    /// Stops all worker threads
-    /// </summary>
-    public async ValueTask DisposeAsync()
+    public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         _cts.Cancel();
-
-        try
+        foreach (var thread in _threads)
         {
-            if (_workerTasks.Count > 0)
-                await Task.WhenAll(_workerTasks);
+            if (thread is { IsAlive: true })
+                thread.Join(TimeSpan.FromSeconds(5));
         }
-        catch (OperationCanceledException)
-        {
-            // Ignore cancellation exceptions
-        }
-
         _cts.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 }

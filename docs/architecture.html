@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JobDispatcherNET — 아키텍처 가이드</title>
+<style>
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
+    --text: #e2e8f0; --text2: #94a3b8; --accent: #38bdf8;
+    --green: #4ade80; --orange: #fb923c; --pink: #f472b6;
+    --red: #f87171; --purple: #a78bfa; --yellow: #fbbf24;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
+  .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { font-size: 2.2rem; text-align: center; margin-bottom: .5rem; background: linear-gradient(135deg, var(--accent), var(--purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { text-align: center; color: var(--text2); margin-bottom: 3rem; font-size: 1.05rem; }
+  h2 { font-size: 1.5rem; margin: 3rem 0 1rem; padding-bottom: .5rem; border-bottom: 2px solid var(--surface2); color: var(--accent); }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 .75rem; color: var(--green); }
+  p, li { color: var(--text); margin-bottom: .75rem; }
+  ul { padding-left: 1.5rem; }
+  .card { background: var(--surface); border-radius: var(--radius); padding: 1.5rem; margin: 1.5rem 0; border: 1px solid var(--surface2); }
+  .card-title { font-weight: 700; color: var(--accent); margin-bottom: .75rem; font-size: 1.1rem; }
+  code { background: var(--surface2); padding: 2px 6px; border-radius: 4px; font-size: .9em; color: var(--green); }
+  pre { background: var(--surface); border-radius: var(--radius); padding: 1.25rem; overflow-x: auto; margin: 1rem 0; border: 1px solid var(--surface2); font-size: .85rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; color: var(--text); }
+  .keyword { color: var(--pink); }
+  .comment { color: var(--text2); }
+  .string { color: var(--yellow); }
+  .type { color: var(--accent); }
+  .anim-container { display: flex; justify-content: center; margin: 2rem 0; }
+  .anim-container svg { max-width: 100%; height: auto; }
+  .btn-group { display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; margin: 1rem 0; }
+  .btn { background: var(--surface2); color: var(--text); border: 1px solid var(--accent); border-radius: 8px; padding: .5rem 1.25rem; cursor: pointer; font-size: .9rem; transition: all .2s; }
+  .btn:hover { background: var(--accent); color: var(--bg); }
+  .btn.active { background: var(--accent); color: var(--bg); font-weight: 600; }
+  .step-indicator { text-align: center; margin: .5rem 0; color: var(--text2); font-size: .9rem; }
+  .highlight-box { background: linear-gradient(135deg, rgba(56,189,248,.1), rgba(167,139,250,.1)); border: 1px solid rgba(56,189,248,.3); border-radius: var(--radius); padding: 1.25rem; margin: 1.5rem 0; }
+  .warn-box { background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.3); border-radius: var(--radius); padding: 1.25rem; margin: 1.5rem 0; }
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.5rem 0; }
+  @media (max-width: 640px) { .comparison { grid-template-columns: 1fr; } }
+  .comparison .card { margin: 0; }
+  .toc { background: var(--surface); border-radius: var(--radius); padding: 1.5rem; margin: 2rem 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc li { margin-bottom: .4rem; }
+  footer { text-align: center; color: var(--text2); margin-top: 4rem; padding: 2rem 0; border-top: 1px solid var(--surface2); font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>JobDispatcherNET</h1>
+<p class="subtitle">Lock 없는 멀티스레드 작업 디스패처 — 아키텍처 가이드</p>
+
+<div class="toc">
+  <strong>목차</strong>
+  <ul>
+    <li><a href="#what">1. 이 라이브러리는 무엇인가?</a></li>
+    <li><a href="#problem">2. 어떤 문제를 해결하는가?</a></li>
+    <li><a href="#classes">3. 핵심 클래스 6개</a></li>
+    <li><a href="#flow">4. 작업 흐름 애니메이션</a></li>
+    <li><a href="#dotask">5. DoTask 내부 동작</a></li>
+    <li><a href="#timer">6. 타이머 (DoAsyncAfter)</a></li>
+    <li><a href="#pattern">7. 실전 패턴 — MMORPG 서버</a></li>
+    <li><a href="#summary">8. 한눈에 보는 요약</a></li>
+  </ul>
+</div>
+
+<!-- ==================== 섹션 1 ==================== -->
+<h2 id="what">1. 이 라이브러리는 무엇인가?</h2>
+
+<p><strong>JobDispatcherNET</strong>은 여러 스레드에서 작업을 동시에 처리하면서도, <code>lock</code>을 거의 사용하지 않고 안전하게 데이터를 다룰 수 있게 해주는 라이브러리입니다.</p>
+
+<div class="highlight-box">
+  <strong>핵심 아이디어:</strong> 각 객체가 자기만의 "우체통(Queue)"을 가집니다.<br>
+  외부에서는 우체통에 편지(작업)를 넣기만 하고, 실제 읽기는 한 번에 하나의 스레드만 합니다.<br>
+  → 같은 우체통의 편지는 절대 동시에 열리지 않으므로 <strong>lock이 필요 없습니다.</strong>
+</div>
+
+<!-- ==================== 섹션 2 ==================== -->
+<h2 id="problem">2. 어떤 문제를 해결하는가?</h2>
+
+<div class="comparison">
+  <div class="card">
+    <div class="card-title" style="color:var(--red)">❌ 일반적인 멀티스레드</div>
+    <p>여러 스레드가 같은 데이터에 접근 → <code>lock</code> 필요</p>
+    <pre><code><span class="keyword">lock</span> (_playerLock)
+{
+    player.Hp -= damage;  <span class="comment">// 안전하지만 느림</span>
+}</code></pre>
+    <p style="color:var(--red)">문제: lock이 많아지면 스레드끼리 서로 기다리며 성능이 떨어집니다.</p>
+  </div>
+  <div class="card">
+    <div class="card-title" style="color:var(--green)">✅ JobDispatcherNET</div>
+    <p>작업을 큐에 넣으면 알아서 직렬 처리 → <code>lock</code> 불필요</p>
+    <pre><code>player.DoAsync(() =>
+{
+    player.Hp -= damage;  <span class="comment">// lock 없이 안전!</span>
+});</code></pre>
+    <p style="color:var(--green)">해결: 같은 객체의 작업은 자동으로 순서대로 실행됩니다.</p>
+  </div>
+</div>
+
+<!-- ==================== 섹션 3 ==================== -->
+<h2 id="classes">3. 핵심 클래스 6개</h2>
+
+<div class="anim-container">
+  <svg viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+    <!-- Background -->
+    <rect width="800" height="420" rx="16" fill="#1e293b"/>
+
+    <!-- JobDispatcher -->
+    <rect x="30" y="30" width="220" height="90" rx="10" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
+    <text x="140" y="62" text-anchor="middle" fill="#38bdf8" font-size="14" font-weight="700">JobDispatcher&lt;T&gt;</text>
+    <text x="140" y="82" text-anchor="middle" fill="#94a3b8" font-size="11">전용 OS 스레드 N개 관리</text>
+    <text x="140" y="100" text-anchor="middle" fill="#94a3b8" font-size="11">ThreadLocal 안정성 보장</text>
+
+    <!-- IRunnable -->
+    <rect x="290" y="30" width="220" height="90" rx="10" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+    <text x="400" y="62" text-anchor="middle" fill="#4ade80" font-size="14" font-weight="700">IRunnable</text>
+    <text x="400" y="82" text-anchor="middle" fill="#94a3b8" font-size="11">워커 스레드의 메인 루프</text>
+    <text x="400" y="100" text-anchor="middle" fill="#94a3b8" font-size="11">bool Run(CancellationToken)</text>
+
+    <!-- ThreadContext -->
+    <rect x="550" y="30" width="220" height="90" rx="10" fill="#0f172a" stroke="#a78bfa" stroke-width="2"/>
+    <text x="660" y="62" text-anchor="middle" fill="#a78bfa" font-size="14" font-weight="700">ThreadContext</text>
+    <text x="660" y="82" text-anchor="middle" fill="#94a3b8" font-size="11">스레드별 저장소 (ThreadLocal)</text>
+    <text x="660" y="100" text-anchor="middle" fill="#94a3b8" font-size="11">Timer, TickCount, Queue</text>
+
+    <!-- AsyncExecutable -->
+    <rect x="30" y="170" width="480" height="110" rx="10" fill="#0f172a" stroke="#fb923c" stroke-width="2"/>
+    <text x="270" y="200" text-anchor="middle" fill="#fb923c" font-size="15" font-weight="700">AsyncExecutable  ⭐ 핵심 클래스</text>
+    <text x="270" y="222" text-anchor="middle" fill="#94a3b8" font-size="11">각 인스턴스가 자기만의 작업 큐(Channel)를 소유</text>
+    <text x="270" y="242" text-anchor="middle" fill="#94a3b8" font-size="11">DoAsync(action) — 큐에 작업 추가</text>
+    <text x="270" y="262" text-anchor="middle" fill="#94a3b8" font-size="11">Flush() — 큐의 모든 작업을 순서대로 실행 (1스레드)</text>
+
+    <!-- Job -->
+    <rect x="550" y="170" width="220" height="110" rx="10" fill="#0f172a" stroke="#fbbf24" stroke-width="2"/>
+    <text x="660" y="200" text-anchor="middle" fill="#fbbf24" font-size="14" font-weight="700">Job (오브젝트 풀)</text>
+    <text x="660" y="222" text-anchor="middle" fill="#94a3b8" font-size="11">Action을 감싸는 작업 단위</text>
+    <text x="660" y="242" text-anchor="middle" fill="#94a3b8" font-size="11">Rent() → Execute() → Pool 반환</text>
+    <text x="660" y="262" text-anchor="middle" fill="#94a3b8" font-size="11">힙 할당 최소화</text>
+
+    <!-- TimerQueue -->
+    <rect x="30" y="330" width="480" height="70" rx="10" fill="#0f172a" stroke="#f472b6" stroke-width="2"/>
+    <text x="270" y="358" text-anchor="middle" fill="#f472b6" font-size="14" font-weight="700">TimerQueue</text>
+    <text x="270" y="378" text-anchor="middle" fill="#94a3b8" font-size="11">DoAsyncAfter(delay, action) — 지연 실행 지원 | Stopwatch 기반 고정밀 타이머</text>
+
+    <!-- Arrows -->
+    <defs>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#94a3b8"/>
+      </marker>
+    </defs>
+    <line x1="250" y1="75" x2="285" y2="75" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <line x1="510" y1="75" x2="545" y2="75" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <line x1="140" y1="120" x2="140" y2="165" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <line x1="510" y1="225" x2="545" y2="225" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <line x1="270" y1="280" x2="270" y2="325" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- Labels -->
+    <text x="140" y="148" text-anchor="middle" fill="#94a3b8" font-size="10">생성/관리</text>
+    <text x="268" y="68" text-anchor="middle" fill="#94a3b8" font-size="10">구현</text>
+    <text x="528" y="218" text-anchor="middle" fill="#94a3b8" font-size="10">사용</text>
+    <text x="285" y="308" text-anchor="middle" fill="#94a3b8" font-size="10">스케줄</text>
+  </svg>
+</div>
+
+<div class="card">
+  <div class="card-title">각 클래스의 역할 요약</div>
+  <ul>
+    <li><code>AsyncExecutable</code> — 상속받는 클래스에 "자기만의 작업 큐"를 부여합니다. 가장 중요한 클래스.</li>
+    <li><code>JobDispatcher&lt;T&gt;</code> — 전용 OS 스레드를 N개 만들어 워커를 실행합니다.</li>
+    <li><code>IRunnable</code> — 워커 스레드의 메인 루프를 정의하는 인터페이스.</li>
+    <li><code>Job</code> — <code>Action</code>을 감싸는 작업 단위. 오브젝트 풀로 재사용됩니다.</li>
+    <li><code>TimerQueue</code> — 일정 시간 후 작업 실행을 예약합니다.</li>
+    <li><code>ThreadContext</code> — 스레드별 저장소. 각 워커 스레드의 타이머, 큐 등을 관리합니다.</li>
+  </ul>
+</div>
+
+<!-- ==================== 섹션 4 ==================== -->
+<h2 id="flow">4. 작업 흐름 애니메이션</h2>
+
+<p>아래 버튼을 눌러 각 단계를 확인하세요. 패킷이 도착해서 처리되기까지의 전체 흐름입니다.</p>
+
+<div class="btn-group">
+  <button class="btn active" onclick="showStep(0)">1. 패킷 도착</button>
+  <button class="btn" onclick="showStep(1)">2. DoAsync 호출</button>
+  <button class="btn" onclick="showStep(2)">3. 큐에 추가</button>
+  <button class="btn" onclick="showStep(3)">4. Flush 실행</button>
+  <button class="btn" onclick="showStep(4)">5. 완료</button>
+</div>
+<div class="step-indicator" id="stepText">단계 1/5: 네트워크에서 패킷이 도착합니다</div>
+
+<div class="anim-container">
+  <svg id="flowSvg" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+    <rect width="800" height="340" rx="16" fill="#1e293b"/>
+
+    <!-- Network -->
+    <rect x="20" y="130" width="120" height="60" rx="8" fill="#334155" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="80" y="155" text-anchor="middle" fill="#94a3b8" font-size="12">네트워크</text>
+    <text x="80" y="172" text-anchor="middle" fill="#94a3b8" font-size="11">IO 스레드</text>
+
+    <!-- Packet -->
+    <g id="packet">
+      <rect x="60" y="96" width="40" height="24" rx="4" fill="#fb923c"/>
+      <text x="80" y="113" text-anchor="middle" fill="#0f172a" font-size="10" font-weight="700">PKT</text>
+    </g>
+
+    <!-- Actor A -->
+    <g id="actorA">
+      <rect x="220" y="80" width="180" height="60" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
+      <text x="310" y="105" text-anchor="middle" fill="#38bdf8" font-size="13" font-weight="700">PlayerActor A</text>
+      <text x="310" y="122" text-anchor="middle" fill="#94a3b8" font-size="10">: AsyncExecutable</text>
+    </g>
+
+    <!-- Queue A -->
+    <g id="queueA">
+      <rect x="220" y="155" width="180" height="35" rx="6" fill="#334155" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="232" y="177" fill="#fbbf24" font-size="10">큐:</text>
+      <g id="queueItems">
+      </g>
+    </g>
+
+    <!-- Actor B -->
+    <g id="actorB">
+      <rect x="220" y="220" width="180" height="60" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+      <text x="310" y="245" text-anchor="middle" fill="#4ade80" font-size="13" font-weight="700">PlayerActor B</text>
+      <text x="310" y="262" text-anchor="middle" fill="#94a3b8" font-size="10">: AsyncExecutable</text>
+    </g>
+
+    <!-- Worker threads -->
+    <rect x="500" y="80" width="140" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="570" y="100" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 스레드 #1</text>
+    <text x="570" y="116" text-anchor="middle" fill="#94a3b8" font-size="10">ThreadLocal ✓</text>
+
+    <rect x="500" y="145" width="140" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="570" y="165" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 스레드 #2</text>
+    <text x="570" y="181" text-anchor="middle" fill="#94a3b8" font-size="10">ThreadLocal ✓</text>
+
+    <rect x="500" y="210" width="140" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="570" y="230" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 스레드 #3</text>
+    <text x="570" y="246" text-anchor="middle" fill="#94a3b8" font-size="10">ThreadLocal ✓</text>
+
+    <!-- Result -->
+    <g id="resultBox" style="opacity:0">
+      <rect x="660" y="100" width="120" height="50" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+      <text x="720" y="120" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="700">처리 완료!</text>
+      <text x="720" y="137" text-anchor="middle" fill="#94a3b8" font-size="10">lock 없이 안전</text>
+    </g>
+
+    <!-- Arrows (animated) -->
+    <g id="arrow1" style="opacity:0">
+      <line x1="140" y1="160" x2="215" y2="110" stroke="#fb923c" stroke-width="2" marker-end="url(#arrowO)"/>
+      <text x="170" y="125" fill="#fb923c" font-size="10">DoAsync()</text>
+    </g>
+    <g id="arrow2" style="opacity:0">
+      <line x1="310" y1="140" x2="310" y2="152" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrowY)"/>
+      <text x="340" y="148" fill="#fbbf24" font-size="10">큐 추가</text>
+    </g>
+    <g id="arrow3" style="opacity:0">
+      <line x1="400" y1="172" x2="495" y2="108" stroke="#a78bfa" stroke-width="2" marker-end="url(#arrowP)"/>
+      <text x="460" y="128" fill="#a78bfa" font-size="10">Flush()</text>
+    </g>
+    <g id="arrow4" style="opacity:0">
+      <line x1="640" y1="110" x2="655" y2="118" stroke="#4ade80" stroke-width="2" marker-end="url(#arrowG)"/>
+    </g>
+
+    <!-- Job in queue -->
+    <g id="jobInQueue" style="opacity:0">
+      <rect x="257" y="160" width="35" height="22" rx="3" fill="#fb923c"/>
+      <text x="274" y="175" text-anchor="middle" fill="#0f172a" font-size="9" font-weight="700">JOB</text>
+    </g>
+
+    <!-- Processing highlight -->
+    <rect id="processHighlight" x="498" y="78" width="144" height="54" rx="9" fill="none" stroke="#4ade80" stroke-width="3" style="opacity:0">
+      <animate id="pulseAnim" attributeName="opacity" values="0;1;0" dur="1s" repeatCount="indefinite" begin="indefinite"/>
+    </rect>
+
+    <defs>
+      <marker id="arrowO" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#fb923c"/></marker>
+      <marker id="arrowY" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#fbbf24"/></marker>
+      <marker id="arrowP" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a78bfa"/></marker>
+      <marker id="arrowG" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4ade80"/></marker>
+    </defs>
+  </svg>
+</div>
+
+<script>
+const steps = [
+  { text: '단계 1/5: 네트워크에서 패킷(PKT)이 도착합니다', show: [], hide: ['arrow1','arrow2','arrow3','arrow4','jobInQueue','resultBox','processHighlight'] },
+  { text: '단계 2/5: IO 스레드에서 해당 Actor의 DoAsync()를 호출합니다', show: ['arrow1'], hide: ['arrow2','arrow3','arrow4','jobInQueue','resultBox','processHighlight'] },
+  { text: '단계 3/5: 작업(Job)이 Actor의 큐(Channel)에 추가됩니다', show: ['arrow1','arrow2','jobInQueue'], hide: ['arrow3','arrow4','resultBox','processHighlight'] },
+  { text: '단계 4/5: 비어있는 워커 스레드가 Flush()로 큐를 비웁니다 — lock 없음!', show: ['arrow1','arrow2','arrow3','jobInQueue','processHighlight'], hide: ['arrow4','resultBox'] },
+  { text: '단계 5/5: 작업이 완료되었습니다. 다른 Actor는 동시에 병렬 처리 가능!', show: ['arrow1','arrow2','arrow3','arrow4','resultBox'], hide: ['jobInQueue','processHighlight'] },
+];
+let currentStep = 0;
+function showStep(idx) {
+  currentStep = idx;
+  const s = steps[idx];
+  document.getElementById('stepText').textContent = s.text;
+  s.show.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.style.opacity = '1'; el.style.transition = 'opacity .4s'; }
+  });
+  s.hide.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.style.opacity = '0'; el.style.transition = 'opacity .4s'; }
+  });
+  if (idx === 3) document.getElementById('pulseAnim').beginElement();
+  document.querySelectorAll('.btn-group .btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+}
+</script>
+
+<!-- ==================== 섹션 5 ==================== -->
+<h2 id="dotask">5. DoTask 내부 동작</h2>
+
+<p><code>DoTask()</code>는 AsyncExecutable의 심장입니다. 3가지 시나리오를 단계별 애니메이션으로 살펴보세요.</p>
+
+<div class="btn-group" id="scenarioBtns">
+  <button class="btn active" onclick="setScenario(0)">시나리오 A: 첫 작업 (주인 획득)</button>
+  <button class="btn" onclick="setScenario(1)">시나리오 B: 작업 추가 (이미 처리 중)</button>
+  <button class="btn" onclick="setScenario(2)">시나리오 C: 다른 객체의 작업</button>
+</div>
+
+<div style="display:flex;align-items:center;justify-content:center;gap:1rem;margin:.75rem 0">
+  <button class="btn" onclick="dtPrev()" id="dtPrevBtn" disabled style="padding:.4rem 1rem">◀ 이전</button>
+  <span class="step-indicator" id="dtStepText" style="min-width:420px;text-align:center">단계를 시작하려면 ▶ 다음을 누르세요</span>
+  <button class="btn" onclick="dtNext()" id="dtNextBtn">다음 ▶</button>
+</div>
+
+<div class="anim-container">
+<svg id="dtSvg" viewBox="0 0 820 500" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+  <rect width="820" height="500" rx="16" fill="#1e293b"/>
+
+  <!-- ===== 왼쪽: AsyncExecutable 객체 시각화 ===== -->
+  <!-- 객체 박스 -->
+  <rect x="30" y="30" width="340" height="440" rx="12" fill="#0f172a" stroke="#fb923c" stroke-width="2"/>
+  <text x="200" y="58" text-anchor="middle" fill="#fb923c" font-size="15" font-weight="700">AsyncExecutable 객체</text>
+
+  <!-- count 표시 -->
+  <rect x="50" y="75" width="300" height="44" rx="8" fill="#334155"/>
+  <text x="80" y="102" fill="#fbbf24" font-size="13" font-weight="600">_remainingTaskCount =</text>
+  <rect id="dtCount" x="278" y="82" width="56" height="28" rx="6" fill="#0f172a" stroke="#fbbf24" stroke-width="2"/>
+  <text id="dtCountVal" x="306" y="102" text-anchor="middle" fill="#fbbf24" font-size="16" font-weight="700">0</text>
+
+  <!-- 큐 시각화 -->
+  <text x="60" y="148" fill="#94a3b8" font-size="12">작업 큐 (Channel):</text>
+  <rect x="50" y="158" width="300" height="50" rx="8" fill="#334155" stroke="#94a3b8" stroke-width="1"/>
+  <text id="dtQueueEmpty" x="200" y="188" text-anchor="middle" fill="#94a3b8" font-size="11" font-style="italic">비어있음</text>
+
+  <!-- 큐 슬롯들 -->
+  <g id="dtSlot0" style="opacity:0"><rect x="60" y="165" width="60" height="36" rx="5" fill="#fb923c"/><text x="90" y="188" text-anchor="middle" fill="#0f172a" font-size="10" font-weight="700">JOB 1</text></g>
+  <g id="dtSlot1" style="opacity:0"><rect x="128" y="165" width="60" height="36" rx="5" fill="#38bdf8"/><text x="158" y="188" text-anchor="middle" fill="#0f172a" font-size="10" font-weight="700">JOB 2</text></g>
+  <g id="dtSlot2" style="opacity:0"><rect x="196" y="165" width="60" height="36" rx="5" fill="#a78bfa"/><text x="226" y="188" text-anchor="middle" fill="#0f172a" font-size="10" font-weight="700">JOB 3</text></g>
+
+  <!-- Flush 영역 -->
+  <rect id="dtFlushBox" x="50" y="225" width="300" height="100" rx="8" fill="#0f172a" stroke="#94a3b8" stroke-width="1" stroke-dasharray="5"/>
+  <text x="200" y="250" text-anchor="middle" fill="#94a3b8" font-size="12">Flush() 실행 영역</text>
+  <text id="dtFlushStatus" x="200" y="275" text-anchor="middle" fill="#94a3b8" font-size="11" font-style="italic">대기 중</text>
+
+  <!-- Flush 실행 중 애니메이션 블록 -->
+  <g id="dtFlushJob" style="opacity:0">
+    <rect x="120" y="285" width="160" height="30" rx="6" fill="#4ade80" opacity=".15" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="200" y="305" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="700" id="dtFlushJobText">job.Execute() 실행 중</text>
+  </g>
+
+  <!-- CurrentExecuter 표시 -->
+  <rect x="50" y="345" width="300" height="44" rx="8" fill="#334155"/>
+  <text x="68" y="372" fill="#a78bfa" font-size="12" font-weight="600">ThreadContext.CurrentExecuter =</text>
+  <text id="dtCurExec" x="338" y="372" text-anchor="end" fill="#a78bfa" font-size="12" font-weight="700">null</text>
+
+  <!-- ExecuterQueue -->
+  <rect x="50" y="405" width="300" height="50" rx="8" fill="#334155"/>
+  <text x="68" y="428" fill="#94a3b8" font-size="11">ExecuterQueue:</text>
+  <text id="dtExecQueue" x="190" y="443" text-anchor="start" fill="#94a3b8" font-size="11" font-style="italic">비어있음</text>
+
+  <!-- ===== 오른쪽: 스레드 시각화 ===== -->
+  <rect x="410" y="30" width="380" height="440" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="2"/>
+  <text x="600" y="58" text-anchor="middle" fill="#a78bfa" font-size="15" font-weight="700">스레드 상황</text>
+
+  <!-- 스레드 A -->
+  <rect id="dtThreadA" x="430" y="80" width="340" height="70" rx="8" fill="#334155" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="450" y="104" fill="#38bdf8" font-size="13" font-weight="700">스레드 A (워커 #1)</text>
+  <text id="dtThreadAStatus" x="450" y="124" fill="#94a3b8" font-size="11">유휴 상태</text>
+  <!-- 동작 표시기 -->
+  <circle id="dtThreadADot" cx="750" cy="115" r="8" fill="#94a3b8"/>
+
+  <!-- 스레드 B -->
+  <rect id="dtThreadB" x="430" y="170" width="340" height="70" rx="8" fill="#334155" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="450" y="194" fill="#4ade80" font-size="13" font-weight="700">스레드 B (워커 #2)</text>
+  <text id="dtThreadBStatus" x="450" y="214" fill="#94a3b8" font-size="11">유휴 상태</text>
+  <circle id="dtThreadBDot" cx="750" cy="205" r="8" fill="#94a3b8"/>
+
+  <!-- 설명 패널 -->
+  <rect id="dtExplainBox" x="430" y="270" width="340" height="180" rx="10" fill="#1e293b" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="600" y="298" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">무슨 일이 일어나고 있나?</text>
+  <text id="dtExL1" x="450" y="322" fill="#e2e8f0" font-size="11"></text>
+  <text id="dtExL2" x="450" y="342" fill="#e2e8f0" font-size="11"></text>
+  <text id="dtExL3" x="450" y="362" fill="#94a3b8" font-size="11"></text>
+  <text id="dtExL4" x="450" y="382" fill="#94a3b8" font-size="11"></text>
+  <text id="dtExL5" x="450" y="402" fill="#4ade80" font-size="11" font-weight="600"></text>
+  <text id="dtExL6" x="450" y="422" fill="#4ade80" font-size="11" font-weight="600"></text>
+</svg>
+</div>
+
+<script>
+// DoTask interactive animation engine
+const T = .35; // transition seconds
+const scenarios = [
+  // === Scenario A: 첫 작업 (주인 획득) ===
+  { title: 'A', steps: [
+    { text:'A-1/6: 스레드 A가 DoAsync(job1)을 호출합니다',
+      count:'0', slots:[0,0,0], qe:'', flush:'대기 중', flushJob:0, curExec:'null',
+      thA:'DoAsync(job1) 호출 중...', thADot:'#fbbf24', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#fbbf24', thBStroke:'#94a3b8',
+      ex:['스레드 A가 DoAsync()를 호출했습니다.','내부적으로 Job.Rent()로 풀에서 Job을 빌리고','DoTask(job)을 호출합니다.','','',''] },
+    { text:'A-2/6: Interlocked.Increment로 count를 0→1로 올립니다',
+      count:'1', slots:[0,0,0], qe:'', flush:'대기 중', flushJob:0, curExec:'null',
+      thA:'count 증가: 0 → 1', thADot:'#fbbf24', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#fbbf24', thBStroke:'#94a3b8',
+      ex:['count가 0에서 1이 되었습니다 (0→1).','결과가 1이므로 ">" 1 조건은 거짓!','이 스레드가 첫 번째 작업을 넣는 것이므로','직접 처리할 자격을 얻습니다.','',''] },
+    { text:'A-3/6: 큐에 job1을 추가하고, CurrentExecuter가 없으므로 주인이 됩니다',
+      count:'1', slots:[1,0,0], qe:'', flush:'대기 중', flushJob:0, curExec:'this ✓',
+      thA:'큐 추가 + 주인 획득!', thADot:'#38bdf8', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#38bdf8', thBStroke:'#94a3b8',
+      ex:['큐에 job1을 추가했습니다.','CurrentExecuter가 null이므로...','이 스레드가 "주인"이 됩니다!','CurrentExecuter = this 로 설정.','→ 다른 스레드는 이제 여기 들어올 수 없습니다.',''] },
+    { text:'A-4/6: Flush() 시작 — 큐에서 job1을 꺼내 실행합니다',
+      count:'1', slots:[0,0,0], qe:'', flush:'실행 중', flushJob:1, curExec:'this ✓',
+      thA:'Flush() → job1.Execute()', thADot:'#4ade80', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['Flush()가 큐에서 job1을 TryRead합니다.','job1.Execute() 실행!','실행이 끝나면 count를 Decrement합니다.','','',''] },
+    { text:'A-5/6: job1 완료, count가 1→0이 되어 Flush 종료',
+      count:'0', slots:[0,0,0], qe:'', flush:'완료!', flushJob:0, curExec:'this ✓',
+      thA:'Flush 완료, count = 0', thADot:'#4ade80', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['Decrement 결과가 0입니다!','→ 더 이상 처리할 작업이 없으므로','Flush() 루프를 탈출합니다.','','',''] },
+    { text:'A-6/6: CurrentExecuter를 null로 해제 — 완료!',
+      count:'0', slots:[0,0,0], qe:'', flush:'대기 중', flushJob:0, curExec:'null',
+      thA:'주인 해제, 유휴 복귀', thADot:'#94a3b8', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#94a3b8', thBStroke:'#94a3b8',
+      ex:['finally 블록에서 CurrentExecuter = null.','스레드 A는 주인을 반납하고','다시 유휴 상태로 돌아갑니다.','','✓ 전체 과정에서 lock은 한 번도 안 썼습니다!',''] },
+  ]},
+  // === Scenario B: 이미 처리 중일 때 추가 ===
+  { title: 'B', steps: [
+    { text:'B-1/5: 스레드 A가 이미 Flush() 중입니다 (count=1)',
+      count:'1', slots:[0,0,0], qe:'', flush:'실행 중', flushJob:1, curExec:'this ✓',
+      thA:'Flush() 실행 중 (job1)', thADot:'#4ade80', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['스레드 A가 이 객체를 Flush 중입니다.','count는 1, 큐에서 job1을 꺼내 실행 중.','이때 스레드 B에서 새 작업이 들어옵니다...','','',''] },
+    { text:'B-2/5: 스레드 B가 DoAsync(job2) 호출 → count 1→2',
+      count:'2', slots:[0,0,0], qe:'', flush:'실행 중', flushJob:1, curExec:'this ✓',
+      thA:'Flush() 계속 중 (job1)', thADot:'#4ade80', thB:'DoAsync(job2) → count 1→2', thBDot:'#fbbf24',
+      thAStroke:'#4ade80', thBStroke:'#fbbf24',
+      ex:['스레드 B가 Increment → count가 2가 됩니다.','count > 1 이므로...','누군가 이미 처리 중이라는 뜻!','스레드 B는 큐에 넣기만 하면 됩니다.','',''] },
+    { text:'B-3/5: 스레드 B는 큐에 job2만 넣고 즉시 돌아갑니다',
+      count:'2', slots:[0,1,0], qe:'', flush:'실행 중', flushJob:1, curExec:'this ✓',
+      thA:'Flush() 계속 중 (job1)', thADot:'#4ade80', thB:'큐에 추가 완료 → 복귀!', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['스레드 B: TryWrite(job2) → 큐에 추가.','그리고 바로 return! 기다리지 않습니다.','','스레드 B는 자유롭게 다른 일을 할 수 있습니다.','→ lock 대기가 전혀 없습니다!',''] },
+    { text:'B-4/5: 스레드 A가 job1 끝 → count 2→1 → 계속 Flush → job2 실행',
+      count:'1', slots:[0,0,0], qe:'', flush:'실행 중', flushJob:1, curExec:'this ✓',
+      thA:'job1 완료 → job2 처리 중', thADot:'#4ade80', thB:'다른 일 처리 중...', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['스레드 A: job1 완료, Decrement → 2→1.','count가 아직 0이 아니므로 Flush 계속!','큐에서 job2를 꺼내서 실행합니다.','','핵심: 스레드 B가 넣은 작업을','스레드 A가 대신 처리해줍니다!'] },
+    { text:'B-5/5: job2 완료 → count 0 → Flush 종료',
+      count:'0', slots:[0,0,0], qe:'', flush:'완료!', flushJob:0, curExec:'null',
+      thA:'Flush 완료, 주인 해제', thADot:'#94a3b8', thB:'다른 일 처리 중...', thBDot:'#94a3b8',
+      thAStroke:'#94a3b8', thBStroke:'#94a3b8',
+      ex:['Decrement → 1→0. Flush 종료!','CurrentExecuter = null.','','✓ 스레드 B는 한 번도 기다리지 않았습니다.','✓ 두 작업 모두 lock 없이 순서대로 처리!',''] },
+  ]},
+  // === Scenario C: 다른 객체의 작업 ===
+  { title: 'C', steps: [
+    { text:'C-1/5: 스레드 A가 객체X를 Flush 중, 그 안에서 객체Y.DoAsync() 호출',
+      count:'0', slots:[0,0,0], qe:'', flush:'실행 중 (객체X)', flushJob:1, curExec:'객체X',
+      thA:'Flush(객체X) → 콜백에서 객체Y.DoAsync()', thADot:'#4ade80', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['스레드 A가 객체X를 Flush 중입니다.','job 콜백 안에서 다른 객체Y의','DoAsync(job3)를 호출합니다.','','예: 전사 Actor → 마법사 Actor 공격',''] },
+    { text:'C-2/5: 객체Y의 count 0→1 → 큐에 추가',
+      count:'1', slots:[0,0,1], qe:'', flush:'실행 중 (객체X)', flushJob:1, curExec:'객체X',
+      thA:'객체Y.DoTask(job3) 진입', thADot:'#fbbf24', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#fbbf24', thBStroke:'#94a3b8',
+      ex:['객체Y의 count: 0→1 (첫 작업).','큐에 job3를 추가합니다.','','그런데 CurrentExecuter를 확인하면...','객체X가 이미 주인으로 설정되어 있습니다!',''] },
+    { text:'C-3/5: CurrentExecuter가 있으므로 → ExecuterQueue에 등록만!',
+      count:'1', slots:[0,0,1], qe:'객체Y', flush:'실행 중 (객체X)', flushJob:1, curExec:'객체X',
+      thA:'객체Y를 ExecuterQueue에 등록', thADot:'#a78bfa', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#a78bfa', thBStroke:'#94a3b8',
+      ex:['CurrentExecuter ≠ null 이므로','객체Y를 ExecuterQueue에 넣습니다.','','→ "나중에 처리해줘" 라는 뜻입니다.','지금은 객체X 처리가 우선이니까요.',''] },
+    { text:'C-4/5: 객체X의 Flush 완료 → ExecuterQueue에서 객체Y를 꺼내 Flush!',
+      count:'1', slots:[0,0,1], qe:'(처리 중)', flush:'객체Y Flush 시작', flushJob:0, curExec:'객체X',
+      thA:'객체X 완료 → 객체Y Flush 시작!', thADot:'#4ade80', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#4ade80', thBStroke:'#94a3b8',
+      ex:['객체X Flush 완료 후,','while 루프에서 ExecuterQueue를 확인합니다.','객체Y가 있으므로 꺼내서 Flush!','','→ 같은 스레드에서 자연스럽게 이어서 처리.',''] },
+    { text:'C-5/5: 객체Y도 Flush 완료 → 모두 끝, 주인 해제',
+      count:'0', slots:[0,0,0], qe:'', flush:'모두 완료!', flushJob:0, curExec:'null',
+      thA:'모든 Flush 완료, 주인 해제', thADot:'#94a3b8', thB:'유휴 상태', thBDot:'#94a3b8',
+      thAStroke:'#94a3b8', thBStroke:'#94a3b8',
+      ex:['객체Y의 job3 실행 → count 0.','ExecuterQueue 비어있음 → 루프 종료.','CurrentExecuter = null.','','✓ 객체X와 Y 모두 같은 스레드에서','✓ lock 없이 순서대로 처리 완료!'] },
+  ]},
+];
+
+let dtScenario = 0, dtStep = -1;
+
+function setScenario(idx) {
+  dtScenario = idx; dtStep = -1;
+  document.getElementById('dtStepText').textContent = '단계를 시작하려면 ▶ 다음을 누르세요';
+  document.getElementById('dtPrevBtn').disabled = true;
+  document.getElementById('dtNextBtn').disabled = false;
+  document.querySelectorAll('#scenarioBtns .btn').forEach((b,i) => b.classList.toggle('active', i===idx));
+  // Reset visuals
+  applyDtState({count:'0',slots:[0,0,0],qe:'',flush:'대기 중',flushJob:0,curExec:'null',
+    thA:'유휴 상태',thADot:'#94a3b8',thB:'유휴 상태',thBDot:'#94a3b8',
+    thAStroke:'#94a3b8',thBStroke:'#94a3b8',ex:['','','시나리오를 선택하고','▶ 다음 버튼을 눌러주세요.','','']});
+}
+
+function dtNext() {
+  const sc = scenarios[dtScenario];
+  if (dtStep < sc.steps.length - 1) { dtStep++; applyDtStep(); }
+}
+function dtPrev() {
+  if (dtStep > 0) { dtStep--; applyDtStep(); }
+}
+
+function applyDtStep() {
+  const sc = scenarios[dtScenario];
+  const s = sc.steps[dtStep];
+  document.getElementById('dtStepText').textContent = s.text;
+  document.getElementById('dtPrevBtn').disabled = dtStep === 0;
+  document.getElementById('dtNextBtn').disabled = dtStep === sc.steps.length - 1;
+  applyDtState(s);
+}
+
+function applyDtState(s) {
+  const tr = `all ${T}s ease`;
+  // Count
+  const cv = document.getElementById('dtCountVal');
+  const cb = document.getElementById('dtCount');
+  cv.textContent = s.count;
+  cb.style.transition = tr;
+  cb.setAttribute('stroke', s.count === '0' ? '#fbbf24' : (parseInt(s.count) > 1 ? '#f87171' : '#4ade80'));
+
+  // Queue slots
+  ['dtSlot0','dtSlot1','dtSlot2'].forEach((id,i) => {
+    const el = document.getElementById(id);
+    el.style.transition = `opacity ${T}s ease`;
+    el.style.opacity = s.slots[i] ? '1' : '0';
+  });
+  document.getElementById('dtQueueEmpty').style.opacity = s.slots.every(v=>!v) ? '1' : '0';
+
+  // Flush
+  const fb = document.getElementById('dtFlushBox');
+  const fs = document.getElementById('dtFlushStatus');
+  const fj = document.getElementById('dtFlushJob');
+  fs.textContent = s.flush;
+  fs.setAttribute('fill', s.flush.includes('실행') ? '#4ade80' : (s.flush.includes('완료') ? '#38bdf8' : '#94a3b8'));
+  fb.setAttribute('stroke', s.flush.includes('실행') ? '#4ade80' : '#94a3b8');
+  fj.style.transition = `opacity ${T}s`; fj.style.opacity = s.flushJob ? '1' : '0';
+
+  // CurrentExecuter
+  const ce = document.getElementById('dtCurExec');
+  ce.textContent = s.curExec;
+  ce.setAttribute('fill', s.curExec === 'null' ? '#94a3b8' : '#38bdf8');
+
+  // ExecuterQueue
+  const eq = document.getElementById('dtExecQueue');
+  eq.textContent = s.qe || '비어있음';
+  eq.setAttribute('fill', s.qe ? '#a78bfa' : '#94a3b8');
+  eq.style.fontStyle = s.qe ? 'normal' : 'italic';
+
+  // Threads
+  document.getElementById('dtThreadAStatus').textContent = s.thA;
+  document.getElementById('dtThreadADot').setAttribute('fill', s.thADot);
+  document.getElementById('dtThreadA').setAttribute('stroke', s.thAStroke);
+  document.getElementById('dtThreadBStatus').textContent = s.thB;
+  document.getElementById('dtThreadBDot').setAttribute('fill', s.thBDot);
+  document.getElementById('dtThreadB').setAttribute('stroke', s.thBStroke);
+
+  // Explain
+  for (let i = 1; i <= 6; i++) {
+    document.getElementById('dtExL'+i).textContent = s.ex[i-1] || '';
+  }
+}
+// Init
+setScenario(0);
+</script>
+
+<div class="highlight-box">
+  <strong>핵심 포인트 정리:</strong>
+  <ul style="margin-top:.5rem">
+    <li><strong>시나리오 A</strong> — count가 0→1이면 이 스레드가 "주인"이 되어 직접 Flush합니다.</li>
+    <li><strong>시나리오 B</strong> — count &gt; 1이면 큐에만 넣고 <em>즉시 돌아갑니다</em>. 기다리는 시간 = 0. 이미 Flush 중인 스레드가 대신 처리.</li>
+    <li><strong>시나리오 C</strong> — Flush 중에 다른 객체의 DoAsync가 호출되면 ExecuterQueue에 등록하고, 현재 Flush가 끝난 후 이어서 처리합니다.</li>
+  </ul>
+  <p style="margin-top:.75rem;color:var(--green)"><strong>→ 어떤 시나리오에서도 lock이나 대기가 없습니다. 이것이 JobDispatcherNET의 핵심입니다.</strong></p>
+</div>
+
+<!-- ==================== 섹션 6 ==================== -->
+<h2 id="timer">6. 타이머 (DoAsyncAfter)</h2>
+
+<div class="anim-container">
+  <svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+    <rect width="700" height="200" rx="16" fill="#1e293b"/>
+
+    <!-- Timeline -->
+    <line x1="50" y1="100" x2="650" y2="100" stroke="#94a3b8" stroke-width="2"/>
+
+    <!-- Now -->
+    <circle cx="80" cy="100" r="6" fill="#38bdf8"/>
+    <text x="80" y="85" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="700">현재</text>
+
+    <!-- DoAsyncAfter call -->
+    <rect x="120" y="35" width="160" height="40" rx="6" fill="#0f172a" stroke="#f472b6" stroke-width="1.5"/>
+    <text x="200" y="60" text-anchor="middle" fill="#f472b6" font-size="11">DoAsyncAfter(5초, 부활)</text>
+    <line x1="200" y1="75" x2="200" y2="94" stroke="#f472b6" stroke-width="1.5" marker-end="url(#arwPk)"/>
+
+    <!-- Timer ticking -->
+    <g>
+      <circle cx="250" cy="100" r="3" fill="#94a3b8"><animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0s"/></circle>
+      <circle cx="300" cy="100" r="3" fill="#94a3b8"><animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.3s"/></circle>
+      <circle cx="350" cy="100" r="3" fill="#94a3b8"><animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.6s"/></circle>
+      <circle cx="400" cy="100" r="3" fill="#94a3b8"><animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="0.9s"/></circle>
+      <circle cx="450" cy="100" r="3" fill="#94a3b8"><animate attributeName="opacity" values="0;1;0" dur="2s" repeatCount="indefinite" begin="1.2s"/></circle>
+    </g>
+    <text x="350" y="130" text-anchor="middle" fill="#94a3b8" font-size="10">⏱ PriorityQueue에서 대기 중...</text>
+
+    <!-- Fire! -->
+    <circle cx="530" cy="100" r="8" fill="#4ade80">
+      <animate attributeName="r" values="6;10;6" dur="1s" repeatCount="indefinite"/>
+    </circle>
+    <text x="530" y="85" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="700">5초 후!</text>
+
+    <!-- DoTask -->
+    <rect x="570" y="35" width="110" height="40" rx="6" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="625" y="55" text-anchor="middle" fill="#4ade80" font-size="11">DoTask(부활)</text>
+    <text x="625" y="68" text-anchor="middle" fill="#94a3b8" font-size="9">→ Actor 큐로 전달</text>
+    <line x1="530" y1="92" x2="580" y2="75" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arwG2)"/>
+
+    <defs>
+      <marker id="arwPk" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f472b6"/></marker>
+      <marker id="arwG2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4ade80"/></marker>
+    </defs>
+  </svg>
+</div>
+
+<div class="card">
+  <div class="card-title">TimerQueue 동작 원리</div>
+  <ol>
+    <li><code>DoAsyncAfter(5초, action)</code> 호출 → PriorityQueue에 (dueTime, job) 저장</li>
+    <li>백그라운드 PeriodicTimer가 1ms마다 깨어나서 만료된 작업을 확인</li>
+    <li>시간이 되면 <code>owner.DoTask(job)</code> 호출 → 해당 AsyncExecutable의 큐로 전달</li>
+    <li>이후는 일반 DoAsync와 동일하게 워커 스레드에서 처리</li>
+  </ol>
+  <p><strong>Stopwatch 기반</strong>이므로 <code>DateTime.UtcNow</code>(~15ms)보다 훨씬 정밀합니다.</p>
+</div>
+
+<!-- ==================== 섹션 7 ==================== -->
+<h2 id="pattern">7. 실전 패턴 — MMORPG 서버</h2>
+
+<p>아래는 존이 1개인 MMORPG에서 플레이어 Actor 패턴을 적용한 예시입니다.</p>
+
+<div class="btn-group">
+  <button class="btn active" onclick="showScene(0)">이동 (병렬)</button>
+  <button class="btn" onclick="showScene(1)">근접 공격</button>
+  <button class="btn" onclick="showScene(2)">범위 공격 (AoE)</button>
+</div>
+
+<div class="anim-container">
+  <svg id="sceneSvg" viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+    <rect width="760" height="300" rx="16" fill="#1e293b"/>
+
+    <!-- Scene 0: Move parallel -->
+    <g id="scene0">
+      <text x="380" y="30" text-anchor="middle" fill="#38bdf8" font-size="14" font-weight="700">이동 — 각 Actor에서 병렬 처리</text>
+
+      <!-- Player A -->
+      <rect x="40" y="60" width="200" height="50" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
+      <text x="140" y="85" text-anchor="middle" fill="#38bdf8" font-size="12">전사 Actor</text>
+      <text x="140" y="100" text-anchor="middle" fill="#94a3b8" font-size="10">DoAsync(이동 50,50→60,70)</text>
+
+      <!-- Player B -->
+      <rect x="40" y="130" width="200" height="50" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+      <text x="140" y="155" text-anchor="middle" fill="#4ade80" font-size="12">마법사 Actor</text>
+      <text x="140" y="170" text-anchor="middle" fill="#94a3b8" font-size="10">DoAsync(이동 30,20→40,30)</text>
+
+      <!-- Player C -->
+      <rect x="40" y="200" width="200" height="50" rx="8" fill="#0f172a" stroke="#fb923c" stroke-width="2"/>
+      <text x="140" y="225" text-anchor="middle" fill="#fb923c" font-size="12">궁수 Actor</text>
+      <text x="140" y="240" text-anchor="middle" fill="#94a3b8" font-size="10">DoAsync(이동 70,80→75,85)</text>
+
+      <!-- Workers -->
+      <rect x="340" y="60" width="130" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="405" y="85" text-anchor="middle" fill="#a78bfa" font-size="11">워커 #1</text>
+      <text x="405" y="100" text-anchor="middle" fill="#94a3b8" font-size="9">Flush(전사)</text>
+
+      <rect x="340" y="130" width="130" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="405" y="155" text-anchor="middle" fill="#a78bfa" font-size="11">워커 #2</text>
+      <text x="405" y="170" text-anchor="middle" fill="#94a3b8" font-size="9">Flush(마법사)</text>
+
+      <rect x="340" y="200" width="130" height="50" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="405" y="225" text-anchor="middle" fill="#a78bfa" font-size="11">워커 #3</text>
+      <text x="405" y="240" text-anchor="middle" fill="#94a3b8" font-size="9">Flush(궁수)</text>
+
+      <!-- Arrows -->
+      <line x1="240" y1="85" x2="335" y2="85" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="4"/>
+      <line x1="240" y1="155" x2="335" y2="155" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="4"/>
+      <line x1="240" y1="225" x2="335" y2="225" stroke="#fb923c" stroke-width="1.5" stroke-dasharray="4"/>
+
+      <!-- Parallel badge -->
+      <rect x="540" y="110" width="190" height="80" rx="10" fill="#334155"/>
+      <text x="635" y="138" text-anchor="middle" fill="#4ade80" font-size="15" font-weight="700">✓ 완전 병렬!</text>
+      <text x="635" y="158" text-anchor="middle" fill="#94a3b8" font-size="11">각 Actor는 독립적</text>
+      <text x="635" y="175" text-anchor="middle" fill="#94a3b8" font-size="11">자기 큐만 접근 → lock 불필요</text>
+    </g>
+
+    <!-- Scene 1: Melee attack -->
+    <g id="scene1" style="display:none">
+      <text x="380" y="30" text-anchor="middle" fill="#fb923c" font-size="14" font-weight="700">근접 공격 — 스냅샷 전달 패턴</text>
+
+      <!-- Attacker Actor -->
+      <rect x="30" y="70" width="180" height="80" rx="8" fill="#0f172a" stroke="#f87171" stroke-width="2"/>
+      <text x="120" y="95" text-anchor="middle" fill="#f87171" font-size="13" font-weight="700">전사 Actor</text>
+      <text x="120" y="115" text-anchor="middle" fill="#94a3b8" font-size="10">1. DoAsync: 스냅샷 캡처</text>
+      <text x="120" y="132" text-anchor="middle" fill="#fbbf24" font-size="9">{pos, attack} 복사</text>
+
+      <!-- Snapshot -->
+      <rect x="260" y="85" width="100" height="50" rx="6" fill="#fbbf24"/>
+      <text x="310" y="107" text-anchor="middle" fill="#0f172a" font-size="11" font-weight="700">스냅샷</text>
+      <text x="310" y="122" text-anchor="middle" fill="#0f172a" font-size="9">불변 데이터</text>
+
+      <line x1="210" y1="110" x2="255" y2="110" stroke="#fbbf24" stroke-width="2" stroke-dasharray="4"/>
+
+      <!-- Target Actor -->
+      <rect x="420" y="70" width="180" height="80" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+      <text x="510" y="95" text-anchor="middle" fill="#4ade80" font-size="13" font-weight="700">마법사 Actor</text>
+      <text x="510" y="115" text-anchor="middle" fill="#94a3b8" font-size="10">2. DoAsync: 데미지 적용</text>
+      <text x="510" y="132" text-anchor="middle" fill="#94a3b8" font-size="9">HP -= 스냅샷.attack</text>
+
+      <line x1="360" y1="110" x2="415" y2="110" stroke="#4ade80" stroke-width="2" stroke-dasharray="4"/>
+      <text x="388" y="102" text-anchor="middle" fill="#fbbf24" font-size="9">전달</text>
+
+      <!-- Explanation -->
+      <rect x="100" y="190" width="520" height="90" rx="10" fill="#334155"/>
+      <text x="360" y="218" text-anchor="middle" fill="#fb923c" font-size="12" font-weight="700">왜 스냅샷을 사용할까?</text>
+      <text x="360" y="240" text-anchor="middle" fill="#94a3b8" font-size="11">전사와 마법사는 서로 다른 Actor → 서로 다른 스레드에서 처리 가능</text>
+      <text x="360" y="258" text-anchor="middle" fill="#94a3b8" font-size="11">전사 상태를 스냅샷(불변 복사본)으로 만들어 마법사 Actor에 전달</text>
+      <text x="360" y="275" text-anchor="middle" fill="#4ade80" font-size="11">→ 양쪽 모두 자기 큐에서만 상태 변경 → lock 불필요!</text>
+    </g>
+
+    <!-- Scene 2: AoE -->
+    <g id="scene2" style="display:none">
+      <text x="380" y="30" text-anchor="middle" fill="#a78bfa" font-size="14" font-weight="700">범위 공격 (AoE) — 다대다 병렬 처리</text>
+
+      <!-- Attacker -->
+      <rect x="30" y="60" width="160" height="65" rx="8" fill="#0f172a" stroke="#f87171" stroke-width="2"/>
+      <text x="110" y="85" text-anchor="middle" fill="#f87171" font-size="12" font-weight="700">마법사 Actor</text>
+      <text x="110" y="103" text-anchor="middle" fill="#94a3b8" font-size="9">1. 스냅샷 캡처</text>
+      <text x="110" y="116" text-anchor="middle" fill="#94a3b8" font-size="9">2. SpatialIndex 조회</text>
+
+      <!-- Spatial Index -->
+      <rect x="230" y="55" width="150" height="40" rx="6" fill="#334155" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="305" y="80" text-anchor="middle" fill="#fbbf24" font-size="11">SpatialIndex 조회</text>
+      <line x1="190" y1="82" x2="225" y2="75" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4"/>
+
+      <!-- Fan out -->
+      <line x1="380" y1="75" x2="450" y2="55" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4"/>
+      <line x1="380" y1="75" x2="450" y2="105" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4"/>
+      <line x1="380" y1="75" x2="450" y2="155" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4"/>
+
+      <!-- Target Actors -->
+      <rect x="450" y="35" width="140" height="40" rx="6" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="520" y="55" text-anchor="middle" fill="#4ade80" font-size="10">전사 Actor</text>
+      <text x="520" y="68" text-anchor="middle" fill="#94a3b8" font-size="9">ReceiveAreaDamage</text>
+
+      <rect x="450" y="85" width="140" height="40" rx="6" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="520" y="105" text-anchor="middle" fill="#4ade80" font-size="10">궁수 Actor</text>
+      <text x="520" y="118" text-anchor="middle" fill="#94a3b8" font-size="9">ReceiveAreaDamage</text>
+
+      <rect x="450" y="135" width="140" height="40" rx="6" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="520" y="155" text-anchor="middle" fill="#4ade80" font-size="10">도적 Actor</text>
+      <text x="520" y="168" text-anchor="middle" fill="#94a3b8" font-size="9">ReceiveAreaDamage</text>
+
+      <!-- Workers -->
+      <rect x="620" y="35" width="110" height="40" rx="6" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+      <text x="675" y="60" text-anchor="middle" fill="#a78bfa" font-size="10">워커#1</text>
+
+      <rect x="620" y="85" width="110" height="40" rx="6" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+      <text x="675" y="110" text-anchor="middle" fill="#a78bfa" font-size="10">워커#2</text>
+
+      <rect x="620" y="135" width="110" height="40" rx="6" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+      <text x="675" y="160" text-anchor="middle" fill="#a78bfa" font-size="10">워커#3</text>
+
+      <line x1="590" y1="55" x2="615" y2="55" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3"/>
+      <line x1="590" y1="105" x2="615" y2="105" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3"/>
+      <line x1="590" y1="155" x2="615" y2="155" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3"/>
+
+      <!-- Explanation -->
+      <rect x="50" y="200" width="660" height="85" rx="10" fill="#334155"/>
+      <text x="380" y="225" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700">AoE 처리 흐름</text>
+      <text x="380" y="245" text-anchor="middle" fill="#94a3b8" font-size="11">① 마법사 Actor: 스냅샷 캡처 → SpatialIndex로 범위 내 플레이어 조회</text>
+      <text x="380" y="262" text-anchor="middle" fill="#94a3b8" font-size="11">② 각 대상의 Actor에 ReceiveAreaDamage 전달 (DoAsync)</text>
+      <text x="380" y="279" text-anchor="middle" fill="#4ade80" font-size="11">③ 각 대상 Actor가 자기 큐에서 독립 처리 → 대상 수만큼 병렬!</text>
+    </g>
+  </svg>
+</div>
+
+<script>
+function showScene(idx) {
+  for (let i = 0; i < 3; i++) {
+    document.getElementById('scene' + i).style.display = i === idx ? 'block' : 'none';
+  }
+  document.querySelectorAll('.btn-group:last-of-type .btn, .btn-group:nth-of-type(2) .btn').forEach((b, i) => {
+    if (b.closest('.btn-group') === document.querySelectorAll('.btn-group')[1]) {
+      b.classList.toggle('active', i === idx);
+    }
+  });
+  // Fix: select only the second btn-group
+  const btnGroups = document.querySelectorAll('.btn-group');
+  if (btnGroups[1]) {
+    btnGroups[1].querySelectorAll('.btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+  }
+}
+</script>
+
+<pre><code><span class="comment">// 플레이어 Actor 정의 — AsyncExecutable 상속</span>
+<span class="keyword">public class</span> <span class="type">PlayerActor</span> : <span class="type">AsyncExecutable</span>
+{
+    <span class="keyword">private readonly</span> <span class="type">Player</span> _player;
+
+    <span class="comment">// 이동 — 자기 Actor에서 실행, 완전 병렬</span>
+    <span class="keyword">public void</span> Move(<span class="keyword">float</span> newX, <span class="keyword">float</span> newY)
+    {
+        DoAsync(() =>
+        {
+            _player.X = newX;      <span class="comment">// lock 없이 안전!</span>
+            _player.Y = newY;      <span class="comment">// 이 Actor의 큐에서만 실행되니까</span>
+        });
+    }
+
+    <span class="comment">// 근접 공격 — 스냅샷 캡처 후 대상 Actor로 전달</span>
+    <span class="keyword">public void</span> MeleeAttack(<span class="type">PlayerActor</span> target)
+    {
+        DoAsync(() =>
+        {
+            <span class="comment">// 1단계: 내 상태를 스냅샷으로 복사 (불변)</span>
+            <span class="keyword">var</span> snapshot = <span class="keyword">new</span> { _player.X, _player.Y, _player.Attack };
+
+            <span class="comment">// 2단계: 대상 Actor의 큐에 데미지 전달</span>
+            target.ReceiveDamage(snapshot.X, snapshot.Y, snapshot.Attack);
+        });
+    }
+}</code></pre>
+
+<!-- ==================== 섹션 8 ==================== -->
+<h2 id="summary">8. 한눈에 보는 요약</h2>
+
+<div class="anim-container">
+  <svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" style="font-family:'Segoe UI',system-ui,sans-serif">
+    <rect width="760" height="360" rx="16" fill="#1e293b"/>
+
+    <text x="380" y="35" text-anchor="middle" fill="#e2e8f0" font-size="16" font-weight="700">JobDispatcherNET 전체 아키텍처</text>
+
+    <!-- Network layer -->
+    <rect x="30" y="60" width="700" height="50" rx="8" fill="#334155" stroke="#94a3b8" stroke-width="1"/>
+    <text x="380" y="90" text-anchor="middle" fill="#94a3b8" font-size="13">네트워크 IO 스레드 (패킷 수신)</text>
+
+    <!-- Arrows down -->
+    <line x1="160" y1="110" x2="160" y2="140" stroke="#fb923c" stroke-width="2" marker-end="url(#aSm)"/>
+    <line x1="380" y1="110" x2="380" y2="140" stroke="#fb923c" stroke-width="2" marker-end="url(#aSm)"/>
+    <line x1="600" y1="110" x2="600" y2="140" stroke="#fb923c" stroke-width="2" marker-end="url(#aSm)"/>
+    <text x="380" y="132" text-anchor="middle" fill="#fb923c" font-size="10">DoAsync()</text>
+
+    <!-- Actor layer -->
+    <rect x="60" y="145" width="160" height="55" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
+    <text x="140" y="168" text-anchor="middle" fill="#38bdf8" font-size="12" font-weight="600">Actor A</text>
+    <text x="140" y="185" text-anchor="middle" fill="#94a3b8" font-size="10">큐: [job1, job2]</text>
+
+    <rect x="280" y="145" width="160" height="55" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="2"/>
+    <text x="360" y="168" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="600">Actor B</text>
+    <text x="360" y="185" text-anchor="middle" fill="#94a3b8" font-size="10">큐: [job3]</text>
+
+    <rect x="500" y="145" width="160" height="55" rx="8" fill="#0f172a" stroke="#fb923c" stroke-width="2"/>
+    <text x="580" y="168" text-anchor="middle" fill="#fb923c" font-size="12" font-weight="600">Actor C</text>
+    <text x="580" y="185" text-anchor="middle" fill="#94a3b8" font-size="10">큐: [job4, job5]</text>
+
+    <!-- Arrows down -->
+    <line x1="140" y1="200" x2="140" y2="230" stroke="#a78bfa" stroke-width="2" marker-end="url(#aSm2)"/>
+    <line x1="360" y1="200" x2="360" y2="230" stroke="#a78bfa" stroke-width="2" marker-end="url(#aSm2)"/>
+    <line x1="580" y1="200" x2="580" y2="230" stroke="#a78bfa" stroke-width="2" marker-end="url(#aSm2)"/>
+    <text x="380" y="222" text-anchor="middle" fill="#a78bfa" font-size="10">Flush()</text>
+
+    <!-- Worker threads -->
+    <rect x="30" y="235" width="700" height="55" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="2"/>
+    <text x="120" y="258" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 #1</text>
+    <text x="120" y="275" text-anchor="middle" fill="#94a3b8" font-size="10">(전용 Thread)</text>
+    <text x="300" y="258" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 #2</text>
+    <text x="300" y="275" text-anchor="middle" fill="#94a3b8" font-size="10">(전용 Thread)</text>
+    <text x="480" y="258" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 #3</text>
+    <text x="480" y="275" text-anchor="middle" fill="#94a3b8" font-size="10">(전용 Thread)</text>
+    <text x="640" y="258" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600">워커 #4</text>
+    <text x="640" y="275" text-anchor="middle" fill="#94a3b8" font-size="10">(전용 Thread)</text>
+
+    <!-- Key points -->
+    <rect x="100" y="305" width="160" height="35" rx="6" fill="#334155"/>
+    <text x="180" y="327" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="700">✓ Lock 없음</text>
+
+    <rect x="300" y="305" width="160" height="35" rx="6" fill="#334155"/>
+    <text x="380" y="327" text-anchor="middle" fill="#38bdf8" font-size="12" font-weight="700">✓ 플레이어별 병렬</text>
+
+    <rect x="500" y="305" width="160" height="35" rx="6" fill="#334155"/>
+    <text x="580" y="327" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700">✓ ThreadLocal 안정</text>
+
+    <defs>
+      <marker id="aSm" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#fb923c"/></marker>
+      <marker id="aSm2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a78bfa"/></marker>
+    </defs>
+  </svg>
+</div>
+
+<div class="card">
+  <div class="card-title">핵심 규칙 3가지</div>
+  <ol>
+    <li><strong>같은 Actor의 작업은 자동으로 순서대로 실행됩니다</strong> — lock이 필요 없습니다.</li>
+    <li><strong>다른 Actor의 작업은 완전히 병렬 처리됩니다</strong> — 플레이어가 100명이면 100개가 동시에.</li>
+    <li><strong>Actor 간 통신은 스냅샷으로</strong> — 불변 데이터를 복사해서 전달하면 안전합니다.</li>
+  </ol>
+</div>
+
+<div class="warn-box">
+  <strong>⚠️ 주의사항</strong>
+  <ul>
+    <li><code>DoAsyncAfter</code>는 워커 스레드의 <code>DoAsync</code> 콜백 안에서 호출해야 타이머가 정상 작동합니다.</li>
+    <li><code>DisposeAsync()</code> 호출 후에는 <code>DoAsync()</code>를 호출하지 마세요.</li>
+    <li>에러 핸들링: <code>AsyncExecutable.OnError</code>에 콜백을 등록하면 작업 실행 중 예외를 받을 수 있습니다.</li>
+  </ul>
+</div>
+
+<footer>
+  JobDispatcherNET Architecture Guide &mdash; Generated for documentation purposes
+</footer>
+
+</div>
+</body>
+</html>

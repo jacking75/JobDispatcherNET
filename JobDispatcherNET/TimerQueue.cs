@@ -1,36 +1,41 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace JobDispatcherNET;
 
-
 /// <summary>
-/// Manages timed jobs
+/// Manages timed jobs using Stopwatch for high-precision timing.
+/// Background PeriodicTimer ensures scheduled tasks fire even when
+/// DoAsyncAfter is called from non-worker threads.
 /// </summary>
-public sealed class TimerQueue
+public sealed class TimerQueue : IDisposable
 {
     private readonly PriorityQueue<TimerJob, long> _queue = new();
     private readonly object _lock = new();
     private readonly PeriodicTimer _timer;
     private readonly Task _processingTask;
-    private readonly CancellationTokenSource _cts = new();
-    private readonly DateTime _startTime = DateTime.UtcNow;
+    private readonly long _startTicks = Stopwatch.GetTimestamp();
+    private readonly List<TimerJob> _jobBuffer = [];
+    private int _disposed;
 
     public TimerQueue()
     {
         _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(1));
-        _processingTask = ProcessTimerJobsAsync(_cts.Token);
+        _processingTask = ProcessTimerJobsAsync();
     }
 
-    public long GetCurrentTick() => (long)(DateTime.UtcNow - _startTime).TotalMilliseconds;
+    /// <summary>
+    /// Returns milliseconds since this TimerQueue was created.
+    /// Uses Stopwatch for sub-millisecond precision (vs DateTime.UtcNow's ~15ms).
+    /// </summary>
+    public long GetCurrentTick() =>
+        (long)Stopwatch.GetElapsedTime(_startTicks).TotalMilliseconds;
 
     public void ScheduleTask(AsyncExecutable owner, TimeSpan delay, JobEntry task)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+
         var dueTime = GetCurrentTick() + (long)delay.TotalMilliseconds;
-        owner.AddRef(); // Add ref for timer
 
         lock (_lock)
         {
@@ -38,52 +43,49 @@ public sealed class TimerQueue
         }
     }
 
-    private async Task ProcessTimerJobsAsync(CancellationToken cancellationToken)
+    private async Task ProcessTimerJobsAsync()
     {
-        while (await _timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+        try
         {
-            ThreadContext.TickCount = GetCurrentTick();
-
-            await ProcessDueJobsAsync();
+            while (await _timer.WaitForNextTickAsync().ConfigureAwait(false))
+            {
+                ProcessDueJobs();
+            }
         }
+        catch (ObjectDisposedException) { }
     }
 
-    private async Task ProcessDueJobsAsync()
+    private void ProcessDueJobs()
     {
-        List<TimerJob>? jobsToExecute = null;
+        _jobBuffer.Clear();
 
         lock (_lock)
         {
             var currentTick = GetCurrentTick();
-
             while (_queue.Count > 0 && _queue.TryPeek(out _, out var dueTime) && currentTick >= dueTime)
             {
-                var job = _queue.Dequeue();
-                jobsToExecute ??= new List<TimerJob>();
-                jobsToExecute.Add(job);
+                _jobBuffer.Add(_queue.Dequeue());
             }
         }
 
-        if (jobsToExecute != null)
+        foreach (var job in _jobBuffer)
         {
-            foreach (var job in jobsToExecute)
-            {
-                var owner = job.Owner;
-                owner.DoTask(job.Task);
-                owner.ReleaseRef(); // Release ref for timer
-            }
+            job.Owner.DoTask(job.Task);
         }
-
-        await Task.Delay(1); // Give other tasks a chance to run
     }
 
-    public async ValueTask DisposeAsync()
+    public void Dispose()
     {
-        _cts.Cancel();
-        await _processingTask.ConfigureAwait(false);
-        _cts.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         _timer.Dispose();
+        try { _processingTask.Wait(TimeSpan.FromSeconds(2)); }
+        catch { /* shutdown */ }
     }
 
-    private record TimerJob(AsyncExecutable Owner, JobEntry Task);
+    /// <summary>
+    /// Value type — no heap allocation per schedule.
+    /// </summary>
+    private readonly record struct TimerJob(AsyncExecutable Owner, JobEntry Task);
 }

@@ -1,34 +1,48 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Collections.Concurrent;
 
 namespace JobDispatcherNET;
-
 
 /// <summary>
 /// Base class for all job entries
 /// </summary>
 public abstract class JobEntry
 {
-    /// <summary>
-    /// Executes the job
-    /// </summary>
     public abstract void Execute();
 }
 
 /// <summary>
-/// Job implementation using delegates
+/// Pooled job implementation using delegates.
+/// Rent/Return pattern avoids heap allocation on every DoAsync call.
 /// </summary>
 public sealed class Job : JobEntry
 {
-    private readonly Action _action;
+    private static readonly ConcurrentBag<Job> Pool = new();
 
-    public Job(Action action)
+    private Action? _action;
+
+    private Job() { }
+
+    /// <summary>
+    /// Rent a Job from the pool (or create one if empty).
+    /// </summary>
+    public static Job Rent(Action action)
     {
-        _action = action;
+        if (!Pool.TryTake(out var job))
+            job = new Job();
+        job._action = action;
+        return job;
     }
 
-    public override void Execute() => _action();
+    public override void Execute()
+    {
+        try
+        {
+            _action?.Invoke();
+        }
+        finally
+        {
+            _action = null;
+            Pool.Add(this);
+        }
+    }
 }

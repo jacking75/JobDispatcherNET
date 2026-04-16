@@ -1,17 +1,23 @@
-﻿using System.Threading.Channels;
-
+using System.Threading.Channels;
 
 namespace JobDispatcherNET;
 
 /// <summary>
-/// Base class that enables asynchronous execution of methods
+/// Base class that enables asynchronous execution of methods.
+/// Each instance has its own job queue — jobs within the same instance
+/// are serialized automatically without locks.
 /// </summary>
 public abstract class AsyncExecutable : IAsyncDisposable
 {
+    /// <summary>
+    /// Global error handler. Set this to receive job execution errors
+    /// instead of losing them to Console.WriteLine.
+    /// </summary>
+    public static Action<Exception>? OnError { get; set; }
+
     private readonly Channel<JobEntry> _jobQueue;
     private int _remainingTaskCount;
-    private int _refCount;
-    private readonly SemaphoreSlim _disposeSignal = new(1, 1);
+    private volatile TaskCompletionSource? _drainTcs;
 
     protected AsyncExecutable()
     {
@@ -23,72 +29,65 @@ public abstract class AsyncExecutable : IAsyncDisposable
     }
 
     /// <summary>
-    /// Executes a method asynchronously
+    /// Executes a method asynchronously through this dispatcher's queue.
     /// </summary>
     public void DoAsync(Action action)
     {
-        var job = new Job(action);
+        var job = Job.Rent(action);
         DoTask(job);
     }
 
     /// <summary>
-    /// Executes a method with a delay
+    /// Executes a method after a delay through the current thread's timer.
+    /// Must be called from a worker thread context (inside DoAsync callback)
+    /// for the timer to fire reliably.
     /// </summary>
     public void DoAsyncAfter(TimeSpan delay, Action action)
     {
-        var job = new Job(action);
+        var job = Job.Rent(action);
         ThreadContext.Timer.ScheduleTask(this, delay, job);
     }
-
-    internal void AddRef() => Interlocked.Increment(ref _refCount);
-
-    internal void ReleaseRef() => Interlocked.Decrement(ref _refCount);
 
     internal void DoTask(JobEntry task)
     {
         if (Interlocked.Increment(ref _remainingTaskCount) > 1)
         {
-            // Register the task in this dispatcher
-            _jobQueue.Writer.TryWrite(task);
+            if (!_jobQueue.Writer.TryWrite(task))
+            {
+                // Channel closed (DisposeAsync called) — roll back to prevent Flush spin
+                Interlocked.Decrement(ref _remainingTaskCount);
+                return;
+            }
         }
         else
         {
-            // Register the task in this dispatcher
-            _jobQueue.Writer.TryWrite(task);
+            if (!_jobQueue.Writer.TryWrite(task))
+            {
+                Interlocked.Decrement(ref _remainingTaskCount);
+                return;
+            }
 
-            AddRef(); // Reference count +1 for this object
-
-            // 현재 이 작업 스레드를 차지하고 있는 디스패처가 존재하나요?
             var currentExecuter = ThreadContext.CurrentExecuter;
             if (currentExecuter is not null)
             {
-                // 이 디스패처를 이 워커 스레드에 등록하세요.
-                ThreadContext.ExecuterList.Add(this);
+                ThreadContext.ExecuterQueue.Enqueue(this);
             }
             else
             {
                 try
                 {
-                    // Acquire
                     ThreadContext.CurrentExecuter = this;
 
-                    // Invoke all tasks of this dispatcher
                     Flush();
 
-                    // 이 스레드에 등록된 다른 디스패처의 모든 작업을 실행합니다.
-                    while (ThreadContext.ExecuterList.Count > 0)
+                    while (ThreadContext.ExecuterQueue.TryDequeue(out var dispatcher))
                     {
-                        var dispatcher = ThreadContext.ExecuterList[0];
-                        ThreadContext.ExecuterList.RemoveAt(0);
                         dispatcher.Flush();
-                        dispatcher.ReleaseRef();
                     }
                 }
                 finally
                 {
-                    // Release
                     ThreadContext.CurrentExecuter = null;
-                    ReleaseRef(); // Reference count -1 for this object
                 }
             }
         }
@@ -96,41 +95,53 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
     internal void Flush()
     {
+        var spinner = new SpinWait();
         while (true)
         {
             if (_jobQueue.Reader.TryRead(out var job))
             {
+                spinner.Reset();
                 try
                 {
                     job.Execute();
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error executing job: {ex}");
+                    if (OnError is { } handler)
+                        handler(ex);
+                    else
+                        Console.Error.WriteLine($"[JobDispatcherNET] Unhandled job error: {ex}");
                 }
 
                 if (Interlocked.Decrement(ref _remainingTaskCount) == 0)
+                {
+                    _drainTcs?.TrySetResult();
                     break;
+                }
+            }
+            else
+            {
+                spinner.SpinOnce();
             }
         }
     }
 
+    /// <summary>
+    /// Waits for all pending jobs to complete, then closes the queue.
+    /// Signal-based (no polling).
+    /// </summary>
     public virtual async ValueTask DisposeAsync()
     {
-        await _disposeSignal.WaitAsync();
-        try
+        if (Volatile.Read(ref _remainingTaskCount) > 0)
         {
-            // Wait for all jobs to complete
-            while (_remainingTaskCount > 0)
-            {
-                await Task.Delay(10);
-            }
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _drainTcs = tcs;
 
-            _jobQueue.Writer.Complete();
+            if (Volatile.Read(ref _remainingTaskCount) > 0)
+                await tcs.Task;
         }
-        finally
-        {
-            _disposeSignal.Dispose();
-        }
+
+        _jobQueue.Writer.Complete();
+        GC.SuppressFinalize(this);
     }
 }

@@ -1,13 +1,10 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using JobDispatcherNET;
 
 namespace ExampleConsoleApp;
 
-// TestWorkerThread.cs - Sample worker implementation
+/// <summary>
+/// Sample worker implementation — runs on a dedicated OS thread
+/// </summary>
 public class TestWorkerThread : IRunnable
 {
     private readonly List<TestObject> _testObjects = new();
@@ -21,12 +18,11 @@ public class TestWorkerThread : IRunnable
         }
     }
 
-    public async ValueTask<bool> RunAsync(CancellationToken cancellationToken)
+    public bool Run(CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
             return false;
 
-        // Test
         int after = Random.Shared.Next(2000);
 
         if (after > 1000)
@@ -44,22 +40,21 @@ public class TestWorkerThread : IRunnable
                 () => _testObjects[index4].TestFuncForTimer(after));
         }
 
-        // Exit condition
         if (_testObjects[Random.Shared.Next(TestObjectCount)].GetTestCount() > 5000)
         {
             Console.WriteLine($"Thread {Environment.CurrentManagedThreadId} end by force");
             return false;
         }
 
-        await Task.Delay(1, cancellationToken);
+        Thread.Sleep(1);
         return true;
     }
 
-    public async ValueTask DisposeAsync()
+    public void Dispose()
     {
         foreach (var testObject in _testObjects)
         {
-            await testObject.DisposeAsync();
+            testObject.DisposeAsync().AsTask().Wait();
         }
     }
 }

@@ -1,13 +1,10 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using JobDispatcherNET;
 
 namespace ExampleConsoleApp;
 
-// ProcessingService.cs - Service that uses the dispatcher
+/// <summary>
+/// Service that uses the dispatcher for data processing
+/// </summary>
 public class ProcessingService : IAsyncDisposable
 {
     private readonly DataProcessor _processor = new();
@@ -20,7 +17,6 @@ public class ProcessingService : IAsyncDisposable
     {
         _dispatcher = new JobDispatcher<ProcessingWorker>(workerCount);
 
-        // Generate test items
         _maxItems = Random.Shared.Next(15, 30);
         for (int i = 0; i < _maxItems; i++)
         {
@@ -32,7 +28,6 @@ public class ProcessingService : IAsyncDisposable
 
     public void Start()
     {
-        // Submit items for processing
         _processingTask = Task.Run(async () =>
         {
             for (int i = 0; i < _maxItems; i++)
@@ -46,7 +41,6 @@ public class ProcessingService : IAsyncDisposable
             }
         });
 
-        // Start worker threads
         _ = _dispatcher.RunWorkerThreadsAsync();
     }
 

@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+
+# IDE / Editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+packages/
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
