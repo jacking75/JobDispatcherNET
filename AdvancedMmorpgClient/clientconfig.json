@@ -1,0 +1,16 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 9100
+  },
+  "screen": {
+    "width": 2560,
+    "height": 1440
+  },
+  "bots": {
+    "count": 16,
+    "tickIntervalMs": 250,
+    "spawnSpacingPixels": 200,
+    "namePrefix": "Bot"
+  }
+}

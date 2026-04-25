@@ -1,0 +1,80 @@
+{
+  "server": {
+    "port": 9100,
+    "workerThreads": 8,
+    "broadcastIntervalMs": 100
+  },
+  "world": {
+    "name": "AdvancedField",
+    "width": 1000.0,
+    "height": 1000.0,
+    "spatialCellSize": 50.0
+  },
+  "npc": {
+    "totalCount": 50,
+    "tickIntervalMs": 200,
+    "respawnSeconds": 8.0,
+    "types": [
+      {
+        "kind": "Slime",
+        "weight": 4,
+        "maxHp": 60,
+        "attack": 8,
+        "defense": 2,
+        "moveSpeed": 1.5,
+        "aggroRange": 8.0,
+        "attackRange": 2.0,
+        "fleeHpRatio": 0.0,
+        "color": "#7CFC00"
+      },
+      {
+        "kind": "Goblin",
+        "weight": 4,
+        "maxHp": 120,
+        "attack": 18,
+        "defense": 4,
+        "moveSpeed": 3.5,
+        "aggroRange": 14.0,
+        "attackRange": 2.5,
+        "fleeHpRatio": 0.25,
+        "color": "#8B4513"
+      },
+      {
+        "kind": "Wolf",
+        "weight": 3,
+        "maxHp": 150,
+        "attack": 22,
+        "defense": 3,
+        "moveSpeed": 5.0,
+        "aggroRange": 18.0,
+        "attackRange": 2.5,
+        "fleeHpRatio": 0.15,
+        "color": "#808080"
+      },
+      {
+        "kind": "Skeleton",
+        "weight": 3,
+        "maxHp": 200,
+        "attack": 25,
+        "defense": 8,
+        "moveSpeed": 2.5,
+        "aggroRange": 16.0,
+        "attackRange": 3.0,
+        "fleeHpRatio": 0.0,
+        "color": "#F5F5DC"
+      },
+      {
+        "kind": "Boss",
+        "weight": 1,
+        "maxHp": 1500,
+        "attack": 60,
+        "defense": 20,
+        "moveSpeed": 2.0,
+        "aggroRange": 25.0,
+        "attackRange": 4.0,
+        "fleeHpRatio": 0.0,
+        "color": "#FF1493"
+      }
+    ]
+  }
+}
