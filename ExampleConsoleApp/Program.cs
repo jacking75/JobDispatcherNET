@@ -33,13 +33,15 @@ class Program
 
 
     /// <summary>
-    /// AsyncExecutable의 심화 활용 패턴을 보여준다.
-    /// - 공유 객체(DataProcessor) 하나에 외부에서 다수의 작업을 비동기로 디스패치하고,
-    ///   동시에 그 객체가 자기 자신에게 DoAsync / DoAsyncAfter 로 후속 작업을 다시 디스패치한다.
-    /// - 우선순위(priority)에 따라 후속 작업의 종류가 분기된다 (즉시 실행 vs 지연 실행).
-    /// - 모든 작업은 AsyncExecutable의 객체별 직렬 실행 보장 위에서 돌아가므로,
-    ///   공유 통계(_processedItems)를 락 최소화로 안전하게 누적할 수 있다.
-    /// 학습 포인트: "객체가 자기 일정을 스스로 만들어 나가는" 작업 그래프를 AsyncExecutable로 표현하는 법.
+    /// AsyncExecutable의 심화 활용 — actor 스타일 패턴을 보여준다.
+    /// - 공유 객체(DataProcessor)의 모든 진입점(ProcessItem, GetProcessingStatsAsync)을
+    ///   자기 자신의 DoAsync 큐로 통과시킨다. 결과적으로 _processedItems 는 항상 단일 스레드만
+    ///   접근하게 되어 클래스 안에 lock 이 단 하나도 없다.
+    /// - 객체가 자기 자신에게 DoAsync / DoAsyncAfter 로 우선순위 기반 후속 작업을 디스패치하며
+    ///   작업 그래프를 스스로 키워 간다 (즉시 실행 vs 500ms 지연 실행).
+    /// - 통계 read 또한 큐를 통과하므로, 결과는 "그 시점까지 큐에 쌓여 있던 모든 작업이
+    ///   처리된 후"의 일관된 스냅샷이 된다 (큐 순서에 따른 happens-before 일관성).
+    /// 학습 포인트: 모든 read/write 를 직렬 큐로 통과시키면 lock 자체가 사라진다는 actor 모델의 핵심.
     /// </summary>
     static async Task AdvancedExampleAsync()
     {
@@ -53,8 +55,8 @@ class Program
         // Run for 5 seconds
         await Task.Delay(TimeSpan.FromSeconds(5));
 
-        // Get processing statistics
-        var stats = processingService.Processor.GetProcessingStats();
+        // 통계 read 도 actor 큐를 통과시켜 안전하게 스냅샷을 받는다
+        var stats = await processingService.Processor.GetProcessingStatsAsync();
 
         Console.WriteLine("\nProcessing Statistics:");
         Console.WriteLine($"Total unique items: {stats.Count}");
