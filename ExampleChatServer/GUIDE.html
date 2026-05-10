@@ -1,0 +1,1317 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>ExampleChatServer — JobDispatcherNET 따라잡기</title>
+<style>
+  :root{
+    --bg:#0f1722; --panel:#172234; --panel2:#1f2d44;
+    --ink:#e8edf5; --muted:#9aa7bd;
+    --line:#2a3a55;
+    --srv:#5b8cff; --room:#3ec28b; --user:#c084fc; --worker:#f59e0b;
+    --queue:#94a3b8; --timer:#fde047;
+    --accent:#22d3ee;
+    --ok:#22c55e; --bad:#ef4444;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+    font-family:"Pretendard","Segoe UI","Noto Sans KR",system-ui,sans-serif;
+    line-height:1.65;font-size:16px}
+  a{color:var(--accent)}
+  header{padding:48px 24px 28px;background:linear-gradient(160deg,#1d2b46,#0f1722);
+    border-bottom:1px solid var(--line)}
+  header .wrap{max-width:1100px;margin:0 auto}
+  header h1{margin:0 0 8px;font-size:34px;letter-spacing:-.5px}
+  header p{margin:0;color:var(--muted);font-size:17px}
+  .toc{max-width:1100px;margin:24px auto 0;padding:0 24px}
+  .toc ol{margin:0;padding-left:20px;columns:2;column-gap:36px}
+  .toc li{margin:4px 0;break-inside:avoid}
+  main{max-width:1100px;margin:0 auto;padding:32px 24px 80px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:28px 32px;margin:28px 0;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+  section h2{margin:0 0 8px;font-size:24px;color:#fff}
+  section h2 .num{display:inline-block;min-width:38px;color:var(--accent);font-weight:700}
+  section h3{margin:24px 0 8px;font-size:18px;color:#cfe1ff}
+  p{margin:10px 0}
+  .lead{color:#cfe1ff}
+  .muted{color:var(--muted)}
+  .figure{background:var(--panel2);border:1px solid var(--line);border-radius:12px;
+    padding:18px;margin:16px 0;display:flex;flex-direction:column;align-items:center}
+  .figure svg{width:100%;height:auto;max-width:1000px;display:block}
+  .figure figcaption{color:var(--muted);font-size:14px;margin-top:10px;text-align:center}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:780px){.grid2{grid-template-columns:1fr}.toc ol{columns:1}}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card h4{margin:0 0 6px;font-size:15px;color:#cfe1ff}
+  .badge{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;
+    background:#0f1722;border:1px solid var(--line);color:var(--muted);vertical-align:middle}
+  .badge.srv{color:#cfe1ff;border-color:#3a5fb0}
+  .badge.room{color:#bff5dc;border-color:#1f6b48}
+  .badge.user{color:#e9d5ff;border-color:#6b3da6}
+  .badge.worker{color:#fed7aa;border-color:#a8651a}
+  pre{background:#0a111c;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;overflow:auto;color:#dbeafe;font-size:13.5px;line-height:1.6}
+  code{font-family:"JetBrains Mono","Consolas",monospace}
+  pre code{display:block}
+  .kw{color:#93c5fd}.ty{color:#fbbf24}.st{color:#86efac}.cm{color:#64748b;font-style:italic}
+  .num2{color:#fda4af}
+  .pill{display:inline-block;padding:1px 8px;border-radius:6px;font-size:12px;background:#0f1722;
+    border:1px solid var(--line)}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin-top:6px;font-size:13px;color:var(--muted)}
+  .legend span::before{content:"";display:inline-block;width:12px;height:12px;border-radius:3px;
+    margin-right:6px;vertical-align:middle}
+  .legend .l-srv::before{background:var(--srv)}
+  .legend .l-room::before{background:var(--room)}
+  .legend .l-user::before{background:var(--user)}
+  .legend .l-worker::before{background:var(--worker)}
+  .legend .l-q::before{background:var(--queue)}
+  .legend .l-timer::before{background:var(--timer)}
+  hr{border:0;border-top:1px solid var(--line);margin:24px 0}
+  .callout{background:rgba(34,211,238,.06);border-left:4px solid var(--accent);
+    padding:12px 16px;border-radius:8px;margin:14px 0}
+  .callout.warn{background:rgba(239,68,68,.08);border-left-color:var(--bad)}
+  .callout.ok{background:rgba(34,197,94,.08);border-left-color:var(--ok)}
+
+  /* SVG 공통 텍스트 */
+  svg text{font-family:"Pretendard","Segoe UI","Noto Sans KR",system-ui,sans-serif;fill:#0f1722}
+  svg .lbl{font-size:14px;font-weight:600}
+  svg .sub{font-size:11px;fill:#475569}
+  svg .ink{fill:#e8edf5}
+  svg .arrow{stroke:#94a3b8;stroke-width:2;fill:none;marker-end:url(#ar)}
+
+  /* 애니메이션: 큐를 따라 이동하는 점 */
+  @keyframes flowR { 0%{transform:translateX(0);opacity:0} 8%{opacity:1}
+                     90%{opacity:1} 100%{transform:translateX(280px);opacity:0} }
+  @keyframes flowD { 0%{transform:translateY(0);opacity:0} 8%{opacity:1}
+                     90%{opacity:1} 100%{transform:translateY(180px);opacity:0} }
+  @keyframes pulse { 0%,100%{transform:scale(1);opacity:1}
+                     50%{transform:scale(1.25);opacity:.7} }
+  @keyframes blink { 0%,100%{opacity:.3} 50%{opacity:1} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>ExampleChatServer 따라잡기</h1>
+    <p>JobDispatcherNET을 처음 만나는 신입 프로그래머를 위한 시각 가이드</p>
+  </div>
+</header>
+
+<nav class="toc">
+  <ol>
+    <li><a href="#sec1">왜 락(lock) 없이도 안전한가?</a></li>
+    <li><a href="#sec2">JobDispatcherNET의 3가지 핵심 도구</a></li>
+    <li><a href="#sec3">ExampleChatServer 전체 지도</a></li>
+    <li><a href="#sec4">Actor 직렬화 — 락이 사라지는 마법</a></li>
+    <li><a href="#sec5">명령이 워커를 타고 들어오는 흐름</a></li>
+    <li><a href="#sec6">Room → User 브로드캐스트의 병렬성</a></li>
+    <li><a href="#sec7">자기복제 Heartbeat (DoAsyncAfter)</a></li>
+    <li><a href="#sec8">유휴 disconnect 시퀀스</a></li>
+    <li><a href="#sec9">파일별 핵심 코드</a></li>
+    <li><a href="#sec-maint">유지보수: 람다 vs 명명된 메서드</a></li>
+    <li><a href="#sec-net">네트워크 IO 스레드 (멀티 프로듀서)</a></li>
+    <li><a href="#sec10">직접 돌려보기</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec1">
+  <h2><span class="num">1</span>왜 락(lock) 없이도 안전한가?</h2>
+  <p class="lead">멀티스레드 프로그램에서 데이터가 깨지는 이유는, <b>여러 스레드가 같은 변수에 동시에 쓰기</b>를 하기 때문입니다. 보통은 <code>lock</code> 으로 한 번에 한 스레드만 들어가도록 막죠.</p>
+  <p>JobDispatcherNET은 다른 길을 갑니다. <b>"하나의 객체에 들어오는 모든 작업을 줄을 세워서 하나씩 처리하자"</b>는 아이디어입니다. 줄(=큐)이 직접 한 번에 하나만 통과시키니, 락이 필요 없어집니다.</p>
+  <div class="callout">
+    <b>이 예제는 전통적 스레드 기반</b>입니다. <code>async/await</code> 키워드를 쓰지 않고, 차단 대기(blocking)에는 <code>ManualResetEventSlim</code> 과 <code>Thread.Sleep</code> 만 사용합니다. 라이브러리 자체는 내부적으로 Task 를 쓰지만, 우리 예제 코드는 종료 시 한 번만 <code>.AsTask().Wait()</code> 로 차단합니다.
+  </div>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 240" aria-label="lock vs actor-queue">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 왼쪽: 락 방식 -->
+      <text class="ink lbl" x="120" y="30" text-anchor="middle">전통적 방법: 자물쇠(lock)</text>
+      <rect x="40" y="55" width="80" height="50" rx="8" fill="var(--user)"/>
+      <rect x="40" y="115" width="80" height="50" rx="8" fill="var(--user)"/>
+      <rect x="40" y="175" width="80" height="50" rx="8" fill="var(--user)"/>
+      <text class="lbl" x="80" y="85" text-anchor="middle">스레드 A</text>
+      <text class="lbl" x="80" y="145" text-anchor="middle">스레드 B</text>
+      <text class="lbl" x="80" y="205" text-anchor="middle">스레드 C</text>
+
+      <path class="arrow" d="M120 80 L210 130"/>
+      <path class="arrow" d="M120 140 L210 140"/>
+      <path class="arrow" d="M120 200 L210 150"/>
+
+      <rect x="210" y="110" width="100" height="60" rx="10" fill="#7f1d1d" stroke="#ef4444"/>
+      <text class="ink lbl" x="260" y="138" text-anchor="middle">🔒 lock</text>
+      <text class="sub" x="260" y="156" text-anchor="middle" fill="#fee2e2">한 번에 하나만 통과</text>
+
+      <rect x="350" y="110" width="100" height="60" rx="8" fill="#1e3a8a"/>
+      <text class="ink lbl" x="400" y="138" text-anchor="middle">공유 데이터</text>
+      <path class="arrow" d="M310 140 L350 140"/>
+
+      <!-- 가운데 구분선 -->
+      <line x1="500" y1="20" x2="500" y2="220" stroke="var(--line)" stroke-dasharray="4 4"/>
+
+      <!-- 오른쪽: actor 큐 -->
+      <text class="ink lbl" x="750" y="30" text-anchor="middle">JobDispatcherNET: actor 큐</text>
+      <rect x="540" y="55" width="80" height="50" rx="8" fill="var(--user)"/>
+      <rect x="540" y="115" width="80" height="50" rx="8" fill="var(--user)"/>
+      <rect x="540" y="175" width="80" height="50" rx="8" fill="var(--user)"/>
+      <text class="lbl" x="580" y="85" text-anchor="middle">스레드 A</text>
+      <text class="lbl" x="580" y="145" text-anchor="middle">스레드 B</text>
+      <text class="lbl" x="580" y="205" text-anchor="middle">스레드 C</text>
+
+      <path class="arrow" d="M620 80 L680 110"/>
+      <path class="arrow" d="M620 140 L680 130"/>
+      <path class="arrow" d="M620 200 L680 150"/>
+
+      <!-- 큐 (3칸) -->
+      <g>
+        <rect x="680" y="100" width="180" height="60" rx="10" fill="#0f1722" stroke="var(--queue)"/>
+        <rect x="690" y="115" width="30" height="30" rx="6" fill="var(--user)"/>
+        <rect x="725" y="115" width="30" height="30" rx="6" fill="var(--user)"/>
+        <rect x="760" y="115" width="30" height="30" rx="6" fill="var(--user)"/>
+        <text class="sub" x="770" y="178" text-anchor="middle" fill="var(--muted)">FIFO 큐</text>
+      </g>
+
+      <rect x="900" y="100" width="80" height="60" rx="10" fill="var(--srv)"/>
+      <text class="ink lbl" x="940" y="128" text-anchor="middle">실행기</text>
+      <text class="sub" x="940" y="146" text-anchor="middle" fill="#dbeafe">한 번에 1개</text>
+      <path class="arrow" d="M860 130 L900 130"/>
+    </svg>
+    <figcaption>왼쪽은 lock으로 직렬화, 오른쪽은 큐로 직렬화. 결과는 같지만 큐 방식은 락 경합 자체가 없습니다.</figcaption>
+  </figure>
+
+  <p>그래서 ExampleChatServer의 <code>ChatServer</code>, <code>Room</code>, <code>User</code> 안에는 <b>lock이 단 하나도 없습니다</b>. 모든 진입은 자기 큐를 통과합니다.</p>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec2">
+  <h2><span class="num">2</span>JobDispatcherNET의 3가지 핵심 도구</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h4><span class="badge srv">AsyncExecutable</span></h4>
+      <p>"내 큐를 가진 객체"가 되는 베이스 클래스. <code>DoAsync(...)</code>로 일을 던지면 그 객체의 큐에 들어가고 한 번에 하나씩 실행됩니다.</p>
+    </div>
+    <div class="card">
+      <h4><span class="badge worker">JobDispatcher&lt;T&gt; + IRunnable</span></h4>
+      <p>전용 OS 스레드를 N개 만들어 각 스레드 위에서 <code>T.Run()</code>을 반복 호출합니다. ThreadPool이 아닌 <b>진짜 스레드</b>라서 ThreadLocal 상태가 안전합니다.</p>
+    </div>
+    <div class="card">
+      <h4><span class="badge" style="border-color:#a16207;color:#fde68a">DoAsyncAfter</span></h4>
+      <p>"N초 뒤에 이 코드 실행해줘". 자기 자신을 다시 예약하면 무한히 반복되는 <b>heartbeat</b>가 됩니다.</p>
+    </div>
+    <div class="card">
+      <h4><span class="badge">ThreadContext.TickCount</span></h4>
+      <p>JobDispatcher 워커가 매 루프마다 갱신하는 ThreadLocal 시각. 워커 스레드에서 도는 코드는 락 없이 시간을 알 수 있습니다.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec3">
+  <h2><span class="num">3</span>ExampleChatServer 전체 지도</h2>
+  <p>이 채팅 서버에는 actor 3종(<span class="badge srv">ChatServer</span> 1개, <span class="badge room">Room</span> N개, <span class="badge user">User</span> N개)과 워커 풀(<span class="badge worker">ChatWorker</span> 4개)이 등장합니다. 각 actor는 자기만의 큐를 갖고, 워커는 진짜 OS 스레드 위에서 돕니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1100 480" aria-label="overall map">
+      <defs>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 콘솔 입력 -->
+      <rect x="20" y="40" width="160" height="60" rx="10" fill="#334155"/>
+      <text class="ink lbl" x="100" y="70" text-anchor="middle">콘솔 입력</text>
+      <text class="sub" x="100" y="88" text-anchor="middle" fill="#cbd5e1">Program.cs (REPL)</text>
+
+      <!-- InboundCommands -->
+      <rect x="220" y="30" width="220" height="80" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="330" y="56" text-anchor="middle">ChatWorker.InboundCommands</text>
+      <text class="sub" x="330" y="74" text-anchor="middle" fill="var(--muted)">ConcurrentQueue&lt;Action&gt;</text>
+      <rect x="240" y="84" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="265" y="84" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="290" y="84" width="20" height="18" rx="3" fill="#94a3b8"/>
+
+      <path d="M180 70 H 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+
+      <!-- 워커 풀 -->
+      <text class="ink lbl" x="600" y="20" text-anchor="middle">JobDispatcher&lt;ChatWorker&gt; — 전용 OS 스레드 4개</text>
+      <g>
+        <rect x="490" y="35" width="100" height="80" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="540" y="65" text-anchor="middle">Worker 1</text>
+        <text class="sub" x="540" y="83" text-anchor="middle">tid=8</text>
+        <text class="sub" x="540" y="100" text-anchor="middle">Run()</text>
+      </g>
+      <g>
+        <rect x="600" y="35" width="100" height="80" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="650" y="65" text-anchor="middle">Worker 2</text>
+        <text class="sub" x="650" y="83" text-anchor="middle">tid=9</text>
+      </g>
+      <g>
+        <rect x="710" y="35" width="100" height="80" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="760" y="65" text-anchor="middle">Worker 3</text>
+        <text class="sub" x="760" y="83" text-anchor="middle">tid=11</text>
+      </g>
+      <g>
+        <rect x="820" y="35" width="100" height="80" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="870" y="65" text-anchor="middle">Worker 4</text>
+        <text class="sub" x="870" y="83" text-anchor="middle">tid=12</text>
+      </g>
+
+      <path d="M440 70 H 490" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+
+      <!-- ChatServer actor -->
+      <rect x="380" y="180" width="320" height="80" rx="14" fill="var(--srv)"/>
+      <text class="lbl" x="540" y="208" text-anchor="middle" style="fill:#0b1735">ChatServer (AsyncExecutable)</text>
+      <text class="sub" x="540" y="226" text-anchor="middle" style="fill:#0b1735">_users / _rooms / heartbeat</text>
+      <text class="sub" x="540" y="244" text-anchor="middle" style="fill:#0b1735">자기 큐로 모든 read/write 직렬화 — lock 0개</text>
+
+      <path d="M560 115 V 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+      <text class="sub" x="608" y="150" fill="var(--muted)">server.HandleX(...) 호출</text>
+
+      <!-- Room actors -->
+      <rect x="60" y="320" width="240" height="80" rx="14" fill="var(--room)"/>
+      <text class="lbl" x="180" y="346" text-anchor="middle" style="fill:#0b1735">Room "general"</text>
+      <text class="sub" x="180" y="362" text-anchor="middle" style="fill:#0b1735">_users / heartbeat</text>
+      <text class="sub" x="180" y="380" text-anchor="middle" style="fill:#0b1735">AsyncExecutable</text>
+
+      <rect x="320" y="320" width="240" height="80" rx="14" fill="var(--room)"/>
+      <text class="lbl" x="440" y="346" text-anchor="middle" style="fill:#0b1735">Room "game"</text>
+      <text class="sub" x="440" y="362" text-anchor="middle" style="fill:#0b1735">AsyncExecutable</text>
+
+      <rect x="580" y="320" width="240" height="80" rx="14" fill="var(--room)"/>
+      <text class="lbl" x="700" y="346" text-anchor="middle" style="fill:#0b1735">Room "dev"</text>
+      <text class="sub" x="700" y="362" text-anchor="middle" style="fill:#0b1735">AsyncExecutable</text>
+
+      <path d="M460 260 L 220 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+      <path d="M540 260 L 440 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+      <path d="M600 260 L 680 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+
+      <!-- User actors -->
+      <g>
+        <rect x="850" y="180" width="220" height="50" rx="10" fill="var(--user)"/>
+        <text class="lbl" x="960" y="210" text-anchor="middle">User "alice" (actor)</text>
+      </g>
+      <g>
+        <rect x="850" y="240" width="220" height="50" rx="10" fill="var(--user)"/>
+        <text class="lbl" x="960" y="270" text-anchor="middle">User "bob" (actor)</text>
+      </g>
+      <g>
+        <rect x="850" y="300" width="220" height="50" rx="10" fill="var(--user)"/>
+        <text class="lbl" x="960" y="330" text-anchor="middle">User "carol" (actor)</text>
+      </g>
+
+      <path d="M700 220 L 850 205" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+      <text class="sub" x="775" y="195" fill="var(--muted)">user.DeliverMessage(...)</text>
+
+      <path d="M820 360 L 850 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+
+      <!-- 범례 -->
+      <text class="sub" x="20" y="450" fill="var(--muted)">화살표 = "...에게 일을 던진다" (모두 비차단, 자기 큐 통과)</text>
+    </svg>
+    <figcaption>외부 입력 → InboundCommands 큐 → 워커 4개 dequeue → ChatServer actor → Room actor → User actor</figcaption>
+    <div class="legend">
+      <span class="l-srv">ChatServer</span>
+      <span class="l-room">Room</span>
+      <span class="l-user">User</span>
+      <span class="l-worker">ChatWorker</span>
+      <span class="l-q">ConcurrentQueue</span>
+    </div>
+  </figure>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec4">
+  <h2><span class="num">4</span>Actor 직렬화 — 락이 사라지는 마법</h2>
+  <p>여러 스레드가 동시에 같은 actor의 <code>DoAsync</code>를 호출해도, actor 안의 코드는 <b>한 번에 하나씩</b> 실행됩니다. 그래서 actor 내부 변수는 락 없이도 안전합니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 280" aria-label="actor serialization animation">
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 3 producers -->
+      <g>
+        <rect x="40" y="40" width="120" height="40" rx="8" fill="var(--worker)"/>
+        <text class="lbl" x="100" y="65" text-anchor="middle">Worker 1</text>
+      </g>
+      <g>
+        <rect x="40" y="120" width="120" height="40" rx="8" fill="var(--worker)"/>
+        <text class="lbl" x="100" y="145" text-anchor="middle">Worker 2</text>
+      </g>
+      <g>
+        <rect x="40" y="200" width="120" height="40" rx="8" fill="var(--worker)"/>
+        <text class="lbl" x="100" y="225" text-anchor="middle">Worker 3</text>
+      </g>
+
+      <!-- 화살표 (큐로 동시에 들어옴) -->
+      <path d="M160 60 L 320 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+      <path d="M160 140 L 320 140" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+      <path d="M160 220 L 320 150" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+
+      <!-- 큐 박스 -->
+      <rect x="320" y="100" width="320" height="80" rx="12" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="480" y="92" text-anchor="middle">Room actor의 큐 (FIFO)</text>
+
+      <!-- 큐 안 작업들 (이동 애니메이션) -->
+      <g>
+        <circle cx="0" cy="0" r="12" fill="#3b82f6" style="animation:flowR 4s linear infinite;animation-delay:0s">
+        </circle>
+        <text x="0" y="4" text-anchor="middle" class="lbl" style="fill:#fff;font-size:12px;animation:flowR 4s linear infinite;animation-delay:0s">A</text>
+      </g>
+      <g transform="translate(340 140)">
+        <circle r="14" fill="#3b82f6" style="animation:flowR 4s linear infinite;animation-delay:.4s"/>
+        <text class="lbl" style="font-size:12px;fill:#fff;animation:flowR 4s linear infinite;animation-delay:.4s" text-anchor="middle" dy="4">A</text>
+      </g>
+      <g transform="translate(340 140)">
+        <circle r="14" fill="#22c55e" style="animation:flowR 4s linear infinite;animation-delay:1.3s"/>
+        <text class="lbl" style="font-size:12px;fill:#fff;animation:flowR 4s linear infinite;animation-delay:1.3s" text-anchor="middle" dy="4">B</text>
+      </g>
+      <g transform="translate(340 140)">
+        <circle r="14" fill="#f97316" style="animation:flowR 4s linear infinite;animation-delay:2.2s"/>
+        <text class="lbl" style="font-size:12px;fill:#fff;animation:flowR 4s linear infinite;animation-delay:2.2s" text-anchor="middle" dy="4">C</text>
+      </g>
+
+      <!-- 실행기 -->
+      <rect x="700" y="100" width="220" height="80" rx="14" fill="var(--room)"/>
+      <text class="lbl" x="810" y="135" text-anchor="middle" style="fill:#0b1735">실행기 (Flush)</text>
+      <text class="sub" x="810" y="153" text-anchor="middle" style="fill:#0b1735">한 번에 1개씩 꺼내 실행</text>
+      <text class="sub" x="810" y="171" text-anchor="middle" style="fill:#0b1735">→ _users 변경에 락 불필요</text>
+
+      <path d="M640 140 L 700 140" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+    </svg>
+    <figcaption>3개의 워커가 동시에 일을 던져도 큐는 줄을 세웁니다. 실행기는 한 번에 한 개만 꺼냅니다.</figcaption>
+  </figure>
+
+  <div class="callout ok">
+    <b>핵심 보장</b>: 같은 actor 안에서 도는 코드는 <b>같은 순간에 두 개가 동시에 실행되는 일이 없다</b>. 이게 actor 모델의 전부입니다.
+  </div>
+  <div class="callout warn">
+    <b>차단(blocking) 호출 주의</b>: <code>GetSnapshot()</code> 같은 동기 read 는 <code>ManualResetEventSlim.Wait()</code> 로 차단합니다. <b>다른 actor 의 Flush 안에서</b> 부르면 그 스레드가 자기가 기다리는 콜백을 처리하지 못해 <b>데드락</b>이 납니다. 메인 스레드에서만 부르세요. 그래서 <code>ChatServer.GetSnapshot()</code> 은 2단계로 동작합니다 — server 큐에서 참조만 모으고, 호출자 스레드에서 각 actor 의 <code>GetSnapshot()</code> 을 따로 호출합니다.
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec5">
+  <h2><span class="num">5</span>명령이 워커를 타고 들어오는 흐름</h2>
+  <p>콘솔에 <code>say alice general 안녕</code>이라고 치면 어떻게 ChatServer까지 도달할까요?</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1100 280" aria-label="command flow animation">
+      <defs>
+        <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 단계 5개 -->
+      <rect x="20"   y="100" width="170" height="80" rx="10" fill="#334155"/>
+      <text class="ink lbl" x="105" y="135" text-anchor="middle">① 콘솔 입력</text>
+      <text class="sub"  x="105" y="153" text-anchor="middle" fill="#cbd5e1">say alice ...</text>
+
+      <rect x="220" y="100" width="190" height="80" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="315" y="135" text-anchor="middle">② InboundCommands</text>
+      <text class="sub"  x="315" y="153" text-anchor="middle" fill="var(--muted)">Enqueue(action)</text>
+
+      <rect x="440" y="100" width="170" height="80" rx="10" fill="var(--worker)"/>
+      <text class="lbl" x="525" y="135" text-anchor="middle">③ ChatWorker</text>
+      <text class="sub" x="525" y="153" text-anchor="middle">Run() — TryDequeue</text>
+
+      <rect x="640" y="100" width="200" height="80" rx="10" fill="var(--srv)"/>
+      <text class="lbl" x="740" y="135" text-anchor="middle">④ server.HandleRoomChat</text>
+      <text class="sub" x="740" y="153" text-anchor="middle">→ DoAsync(...)</text>
+
+      <rect x="870" y="100" width="210" height="80" rx="10" fill="var(--room)"/>
+      <text class="lbl" x="975" y="135" text-anchor="middle">⑤ Room.ProcessChatMessage</text>
+      <text class="sub" x="975" y="153" text-anchor="middle">_users 직접 read</text>
+
+      <path d="M190 140 H 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar4)"/>
+      <path d="M410 140 H 440" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar4)"/>
+      <path d="M610 140 H 640" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar4)"/>
+      <path d="M840 140 H 870" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar4)"/>
+
+      <!-- 흐르는 점 (메시지) -->
+      <g style="animation:flowR 5s linear infinite;animation-delay:0s">
+        <circle cx="190" cy="50" r="14" fill="#22d3ee"/>
+        <text x="190" y="54" text-anchor="middle" class="lbl" style="font-size:12px;fill:#0b1735">msg</text>
+      </g>
+
+      <text class="sub" x="540" y="240" text-anchor="middle" fill="var(--muted)">
+        ④번에서 server actor 큐가 비어 있으면, ChatWorker 스레드가 곧바로 ⑤를 실행합니다 (Flush가 워커 스레드에서 일어남).
+      </text>
+    </svg>
+    <figcaption>한 명령이 5단계를 거쳐 Room까지 도달하는 흐름. 워커가 진짜 일을 하는 모습이 보입니다.</figcaption>
+  </figure>
+
+  <p class="muted">이 흐름이 <b>JobDispatcher&lt;ChatWorker&gt;가 단순 장식이 아니라 진짜로 작업을 처리</b>한다는 증거입니다. 4개 워커가 서로 다른 명령을 동시에 dequeue해서 처리하므로 자연스럽게 병렬화됩니다.</p>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec6">
+  <h2><span class="num">6</span>Room → User 브로드캐스트의 병렬성</h2>
+  <p>Room이 100명에게 채팅 메시지를 뿌릴 때, 만약 Room이 한 명씩 직접 보내며 기다리면 그동안 Room의 큐가 막힙니다. ExampleChatServer는 그렇게 하지 않습니다. Room은 <code>user.DeliverMessage(msg)</code>로 <b>각 User actor의 큐에 작업을 던지고 즉시 다음 사람으로 넘어갑니다</b>. 실제 송신은 각 User actor가 자기 큐에서 처리하므로 병렬화됩니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1100 320" aria-label="broadcast parallelism">
+      <defs>
+        <marker id="ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <rect x="60" y="120" width="200" height="80" rx="14" fill="var(--room)"/>
+      <text class="lbl" x="160" y="155" text-anchor="middle" style="fill:#0b1735">Room "general"</text>
+      <text class="sub" x="160" y="175" text-anchor="middle" style="fill:#0b1735">foreach user → DeliverMessage</text>
+
+      <!-- 4명의 user에게 -->
+      <rect x="500" y="30"  width="220" height="50" rx="10" fill="var(--user)"/>
+      <rect x="500" y="105" width="220" height="50" rx="10" fill="var(--user)"/>
+      <rect x="500" y="180" width="220" height="50" rx="10" fill="var(--user)"/>
+      <rect x="500" y="255" width="220" height="50" rx="10" fill="var(--user)"/>
+      <text class="lbl" x="610" y="60"  text-anchor="middle">User alice (actor)</text>
+      <text class="lbl" x="610" y="135" text-anchor="middle">User bob (actor)</text>
+      <text class="lbl" x="610" y="210" text-anchor="middle">User carol (actor)</text>
+      <text class="lbl" x="610" y="285" text-anchor="middle">User dave (actor)</text>
+
+      <!-- 각 user의 IO 박스 -->
+      <rect x="780" y="30"  width="280" height="50" rx="10" fill="#1e293b" stroke="var(--line)"/>
+      <rect x="780" y="105" width="280" height="50" rx="10" fill="#1e293b" stroke="var(--line)"/>
+      <rect x="780" y="180" width="280" height="50" rx="10" fill="#1e293b" stroke="var(--line)"/>
+      <rect x="780" y="255" width="280" height="50" rx="10" fill="#1e293b" stroke="var(--line)"/>
+      <text class="ink lbl" x="920" y="60"  text-anchor="middle">SendMessage (~2ms)</text>
+      <text class="ink lbl" x="920" y="135" text-anchor="middle">SendMessage (~2ms)</text>
+      <text class="ink lbl" x="920" y="210" text-anchor="middle">SendMessage (~2ms)</text>
+      <text class="ink lbl" x="920" y="285" text-anchor="middle">SendMessage (~2ms)</text>
+
+      <path d="M260 150 L 500 55"  stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M260 160 L 500 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M260 170 L 500 205" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M260 180 L 500 280" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+
+      <path d="M720 55  L 780 55"  stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M720 130 L 780 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M720 205 L 780 205" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <path d="M720 280 L 780 280" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+
+      <!-- 동시에 진행 중 깜빡임 -->
+      <g style="animation:blink 1.6s ease-in-out infinite">
+        <circle cx="1000" cy="55" r="8"  fill="#22d3ee"/>
+        <circle cx="1000" cy="130" r="8" fill="#22d3ee"/>
+        <circle cx="1000" cy="205" r="8" fill="#22d3ee"/>
+        <circle cx="1000" cy="280" r="8" fill="#22d3ee"/>
+      </g>
+    </svg>
+    <figcaption>Room은 4명에게 "보내라"는 작업만 던지고 즉시 끝납니다. 실제 송신은 4개 User actor가 각각 자기 워커 스레드에서 동시에 진행됩니다.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <b>왜 이게 좋은가?</b> 만약 User가 actor가 아니었다면 Room이 4명에게 직접 <code>SendMessage</code>를 호출하면서 Thread.Sleep을 차례로 기다려야 했고, 그동안 Room 큐의 다른 작업(다른 채팅, 입장/퇴장)은 모두 멈췄을 겁니다.
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec7">
+  <h2><span class="num">7</span>자기복제 Heartbeat — DoAsyncAfter</h2>
+  <p><b>"5초마다 통계 출력"</b>이나 <b>"15초마다 방 인원 알림"</b> 같은 주기 작업은 어떻게 만들까요? <code>Timer</code>를 따로 두지 않고, actor가 <b>자기 자신에게 다음 일정을 예약</b>합니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 240" aria-label="self-rescheduling heartbeat">
+      <defs>
+        <marker id="ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#fde047"/>
+        </marker>
+      </defs>
+
+      <rect x="380" y="80" width="240" height="80" rx="14" fill="var(--srv)"/>
+      <text class="lbl" x="500" y="115" text-anchor="middle" style="fill:#0b1735">ChatServer.StatsHeartbeat()</text>
+      <text class="sub" x="500" y="135" text-anchor="middle" style="fill:#0b1735">통계 출력 후 5초 뒤 자기 호출 예약</text>
+
+      <!-- 곡선 화살표: 자기에게 -->
+      <path d="M620 100 C 800 40, 800 200, 620 140"
+            stroke="var(--timer)" stroke-width="3" fill="none" stroke-dasharray="6 4"
+            marker-end="url(#ar6)"/>
+      <text class="ink lbl" x="780" y="125" fill="var(--timer)" text-anchor="middle">DoAsyncAfter(5s)</text>
+
+      <!-- 펄스하는 시계 -->
+      <g style="animation:pulse 2s ease-in-out infinite">
+        <circle cx="180" cy="120" r="40" fill="var(--timer)"/>
+        <text x="180" y="128" text-anchor="middle" class="lbl" style="font-size:24px;fill:#0b1735">⏲</text>
+      </g>
+      <text class="ink lbl" x="180" y="190" text-anchor="middle">PeriodicTimer (1ms)</text>
+      <text class="sub" x="180" y="208" text-anchor="middle" fill="var(--muted)">JobDispatcherNET 내부</text>
+
+      <path d="M220 120 L 380 120" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#ar6)"/>
+      <text class="sub" x="300" y="108" text-anchor="middle" fill="var(--muted)">시간이 되면 큐로 푸시</text>
+    </svg>
+    <figcaption>StatsHeartbeat이 자기 끝에서 다시 자기를 5초 뒤로 예약합니다. 무한 루프가 락 없이 굴러갑니다.</figcaption>
+  </figure>
+
+  <pre><code><span class="kw">private void</span> StatsHeartbeat()
+{
+    <span class="kw">if</span> (_stopped) <span class="kw">return</span>;
+
+    Console.WriteLine($<span class="st">"==== Stats: 사용자 {_users.Count}명 ===="</span>);
+
+    DoAsyncAfter(_statsPeriod, StatsHeartbeat);  <span class="cm">// ← 자기 자신을 5초 뒤로 예약</span>
+}</code></pre>
+
+  <p>ExampleChatServer는 이 패턴을 3군데에서 씁니다:</p>
+  <ul>
+    <li><span class="badge srv">ChatServer</span> — 5초마다 통계, 10초마다 유휴 스캔</li>
+    <li><span class="badge room">Room</span> — 15초마다 방 인원 알림</li>
+  </ul>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec8">
+  <h2><span class="num">8</span>유휴 disconnect 시퀀스 — actor가 actor에게 말하기</h2>
+  <p>"30초 동안 아무 활동이 없으면 자동 종료"를 어떻게 구현할까요? <b>두 actor가 서로에게 메시지를 던지며</b> 협력합니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1100 360" aria-label="idle disconnect sequence">
+      <defs>
+        <marker id="ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#22d3ee"/>
+        </marker>
+      </defs>
+
+      <!-- 라인 1: ChatServer -->
+      <rect x="60" y="40" width="200" height="50" rx="10" fill="var(--srv)"/>
+      <text class="lbl" x="160" y="70" text-anchor="middle" style="fill:#0b1735">ChatServer</text>
+      <line x1="160" y1="90" x2="160" y2="340" stroke="var(--srv)" stroke-width="2" stroke-dasharray="3 4"/>
+
+      <!-- 라인 2: User -->
+      <rect x="800" y="40" width="200" height="50" rx="10" fill="var(--user)"/>
+      <text class="lbl" x="900" y="70" text-anchor="middle">User "alice"</text>
+      <line x1="900" y1="90" x2="900" y2="340" stroke="var(--user)" stroke-width="2" stroke-dasharray="3 4"/>
+
+      <!-- 메시지 1: 10초 timer 발화, IdleScanHeartbeat 자기에게 -->
+      <rect x="80" y="115" width="160" height="34" rx="8" fill="#0f1722" stroke="var(--line)"/>
+      <text class="sub" x="160" y="137" text-anchor="middle" fill="#cbd5e1">DoAsyncAfter 발화</text>
+      <text class="sub" x="160" y="108" text-anchor="middle" fill="var(--muted)">10초마다</text>
+
+      <!-- 메시지 2: server → user.CheckIdleAndDisconnect -->
+      <path d="M160 165 L 900 165" stroke="#22d3ee" stroke-width="2" marker-end="url(#ar7)"/>
+      <text class="ink lbl" x="530" y="158" text-anchor="middle">user.CheckIdleAndDisconnect(this, 30000)</text>
+      <text class="sub" x="530" y="180" text-anchor="middle" fill="var(--muted)">User actor 큐에 push</text>
+
+      <!-- User 내부 처리: 자기 _lastActivityTickMs 검사 -->
+      <rect x="850" y="195" width="200" height="50" rx="8" fill="#0f1722" stroke="var(--line)"/>
+      <text class="sub" x="950" y="215" text-anchor="middle" fill="#cbd5e1">자기 큐 안에서</text>
+      <text class="sub" x="950" y="232" text-anchor="middle" fill="#cbd5e1">_lastActivityTickMs 검사</text>
+
+      <!-- 메시지 3: user → server.HandleUserDisconnect -->
+      <path d="M900 270 L 160 270" stroke="#22d3ee" stroke-width="2" marker-end="url(#ar7)"/>
+      <text class="ink lbl" x="530" y="263" text-anchor="middle">server.HandleUserDisconnect("alice")</text>
+      <text class="sub" x="530" y="285" text-anchor="middle" fill="var(--muted)">초과했으면 disconnect 요청</text>
+
+      <!-- 결과 -->
+      <rect x="80" y="295" width="200" height="40" rx="8" fill="#0f1722" stroke="var(--line)"/>
+      <text class="sub" x="180" y="320" text-anchor="middle" fill="#cbd5e1">_users.Remove + 모든 방에서 제거</text>
+    </svg>
+    <figcaption>10초마다 ChatServer가 모든 User에게 "유휴 검사해봐"를 던지고, User가 자기 시각을 안전하게 검사한 뒤 필요하면 disconnect를 요청합니다.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <b>왜 User가 직접 검사하나?</b> <code>_lastActivityTickMs</code>는 메시지를 받을 때마다 갱신되는데, 만약 ChatServer가 그 값을 직접 읽으면 race가 생깁니다. User actor 안에서만 읽고 쓰면 락이 필요 없습니다 — 이게 actor 모델의 진짜 위력입니다.
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec9">
+  <h2><span class="num">9</span>파일별 핵심 코드</h2>
+
+  <h3>ChatWorker.cs <span class="badge worker">IRunnable</span></h3>
+  <pre><code><span class="kw">public class</span> <span class="ty">ChatWorker</span> : <span class="ty">IRunnable</span>
+{
+    <span class="kw">public static readonly</span> ConcurrentQueue&lt;Action&gt; InboundCommands = <span class="kw">new</span>();
+
+    <span class="kw">public bool</span> Run(CancellationToken token)
+    {
+        <span class="kw">if</span> (token.IsCancellationRequested) <span class="kw">return false</span>;
+
+        <span class="kw">if</span> (InboundCommands.TryDequeue(<span class="kw">out var</span> cmd))
+            cmd();   <span class="cm">// ← 이 안에서 server.HandleX 가 실행됨</span>
+        <span class="kw">else</span>
+            Thread.Sleep(<span class="num2">1</span>);
+
+        <span class="kw">long</span> now = ThreadContext.TickCount;  <span class="cm">// 워커 스레드 ThreadLocal</span>
+        <span class="cm">// ... 5초마다 통계 로그 ...</span>
+        <span class="kw">return true</span>;
+    }
+}</code></pre>
+  <p class="muted">전용 OS 스레드에서 무한 루프로 큐를 비웁니다. 일이 없으면 1ms 잠깐 양보.</p>
+
+  <h3>User.cs <span class="badge user">AsyncExecutable</span></h3>
+  <pre><code><span class="kw">public sealed class</span> <span class="ty">User</span> : <span class="ty">AsyncExecutable</span>
+{
+    <span class="kw">private readonly</span> HashSet&lt;<span class="kw">string</span>&gt; _joinedRoomIds = [];   <span class="cm">// 락 없음!</span>
+    <span class="kw">private long</span> _lastActivityTickMs;
+
+    <span class="kw">public void</span> DeliverMessage(ChatMessage msg) =&gt; DoAsync(() =&gt;
+    {
+        _lastActivityTickMs = Environment.TickCount64;
+        _client.SendMessage(msg);   <span class="cm">// 동기 — User actor 큐에서 직렬</span>
+    });
+
+    <span class="kw">public</span> UserSnapshot GetSnapshot()
+    {
+        <span class="kw">using var</span> ev = <span class="kw">new</span> ManualResetEventSlim(<span class="kw">false</span>);
+        UserSnapshot? result = <span class="kw">null</span>;
+        DoAsync(() =&gt;
+        {
+            <span class="kw">long</span> idle = Environment.TickCount64 - _lastActivityTickMs;
+            result = <span class="kw">new</span> UserSnapshot(UserId, Username, _joinedRoomIds.ToList(), idle);
+            ev.Set();
+        });
+        ev.Wait();   <span class="cm">// 차단 대기 — 전통적 스레드 동기화</span>
+        <span class="kw">return</span> result!;
+    }
+
+    <span class="kw">public void</span> CheckIdleAndDisconnect(ChatServer server, <span class="kw">long</span> thresholdMs) =&gt; DoAsync(() =&gt;
+    {
+        <span class="kw">long</span> idle = Environment.TickCount64 - _lastActivityTickMs;
+        <span class="kw">if</span> (idle &gt; thresholdMs)
+            server.HandleUserDisconnect(UserId);  <span class="cm">// actor → actor</span>
+    });
+}</code></pre>
+
+  <h3>Room.cs <span class="badge room">AsyncExecutable</span></h3>
+  <pre><code><span class="kw">public void</span> ProcessChatMessage(<span class="kw">string</span> senderId, <span class="kw">string</span> content) =&gt; DoAsync(() =&gt;
+{
+    <span class="kw">if</span> (!_users.TryGetValue(senderId, <span class="kw">out var</span> sender)) <span class="kw">return</span>;
+
+    <span class="kw">var</span> message = <span class="kw">new</span> ChatMessage(...);
+
+    <span class="kw">foreach</span> (<span class="kw">var</span> user <span class="kw">in</span> _users.Values)
+        user.DeliverMessage(message);   <span class="cm">// 각자 자기 큐로 넘기고 즉시 다음 사람</span>
+});
+
+<span class="kw">private void</span> Heartbeat(TimeSpan period)
+{
+    <span class="kw">if</span> (_stopped) <span class="kw">return</span>;
+    <span class="cm">// ... 인원 알림 broadcast ...</span>
+    DoAsyncAfter(period, () =&gt; Heartbeat(period));   <span class="cm">// 자기복제</span>
+}</code></pre>
+
+  <h3>ChatServer.cs <span class="badge srv">AsyncExecutable</span></h3>
+  <pre><code><span class="kw">public void</span> HandleRoomChat(<span class="kw">string</span> userId, <span class="kw">string</span> roomId, <span class="kw">string</span> content) =&gt; DoAsync(() =&gt;
+{
+    <span class="kw">if</span> (_rooms.TryGetValue(roomId, <span class="kw">out var</span> room))
+        room.ProcessChatMessage(userId, content);   <span class="cm">// Room actor로 넘김</span>
+});
+
+<span class="kw">public</span> ServerSnapshot GetSnapshot()
+{
+    <span class="cm">// 1단계 — server actor 큐에서 user/room 참조만 복사</span>
+    User[] userArr; Room[] roomArr;
+    <span class="kw">using</span> (<span class="kw">var</span> ev = <span class="kw">new</span> ManualResetEventSlim(<span class="kw">false</span>))
+    {
+        User[]? u = <span class="kw">null</span>; Room[]? r = <span class="kw">null</span>;
+        DoAsync(() =&gt;
+        {
+            u = _users.Values.ToArray();
+            r = _rooms.Values.ToArray();
+            ev.Set();
+        });
+        ev.Wait();
+        userArr = u!; roomArr = r!;
+    }
+    <span class="cm">// 2단계 — 호출자 스레드에서 fan-out (각 actor 가 자기 큐로 직렬화)</span>
+    <span class="kw">var</span> users = userArr.Select(x =&gt; x.GetSnapshot()).ToArray();
+    <span class="kw">var</span> rooms = roomArr.Select(x =&gt; x.GetSnapshot()).ToArray();
+    <span class="kw">return new</span> ServerSnapshot(users, rooms);
+}
+
+<span class="kw">public void</span> Stop()
+{
+    _stopped = <span class="kw">true</span>;
+    DoAsync(() =&gt; { <span class="cm">/* 모든 방 강제 정리 */</span> });
+    DisposeAsync().AsTask().Wait();   <span class="cm">// 라이브러리의 ValueTask 만 1회 차단</span>
+    _dispatcher?.Dispose();             <span class="cm">// 워커 스레드 Join</span>
+    TimerRegistry.DisposeAll();
+}</code></pre>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec-maint">
+  <h2><span class="num">★</span>유지보수: 람다 vs 명명된 메서드</h2>
+  <p class="lead">actor 패턴의 흔한 함정 하나는 <b>처리 본문을 모두 <code>DoAsync(() =&gt; { ... })</code> 람다 안에 쑤셔넣는 것</b>입니다. 디버거에서 스택 트레이스가 <code>&lt;HandleUserConnect&gt;b__0_0</code> 같은 익명 이름으로 찍히고, 브레이크포인트·grep·프로파일러 모두 곤란해집니다.</p>
+
+  <p>이 예제는 <b>2단 분리 패턴</b>을 사용합니다:</p>
+  <ul>
+    <li><b>public <code>Handle*</code> / <code>동사*</code></b> — 큐에 푸시만. 한 줄짜리 expression-bodied.</li>
+    <li><b>private <code>Process*</code></b> — 실제 본문. 디버거가 이름으로 잡고, 스택 트레이스에 또렷이 찍히고, grep으로 한 번에 찾을 수 있습니다.</li>
+  </ul>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>❌ 람다에 본문 매몰</h4>
+      <pre><code><span class="kw">public void</span> HandleUserConnect(IChatClient client)
+{
+    DoAsync(() =&gt;
+    {
+        <span class="kw">if</span> (_users.ContainsKey(client.UserId))
+        {
+            Console.WriteLine($<span class="st">"이미 접속: {client.UserId}"</span>);
+            <span class="kw">return</span>;
+        }
+        <span class="kw">var</span> user = <span class="kw">new</span> User(client);
+        _users[user.UserId] = user;
+        BroadcastSystemToAll(...);
+    });
+}</code></pre>
+      <p class="muted">스택 트레이스: <code>&lt;HandleUserConnect&gt;b__0_0()</code></p>
+    </div>
+    <div class="card">
+      <h4>✓ 본문은 명명된 메서드로</h4>
+      <pre><code><span class="kw">public void</span> HandleUserConnect(IChatClient client)
+    =&gt; DoAsync(() =&gt; ProcessUserConnect(client));
+
+<span class="kw">private void</span> ProcessUserConnect(IChatClient client)
+{
+    <span class="kw">if</span> (_users.ContainsKey(client.UserId))
+    {
+        Console.WriteLine($<span class="st">"이미 접속: {client.UserId}"</span>);
+        <span class="kw">return</span>;
+    }
+    <span class="kw">var</span> user = <span class="kw">new</span> User(client);
+    _users[user.UserId] = user;
+    BroadcastSystemToAll(...);
+}</code></pre>
+      <p class="muted">스택 트레이스: <code>ChatServer.ProcessUserConnect()</code></p>
+    </div>
+  </div>
+
+  <h3>왜 이게 더 좋은가?</h3>
+  <ul>
+    <li><b>스택 트레이스</b> — 예외 발생 시 컴파일러가 만든 익명 이름(<code>&lt;...&gt;b__#_#</code>) 대신 사람이 읽을 수 있는 메서드 이름이 나옵니다.</li>
+    <li><b>브레이크포인트</b> — 메서드 첫 줄에 한 번만 걸면 됨. 람다는 람다가 캡처된 위치마다 따로 걸어야 함.</li>
+    <li><b>프로파일러</b> — VS Profiler / dotTrace / PerfView 모두 메서드 이름으로 시간 표시. 람다는 모두 묶여서 무엇이 느린지 안 보임.</li>
+    <li><b>코드 검색</b> — <code>grep ProcessUserConnect</code> 한 번이면 정의·호출 모두 찾음.</li>
+    <li><b>코드 리뷰</b> — 한 메서드 = 한 책임이 시각적으로 명확.</li>
+    <li><b>테스트</b> — InternalsVisibleTo 또는 별도 인터페이스로 단위 테스트하기 쉬움.</li>
+  </ul>
+
+  <h3>인라인 람다를 그대로 둬도 되는 경우</h3>
+  <ul>
+    <li><b>1-statement trivial 본문</b>: <code>DoAsync(() =&gt; _joinedRoomIds.Remove(roomId))</code> — 추출하면 오히려 노이즈.</li>
+    <li><b>로컬 변수 closure 캡처가 필요한 경우</b>: <code>GetSnapshot()</code>처럼 <code>ManualResetEventSlim</code>과 결과 변수를 캡처해야 하면 람다가 자연스럽습니다.</li>
+  </ul>
+
+  <div class="callout">
+    <b>실용 규칙</b>: 본문이 <b>2줄 이상</b>이거나 <b>분기/반복</b>이 있으면 <code>Process*</code> 메서드로 추출하세요. 그렇지 않으면 람다 유지.
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec-net">
+  <h2><span class="num">★</span>네트워크 IO 스레드 (멀티 프로듀서)</h2>
+  <p class="lead">실제 채팅 서버는 <b>여러 TCP 연결이 각자 자기 IO 스레드</b>를 가지고 동시에 패킷을 파싱 → <code>server.HandleX(...)</code> 를 호출합니다. 이 예제의 <code>NetworkSimulator</code> 는 이 구조를 그대로 흉내 냅니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1100 480" aria-label="multi-producer network architecture">
+      <defs>
+        <marker id="arN" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- N개 IO 스레드 -->
+      <text class="ink lbl" x="130" y="25" text-anchor="middle">네트워크 IO 스레드 (N개 = TCP 연결 수)</text>
+      <g>
+        <rect x="40" y="40"  width="180" height="55" rx="10" fill="#1e293b" stroke="#22d3ee" stroke-width="2"/>
+        <text class="ink lbl" x="130" y="64" text-anchor="middle">NetIO-0 (tid=11)</text>
+        <text class="sub" x="130" y="82" text-anchor="middle" fill="#cbd5e1">클라0 패킷 파싱</text>
+      </g>
+      <g>
+        <rect x="40" y="105" width="180" height="55" rx="10" fill="#1e293b" stroke="#22d3ee" stroke-width="2"/>
+        <text class="ink lbl" x="130" y="129" text-anchor="middle">NetIO-1 (tid=12)</text>
+        <text class="sub" x="130" y="147" text-anchor="middle" fill="#cbd5e1">클라1 패킷 파싱</text>
+      </g>
+      <g>
+        <rect x="40" y="170" width="180" height="55" rx="10" fill="#1e293b" stroke="#22d3ee" stroke-width="2"/>
+        <text class="ink lbl" x="130" y="194" text-anchor="middle">NetIO-2 (tid=13)</text>
+        <text class="sub" x="130" y="212" text-anchor="middle" fill="#cbd5e1">클라2 패킷 파싱</text>
+      </g>
+      <g>
+        <rect x="40" y="235" width="180" height="55" rx="10" fill="#1e293b" stroke="#22d3ee" stroke-width="2"/>
+        <text class="ink lbl" x="130" y="259" text-anchor="middle">NetIO-3 (tid=14)</text>
+        <text class="sub" x="130" y="277" text-anchor="middle" fill="#cbd5e1">클라3 패킷 파싱</text>
+      </g>
+      <text class="sub" x="130" y="320" text-anchor="middle" fill="var(--muted)">⋮</text>
+      <g>
+        <rect x="40" y="335" width="180" height="55" rx="10" fill="#1e293b" stroke="#22d3ee" stroke-width="2"/>
+        <text class="ink lbl" x="130" y="359" text-anchor="middle">NetIO-N</text>
+        <text class="sub" x="130" y="377" text-anchor="middle" fill="#cbd5e1">동시에 push</text>
+      </g>
+
+      <!-- 화살표들이 모두 InboundCommands 로 -->
+      <path d="M220 67  L 410 200" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M220 132 L 410 210" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M220 197 L 410 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M220 262 L 410 230" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M220 362 L 410 240" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+
+      <!-- 중앙 큐 -->
+      <rect x="410" y="180" width="280" height="80" rx="14" fill="#0f1722" stroke="var(--queue)" stroke-width="3"/>
+      <text class="ink lbl" x="550" y="208" text-anchor="middle">ChatWorker.InboundCommands</text>
+      <text class="sub" x="550" y="226" text-anchor="middle" fill="var(--muted)">ConcurrentQueue&lt;Action&gt; — 다중 producer 안전</text>
+      <rect x="430" y="232" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="455" y="232" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="480" y="232" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="505" y="232" width="20" height="18" rx="3" fill="#94a3b8"/>
+      <rect x="530" y="232" width="20" height="18" rx="3" fill="#94a3b8"/>
+
+      <!-- 화살표들이 worker 로 -->
+      <path d="M690 220 L 800 70"  stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M690 220 L 800 145" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M690 220 L 800 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+      <path d="M690 220 L 800 295" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+
+      <!-- 워커 -->
+      <text class="ink lbl" x="930" y="25" text-anchor="middle">JobDispatcher 워커 (4개)</text>
+      <g>
+        <rect x="800" y="40"  width="240" height="55" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="920" y="64" text-anchor="middle">Worker 1 (tid=5)</text>
+        <text class="sub" x="920" y="82" text-anchor="middle">Run() — TryDequeue</text>
+      </g>
+      <g>
+        <rect x="800" y="115"  width="240" height="55" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="920" y="139" text-anchor="middle">Worker 2 (tid=6)</text>
+      </g>
+      <g>
+        <rect x="800" y="190"  width="240" height="55" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="920" y="214" text-anchor="middle">Worker 3 (tid=7)</text>
+      </g>
+      <g>
+        <rect x="800" y="265"  width="240" height="55" rx="10" fill="var(--worker)"/>
+        <text class="lbl" x="920" y="289" text-anchor="middle">Worker 4 (tid=8)</text>
+      </g>
+
+      <!-- actor 큐 -->
+      <rect x="800" y="350" width="240" height="50" rx="10" fill="var(--srv)"/>
+      <text class="lbl" x="920" y="380" text-anchor="middle" style="fill:#0b1735">ChatServer actor</text>
+      <path d="M920 320 V 350" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arN)"/>
+
+      <!-- 라벨 -->
+      <text class="sub" x="295" y="410" fill="var(--muted)">① 다중 producer push</text>
+      <text class="sub" x="555" y="290" text-anchor="middle" fill="var(--muted)">② lock-free 큐</text>
+      <text class="sub" x="745" y="410" fill="var(--muted)">③ 워커가 dequeue & invoke</text>
+      <text class="sub" x="920" y="425" text-anchor="middle" fill="var(--muted)">④ actor 큐가 직렬화 (락 0개)</text>
+    </svg>
+    <figcaption>여러 IO 스레드가 같은 큐에 동시에 push해도 안전. 워커들이 dequeue해서 server actor를 호출하면, 그 다음은 actor 큐가 한 번에 하나씩만 통과시켜 락 없는 안전을 보장합니다.</figcaption>
+  </figure>
+
+  <h3>이 구조가 보여주는 4가지 핵심 특성</h3>
+
+  <!-- ① 네트워크 ↔ 처리 분리 -->
+  <h4>① 네트워크 스레드와 처리 스레드의 완전한 분리</h4>
+  <p>IO 스레드는 <b>패킷을 받아 큐에 던지면 즉시 다음 패킷</b>으로 넘어갑니다. 워커는 <b>자기 페이스로 actor 로직을 처리</b>합니다. 두 그룹은 서로의 속도에 영향을 받지 않으며, 각자 다른 기준으로 스케일됩니다 (IO=연결 수, Worker=CPU 코어 수). Kestrel · libevent · boost.asio 등 모든 서버 프레임워크가 이 패턴입니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 360" aria-label="IO vs processing separation">
+      <defs>
+        <marker id="arS1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 왼쪽: IO 스레드 그룹 -->
+      <text class="ink lbl" x="170" y="30" text-anchor="middle">IO 스레드 (N ≈ 연결 수)</text>
+      <text class="sub" x="170" y="50" text-anchor="middle" fill="var(--muted)">짧은 작업 (μs 단위) — push 후 즉시 다음 패킷</text>
+
+      <g>
+        <rect x="40" y="70" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="70" y="93" text-anchor="middle" fill="#cbd5e1">IO-0</text>
+      </g>
+      <g>
+        <rect x="110" y="70" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="140" y="93" text-anchor="middle" fill="#cbd5e1">IO-1</text>
+      </g>
+      <g>
+        <rect x="180" y="70" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="210" y="93" text-anchor="middle" fill="#cbd5e1">IO-2</text>
+      </g>
+      <g>
+        <rect x="250" y="70" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="280" y="93" text-anchor="middle" fill="#cbd5e1">IO-3</text>
+      </g>
+      <g>
+        <rect x="40" y="115" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="70" y="138" text-anchor="middle" fill="#cbd5e1">IO-4</text>
+      </g>
+      <g>
+        <rect x="110" y="115" width="60" height="36" rx="6" fill="#1e293b" stroke="#22d3ee"/>
+        <text class="sub" x="140" y="138" text-anchor="middle" fill="#cbd5e1">IO-5</text>
+      </g>
+      <text class="sub" x="220" y="138" fill="var(--muted)">… (수천 개도 가능)</text>
+
+      <!-- 시간 축 — IO -->
+      <text class="sub" x="170" y="180" text-anchor="middle" fill="var(--muted)">시간축 (각 스레드 동작)</text>
+      <line x1="40" y1="195" x2="300" y2="195" stroke="#94a3b8" stroke-width="1"/>
+      <g fill="#22d3ee">
+        <rect x="42" y="187" width="6" height="16" rx="1"/>
+        <rect x="60" y="187" width="6" height="16" rx="1"/>
+        <rect x="78" y="187" width="6" height="16" rx="1"/>
+        <rect x="96" y="187" width="6" height="16" rx="1"/>
+        <rect x="120" y="187" width="6" height="16" rx="1"/>
+        <rect x="142" y="187" width="6" height="16" rx="1"/>
+        <rect x="170" y="187" width="6" height="16" rx="1"/>
+        <rect x="200" y="187" width="6" height="16" rx="1"/>
+        <rect x="230" y="187" width="6" height="16" rx="1"/>
+        <rect x="260" y="187" width="6" height="16" rx="1"/>
+      </g>
+      <text class="sub" x="170" y="222" text-anchor="middle" fill="var(--muted)">push 자주 (예: 100μs마다)</text>
+
+      <!-- 가운데: 큐 -->
+      <rect x="370" y="100" width="220" height="60" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="480" y="125" text-anchor="middle">InboundCommands</text>
+      <text class="sub" x="480" y="143" text-anchor="middle" fill="var(--muted)">결합 해제 (decouple)</text>
+
+      <path d="M310 130 L 370 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS1)"/>
+      <path d="M590 130 L 650 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS1)"/>
+
+      <!-- 오른쪽: 워커 -->
+      <text class="ink lbl" x="820" y="30" text-anchor="middle">Worker (M ≈ CPU 코어 수)</text>
+      <text class="sub" x="820" y="50" text-anchor="middle" fill="var(--muted)">긴 작업 (ms 단위) — actor 로직 + IO 시뮬</text>
+
+      <g>
+        <rect x="660" y="70" width="80" height="42" rx="8" fill="var(--worker)"/>
+        <text class="sub" x="700" y="96" text-anchor="middle">Worker 1</text>
+      </g>
+      <g>
+        <rect x="750" y="70" width="80" height="42" rx="8" fill="var(--worker)"/>
+        <text class="sub" x="790" y="96" text-anchor="middle">Worker 2</text>
+      </g>
+      <g>
+        <rect x="840" y="70" width="80" height="42" rx="8" fill="var(--worker)"/>
+        <text class="sub" x="880" y="96" text-anchor="middle">Worker 3</text>
+      </g>
+      <g>
+        <rect x="930" y="70" width="60" height="42" rx="8" fill="var(--worker)"/>
+        <text class="sub" x="960" y="96" text-anchor="middle">W4</text>
+      </g>
+
+      <!-- 시간 축 — Worker -->
+      <line x1="660" y1="195" x2="990" y2="195" stroke="#94a3b8" stroke-width="1"/>
+      <g fill="#f59e0b">
+        <rect x="665" y="183" width="40" height="24" rx="2"/>
+        <rect x="715" y="183" width="40" height="24" rx="2"/>
+        <rect x="765" y="183" width="40" height="24" rx="2"/>
+        <rect x="815" y="183" width="40" height="24" rx="2"/>
+        <rect x="865" y="183" width="40" height="24" rx="2"/>
+        <rect x="920" y="183" width="40" height="24" rx="2"/>
+      </g>
+      <text class="sub" x="820" y="222" text-anchor="middle" fill="var(--muted)">process 가끔 (예: 5ms마다)</text>
+
+      <!-- 핵심 박스 -->
+      <rect x="40" y="260" width="950" height="80" rx="10" fill="rgba(34,211,238,.08)" stroke="var(--accent)"/>
+      <text class="ink lbl" x="515" y="284" text-anchor="middle">스케일 축이 다름 → 독립 튜닝 가능</text>
+      <text class="sub" x="515" y="305" text-anchor="middle" fill="#cbd5e1">예: 연결 1만 + CPU 8 코어 → IO 스레드 8개(epoll/IOCP) + Worker 8개로 충분</text>
+      <text class="sub" x="515" y="324" text-anchor="middle" fill="#cbd5e1">큐 깊이가 늘면 워커 처리가 못 따라간다는 신호 → 워커만 늘리면 됨 (IO는 그대로)</text>
+    </svg>
+    <figcaption>IO와 Worker는 서로 다른 기준으로 스케일하고 서로의 속도에 영향받지 않습니다.</figcaption>
+  </figure>
+
+  <!-- ② 다중 producer 안전 -->
+  <h4>② 다중 Producer ConcurrentQueue 안전성 (lock-free)</h4>
+  <p>전통적 큐는 push마다 lock을 잡아야 해서, N개 IO 스레드 중 1개만 들어갈 수 있고 나머지 N-1개는 <b>대기</b>합니다. <code>ConcurrentQueue&lt;T&gt;</code>는 CAS(Compare-And-Swap) 기반이라 N개 스레드가 모두 <b>동시에 진행</b>하며, 충돌 시 짧게 retry할 뿐 절대 block되지 않습니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 320" aria-label="locked vs lockfree queue comparison">
+      <defs>
+        <marker id="arS2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 왼쪽: 락 기반 -->
+      <text class="ink lbl" x="220" y="30" text-anchor="middle">전통적 락 기반 큐 (Queue + lock)</text>
+
+      <g><rect x="40"  y="55" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="80"  y="76" text-anchor="middle" fill="#cbd5e1">IO-0</text></g>
+      <g><rect x="40" y="95" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="80"  y="116" text-anchor="middle" fill="#cbd5e1">IO-1</text></g>
+      <g><rect x="40" y="135" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="80"  y="156" text-anchor="middle" fill="#cbd5e1">IO-2</text></g>
+      <g><rect x="40" y="175" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="80"  y="196" text-anchor="middle" fill="#cbd5e1">IO-3</text></g>
+      <g><rect x="40" y="215" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="80"  y="236" text-anchor="middle" fill="#cbd5e1">IO-4</text></g>
+
+      <path d="M120 71  L 200 145" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+      <path d="M120 111 L 200 145" stroke="#ef4444" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
+      <path d="M120 151 L 200 151" stroke="#ef4444" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
+      <path d="M120 191 L 200 157" stroke="#ef4444" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
+      <path d="M120 231 L 200 163" stroke="#ef4444" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
+
+      <rect x="200" y="120" width="120" height="60" rx="10" fill="#7f1d1d" stroke="#ef4444"/>
+      <text class="ink lbl" x="260" y="145" text-anchor="middle">🔒 lock</text>
+      <text class="sub" x="260" y="163" text-anchor="middle" fill="#fee2e2">1개만 통과</text>
+
+      <text class="sub" x="345" y="138" fill="#ef4444">4개 IO 대기</text>
+      <text class="sub" x="345" y="156" fill="#ef4444">→ 직렬화</text>
+
+      <text class="sub" x="220" y="285" text-anchor="middle" fill="#ef4444">총 push 시간 ≈ N × T_push</text>
+      <text class="sub" x="220" y="303" text-anchor="middle" fill="var(--muted)">스레드가 늘어도 throughput 한계</text>
+
+      <!-- 구분선 -->
+      <line x1="500" y1="20" x2="500" y2="310" stroke="var(--line)" stroke-dasharray="4 4"/>
+
+      <!-- 오른쪽: lock-free -->
+      <text class="ink lbl" x="780" y="30" text-anchor="middle">ConcurrentQueue (CAS 기반, lock-free)</text>
+
+      <g><rect x="540" y="55" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="580" y="76" text-anchor="middle" fill="#cbd5e1">IO-0</text></g>
+      <g><rect x="540" y="95" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="580" y="116" text-anchor="middle" fill="#cbd5e1">IO-1</text></g>
+      <g><rect x="540" y="135" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="580" y="156" text-anchor="middle" fill="#cbd5e1">IO-2</text></g>
+      <g><rect x="540" y="175" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="580" y="196" text-anchor="middle" fill="#cbd5e1">IO-3</text></g>
+      <g><rect x="540" y="215" width="80" height="32" rx="6" fill="#1e293b" stroke="#22d3ee"/><text class="sub" x="580" y="236" text-anchor="middle" fill="#cbd5e1">IO-4</text></g>
+
+      <path d="M620 71  L 700 145" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+      <path d="M620 111 L 700 148" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+      <path d="M620 151 L 700 151" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+      <path d="M620 191 L 700 154" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+      <path d="M620 231 L 700 157" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS2)"/>
+
+      <rect x="700" y="120" width="200" height="60" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="800" y="145" text-anchor="middle">CAS-based head ptr</text>
+      <text class="sub" x="800" y="163" text-anchor="middle" fill="var(--muted)">5개 동시 진행 (block 없음)</text>
+
+      <text class="sub" x="780" y="285" text-anchor="middle" fill="#22c55e">총 push 시간 ≈ T_push (병렬)</text>
+      <text class="sub" x="780" y="303" text-anchor="middle" fill="var(--muted)">스레드 추가에 거의 선형 확장</text>
+    </svg>
+    <figcaption>락 기반은 N개 IO가 1개씩 직렬로 통과하지만, ConcurrentQueue는 CAS로 모두 동시 진행합니다.</figcaption>
+  </figure>
+
+  <!-- ③ Actor 직렬화 유지 -->
+  <h4>③ 동시 push에도 Actor 직렬화는 유지됨</h4>
+  <p>여러 IO 스레드가 같은 actor(예: ChatServer)에 동시에 명령을 던져도, actor의 본문은 <b>여전히 한 번에 하나씩만 실행</b>됩니다. <code>_remainingTaskCount</code>를 0→1로 increment 한 스레드만이 그 회차의 Flush를 잡고, 나머지는 채널에 쓰기만 하고 빠집니다. 이게 락 없이도 actor 내부 변수가 안전한 이유입니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 380" aria-label="parallel push, sequential execute">
+      <defs>
+        <marker id="arS3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- N producers (parallel) -->
+      <text class="ink lbl" x="160" y="30" text-anchor="middle">5개 producer 동시 push</text>
+
+      <g><rect x="40" y="50" width="80" height="32" rx="6" fill="var(--worker)"/><text class="sub" x="80" y="71" text-anchor="middle">W1</text></g>
+      <g><rect x="40" y="92" width="80" height="32" rx="6" fill="var(--worker)"/><text class="sub" x="80" y="113" text-anchor="middle">W2</text></g>
+      <g><rect x="40" y="134" width="80" height="32" rx="6" fill="var(--worker)"/><text class="sub" x="80" y="155" text-anchor="middle">W3</text></g>
+      <g><rect x="40" y="176" width="80" height="32" rx="6" fill="var(--worker)"/><text class="sub" x="80" y="197" text-anchor="middle">W4</text></g>
+      <g><rect x="40" y="218" width="80" height="32" rx="6" fill="var(--worker)"/><text class="sub" x="80" y="239" text-anchor="middle">W5</text></g>
+
+      <!-- 동시 push 화살표 -->
+      <path d="M120 66  L 280 130" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+      <path d="M120 108 L 280 138" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+      <path d="M120 150 L 280 146" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+      <path d="M120 192 L 280 154" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+      <path d="M120 234 L 280 162" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+
+      <text class="sub" x="200" y="100" fill="#22c55e">동시</text>
+      <text class="sub" x="200" y="118" fill="#22c55e">(병렬)</text>
+
+      <!-- Actor 큐 -->
+      <rect x="280" y="115" width="200" height="60" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="380" y="138" text-anchor="middle">ChatServer.actor 큐</text>
+      <text class="sub" x="380" y="155" text-anchor="middle" fill="var(--muted)">5개 명령 적재 (FIFO)</text>
+
+      <!-- 화살표 큐 → 단일 실행기 -->
+      <path d="M480 145 L 560 145" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS3)"/>
+      <text class="sub" x="520" y="135" text-anchor="middle" fill="var(--muted)">TryDequeue</text>
+
+      <!-- 단일 실행기 -->
+      <rect x="560" y="115" width="180" height="60" rx="10" fill="var(--srv)"/>
+      <text class="lbl" x="650" y="140" text-anchor="middle" style="fill:#0b1735">Flush 실행기</text>
+      <text class="sub" x="650" y="158" text-anchor="middle" style="fill:#0b1735">(단일 스레드만 진입)</text>
+
+      <!-- 시간축 — sequential output -->
+      <text class="ink lbl" x="850" y="50" text-anchor="middle">실행 결과 (시간순)</text>
+      <line x1="780" y1="70" x2="780" y2="280" stroke="#94a3b8" stroke-width="1"/>
+      <g>
+        <rect x="790" y="80" width="100" height="28" rx="4" fill="#3b82f6"/>
+        <text class="sub" x="840" y="98" text-anchor="middle" fill="#fff">cmd1 실행</text>
+      </g>
+      <g>
+        <rect x="790" y="120" width="100" height="28" rx="4" fill="#3b82f6"/>
+        <text class="sub" x="840" y="138" text-anchor="middle" fill="#fff">cmd2 실행</text>
+      </g>
+      <g>
+        <rect x="790" y="160" width="100" height="28" rx="4" fill="#3b82f6"/>
+        <text class="sub" x="840" y="178" text-anchor="middle" fill="#fff">cmd3 실행</text>
+      </g>
+      <g>
+        <rect x="790" y="200" width="100" height="28" rx="4" fill="#3b82f6"/>
+        <text class="sub" x="840" y="218" text-anchor="middle" fill="#fff">cmd4 실행</text>
+      </g>
+      <g>
+        <rect x="790" y="240" width="100" height="28" rx="4" fill="#3b82f6"/>
+        <text class="sub" x="840" y="258" text-anchor="middle" fill="#fff">cmd5 실행</text>
+      </g>
+      <text class="sub" x="900" y="290" fill="var(--muted)">↓ 시간</text>
+
+      <path d="M740 145 L 780 145" stroke="#94a3b8" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
+
+      <!-- 핵심 박스 -->
+      <rect x="40" y="300" width="920" height="60" rx="10" fill="rgba(34,197,94,.08)" stroke="var(--ok)"/>
+      <text class="ink lbl" x="500" y="324" text-anchor="middle">결론: 입력은 병렬, 처리는 직렬 — actor 안의 _users / _rooms 는 락 없이 안전</text>
+      <text class="sub" x="500" y="345" text-anchor="middle" fill="#cbd5e1">producer 가 5개든 5천개든 actor 내부에서 두 개의 코드가 동시 실행되는 일은 절대 없음</text>
+    </svg>
+    <figcaption>입력 측은 동시(병렬), 처리 측은 한 명씩(직렬). 이 비대칭이 actor 모델의 핵심 보장입니다.</figcaption>
+  </figure>
+
+  <!-- ④ 부하 자동 분산 -->
+  <h4>④ 자동 부하 분산 (FIFO + 빈 워커가 가져감)</h4>
+  <p>워커는 일이 없으면 큐를 polling 합니다. 일이 들어오면 <b>가장 먼저 빈 워커가 가져갑니다</b>. 사전 할당이나 라우팅 룰 없이도 자연스럽게 균등 분산됩니다. <code>--network 6 4</code> 실측에서 97건이 4 워커에 27/24/24/22 (편차 ±2) 로 분산되었습니다.</p>
+
+  <figure class="figure">
+    <svg viewBox="0 0 1000 360" aria-label="auto load balancing bar chart">
+      <defs>
+        <marker id="arS4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 큐 -->
+      <rect x="40" y="60" width="220" height="80" rx="10" fill="#0f1722" stroke="var(--queue)" stroke-width="2"/>
+      <text class="ink lbl" x="150" y="86" text-anchor="middle">InboundCommands</text>
+      <text class="sub" x="150" y="104" text-anchor="middle" fill="var(--muted)">총 97건</text>
+      <g fill="#94a3b8">
+        <rect x="55" y="115" width="14" height="14" rx="2"/>
+        <rect x="73" y="115" width="14" height="14" rx="2"/>
+        <rect x="91" y="115" width="14" height="14" rx="2"/>
+        <rect x="109" y="115" width="14" height="14" rx="2"/>
+        <rect x="127" y="115" width="14" height="14" rx="2"/>
+        <rect x="145" y="115" width="14" height="14" rx="2"/>
+        <rect x="163" y="115" width="14" height="14" rx="2"/>
+        <rect x="181" y="115" width="14" height="14" rx="2"/>
+        <rect x="199" y="115" width="14" height="14" rx="2"/>
+        <rect x="217" y="115" width="14" height="14" rx="2"/>
+      </g>
+
+      <!-- 4 workers 모두 큐에서 가져감 -->
+      <path d="M260 90  L 360 60"  stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS4)"/>
+      <path d="M260 100 L 360 100" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS4)"/>
+      <path d="M260 110 L 360 140" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS4)"/>
+      <path d="M260 120 L 360 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arS4)"/>
+
+      <text class="sub" x="305" y="55" fill="var(--muted)">TryDequeue</text>
+
+      <!-- 워커 + 막대 그래프 -->
+      <g>
+        <rect x="360" y="40" width="80" height="36" rx="6" fill="var(--worker)"/>
+        <text class="sub" x="400" y="63" text-anchor="middle">Worker 1</text>
+        <rect x="450" y="44" width="270" height="28" rx="4" fill="#f59e0b"/>
+        <text class="lbl" x="730" y="65" fill="var(--ink)" style="font-size:13px">27건 (28%)</text>
+      </g>
+      <g>
+        <rect x="360" y="84" width="80" height="36" rx="6" fill="var(--worker)"/>
+        <text class="sub" x="400" y="107" text-anchor="middle">Worker 2</text>
+        <rect x="450" y="88" width="240" height="28" rx="4" fill="#f59e0b"/>
+        <text class="lbl" x="700" y="109" fill="var(--ink)" style="font-size:13px">24건 (25%)</text>
+      </g>
+      <g>
+        <rect x="360" y="128" width="80" height="36" rx="6" fill="var(--worker)"/>
+        <text class="sub" x="400" y="151" text-anchor="middle">Worker 3</text>
+        <rect x="450" y="132" width="240" height="28" rx="4" fill="#f59e0b"/>
+        <text class="lbl" x="700" y="153" fill="var(--ink)" style="font-size:13px">24건 (25%)</text>
+      </g>
+      <g>
+        <rect x="360" y="172" width="80" height="36" rx="6" fill="var(--worker)"/>
+        <text class="sub" x="400" y="195" text-anchor="middle">Worker 4</text>
+        <rect x="450" y="176" width="220" height="28" rx="4" fill="#f59e0b"/>
+        <text class="lbl" x="680" y="197" fill="var(--ink)" style="font-size:13px">22건 (22%)</text>
+      </g>
+
+      <!-- 평균선 -->
+      <line x1="690" y1="32" x2="690" y2="220" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text class="sub" x="690" y="22" text-anchor="middle" fill="var(--accent)">평균 24.25</text>
+
+      <!-- 핵심 박스 -->
+      <rect x="40" y="250" width="920" height="90" rx="10" fill="rgba(34,211,238,.08)" stroke="var(--accent)"/>
+      <text class="ink lbl" x="500" y="275" text-anchor="middle">분산 알고리즘 = "빈 워커가 가져감" (work stealing 의 가장 단순한 형태)</text>
+      <text class="sub" x="500" y="297" text-anchor="middle" fill="#cbd5e1">사전 할당 없음 · 라우팅 룰 없음 · 한 워커가 느려져도 다른 워커가 알아서 더 가져감</text>
+      <text class="sub" x="500" y="318" text-anchor="middle" fill="#cbd5e1">실측 편차: 22 ~ 27 (±2건, 8%) — 평균에 자연 수렴</text>
+    </svg>
+    <figcaption>큐가 FIFO + 다중 consumer 안전이라는 한 가지 성질만으로 부하 분산이 자동으로 이루어집니다.</figcaption>
+  </figure>
+
+  <h3>실측 결과 (예: <code>--network 6 4</code>)</h3>
+  <pre><code>=== 네트워크 시뮬레이션 시작: 6개 IO 스레드 × 4초 ===
+[NetIO-0] 시작 (스레드 ID: 11)
+[NetIO-1] 시작 (스레드 ID: 12)
+[NetIO-2] 시작 (스레드 ID: 13)
+[NetIO-3] 시작 (스레드 ID: 14)
+[NetIO-4] 시작 (스레드 ID: 15)
+[NetIO-5] 시작 (스레드 ID: 16)
+...
+[NetSim] 정지 — 총 97개 명령 push
+[Stats] IO push: 97건, Worker 처리: 97건
+[Worker 1] 종료 (처리 27건, 스레드 ID: 8)
+[Worker 2] 종료 (처리 24건, 스레드 ID: 9)
+[Worker 3] 종료 (처리 24건, 스레드 ID: 10)
+[Worker 4] 종료 (처리 22건, 스레드 ID: 11)</code></pre>
+  <p class="muted">6개 producer가 4초간 97건을 push, 4개 worker가 거의 균등(27/24/24/22)하게 처리. push와 처리 건수가 정확히 일치 — 큐가 안전하게 모든 명령을 보존했음을 보여줍니다.</p>
+
+  <div class="callout">
+    <b>실행</b>: <code>dotnet run -- --network 6 4</code> (6개 연결, 4초). 인자 생략 시 기본 8 × 8.
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────── -->
+<section id="sec10">
+  <h2><span class="num">10</span>직접 돌려보기</h2>
+  <p>ExampleChatServer는 3가지 모드로 실행할 수 있습니다.</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>인터랙티브 모드 (기본)</h4>
+      <pre><code>dotnet run</code></pre>
+      <p>콘솔에서 명령을 직접 입력합니다.</p>
+      <pre><code>connect alice 앨리스
+connect bob 밥
+join alice general
+join bob general
+say alice general 안녕!
+pm alice bob 잠깐 얘기 좀
+status
+quit</code></pre>
+    </div>
+    <div class="card">
+      <h4>자동 시나리오</h4>
+      <pre><code>dotnet run -- --simulate</code></pre>
+      <p>4명이 입장/채팅/퇴장하는 단일 producer 시나리오.</p>
+      <pre><code>dotnet run -- --simulate-idle</code></pre>
+      <p>3초 유휴 임계로 자동 disconnect 흐름.</p>
+      <pre><code>dotnet run -- --network [conn] [sec]</code></pre>
+      <p>멀티 producer 네트워크 시뮬레이션. 인자 생략 시 8 × 8초. 예: <code>--network 16 5</code></p>
+    </div>
+  </div>
+
+  <h3>로그에서 무엇을 봐야 할까?</h3>
+  <ul>
+    <li><b>워커 스레드 ID가 다 다름</b> (예: tid=8, 9, 10, 11) — 진짜 OS 스레드 4개가 떴다는 증거.</li>
+    <li><b>"[Worker N] 처리 X건"</b> — 명령이 워커들에 분산되었다는 증거.</li>
+    <li><b>"==== [Stats] ===="</b> 5초마다 출력 — 자기복제 heartbeat 동작.</li>
+    <li><b>"[Idle] alice 유휴 ..."</b> — User가 자기 시각을 검사하고 disconnect를 요청한 흔적.</li>
+  </ul>
+
+  <hr/>
+
+</section>
+
+</main>
+
+</body>
+</html>

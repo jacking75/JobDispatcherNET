@@ -1,9 +1,3 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
 namespace ExampleChatServer;
 
 // 채팅 메시지 종류
@@ -18,7 +12,7 @@ public enum MessageType
     UserDisconnect  // 유저 접속 종료
 }
 
-// 채팅 메시지 클래스
+// 채팅 메시지 (불변 record)
 public record ChatMessage(
     Guid Id,
     MessageType Type,
@@ -28,12 +22,12 @@ public record ChatMessage(
     string Content,
     DateTimeOffset Timestamp);
 
-// 클라이언트 인터페이스
+// 클라이언트 인터페이스 — 동기식 (Task/ValueTask 사용 안 함)
 public interface IChatClient
 {
     string UserId { get; }
     string Username { get; }
 
-    // 메시지 전송 (네트워크 구현은 생략)
-    ValueTask SendMessageAsync(ChatMessage message);
+    // 메시지 송신 (네트워크 구현은 생략) — User actor 큐 안에서 동기로 호출됨
+    void SendMessage(ChatMessage message);
 }

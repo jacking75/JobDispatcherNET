@@ -1,160 +1,149 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using JobDispatcherNET;
 
 namespace ExampleChatServer;
 
-public class Room : AsyncExecutable
+public sealed record RoomSnapshot(string RoomId, string Name, IReadOnlyList<string> UserIds);
+
+/// <summary>
+/// 채팅방 actor — _users 컬렉션에 락이 0개. 모든 진입은 자기 큐 통과.
+///
+/// 코딩 컨벤션:
+///   public 동사(args)        → DoAsync(() => Process동사(args))   (큐에 푸시만)
+///   private Process동사(args) → 실제 본문
+///
+/// 학습 포인트:
+///   - DoAsyncAfter 로 자기 자신에게 다음 heartbeat 를 예약 (타이머 자기복제 패턴).
+///   - 외부 read 는 GetSnapshot 으로 ManualResetEventSlim 신호 대기 (동기식).
+///   - 송신(BroadcastSystem)은 user.DeliverMessage 로 위임 — Room 큐가 네트워크 IO 에 막히지 않는다.
+/// </summary>
+public sealed class Room : AsyncExecutable
 {
     private readonly Dictionary<string, User> _users = [];
     private readonly string _roomId;
     private readonly string _name;
+    private volatile bool _stopped;
 
-    public Room(string name)
+    public Room(string roomId, string name)
     {
-        _roomId = Guid.NewGuid().ToString();
+        _roomId = roomId;
         _name = name;
-        Console.WriteLine($"채팅방 생성: {_name} ({_roomId})");
+        Console.WriteLine($"[Room] 생성: {_name} ({_roomId})");
     }
 
     public string RoomId => _roomId;
     public string Name => _name;
 
-    // 사용자 수 반환
-    public int GetUserCount()
+    // ── 외부 진입점 (큐에 푸시만) ──────────────────────────────────────
+
+    public void AddUser(User user) => DoAsync(() => ProcessAddUser(user));
+
+    public void RemoveUser(string userId) => DoAsync(() => ProcessRemoveUser(userId));
+
+    public void BroadcastChat(string senderId, string content)
+        => DoAsync(() => ProcessBroadcastChat(senderId, content));
+
+    public void StartHeartbeat(TimeSpan period) => DoAsync(() => Heartbeat(period));
+
+    public void ForceRemoveAllUsers() => DoAsync(ProcessForceRemoveAllUsers);
+
+    // ── 실제 본문 (private) ────────────────────────────────────────────
+
+    private void ProcessAddUser(User user)
     {
-        int count = 0;
+        if (!_users.TryAdd(user.UserId, user))
+            return;
 
-        // DoAsync를 사용하여 현재 Room의 스레드에서 안전하게 실행
-        // count를 return하기 위해 TaskCompletionSource 사용
-        var tcs = new TaskCompletionSource<int>();
-
-        DoAsync(() => {
-            count = _users.Count;
-            tcs.SetResult(count);
-        });
-
-        return tcs.Task.Result;
+        Console.WriteLine($"[Room {_roomId}] 입장: {user.Username}");
+        BroadcastSystem(MessageType.RoomJoin, $"{user.Username}님이 입장하셨습니다.");
+        user.NoteRoomJoined(_roomId);
     }
 
-    // 사용자 목록 반환
-    public List<string> GetUserIds()
+    private void ProcessRemoveUser(string userId)
     {
-        var tcs = new TaskCompletionSource<List<string>>();
+        if (!_users.Remove(userId, out var user))
+            return;
 
-        DoAsync(() => {
-            var userIds = _users.Keys.ToList();
-            tcs.SetResult(userIds);
-        });
-
-        return tcs.Task.Result;
+        Console.WriteLine($"[Room {_roomId}] 퇴장: {user.Username}");
+        BroadcastSystem(MessageType.RoomLeave, $"{user.Username}님이 퇴장하셨습니다.");
+        user.NoteRoomLeft(_roomId);
     }
 
-    // 사용자 입장 처리
-    public void AddUser(User user)
+    private void ProcessBroadcastChat(string senderId, string content)
     {
-        DoAsync(() => {
-            if (!_users.ContainsKey(user.UserId))
-            {
-                _users[user.UserId] = user;
-                Console.WriteLine($"방 입장: {user.Username} -> {_name}");
+        if (!_users.TryGetValue(senderId, out var sender))
+            return;
 
-                // 입장 메시지 모든 사용자에게 전송
-                BroadcastSystemMessage(
-                    MessageType.RoomJoin,
-                    $"{user.Username}님이 입장하셨습니다.");
-            }
-        });
-    }
+        sender.TouchActivity();
+        Console.WriteLine($"[Room {_roomId}] {sender.Username}: {content}");
 
-    // 사용자 퇴장 처리
-    public void RemoveUser(string userId)
-    {
-        DoAsync(() => {
-            if (_users.TryGetValue(userId, out var user))
-            {
-                _users.Remove(userId);
-                Console.WriteLine($"방 퇴장: {user.Username} <- {_name}");
-
-                // 퇴장 메시지 모든 사용자에게 전송
-                BroadcastSystemMessage(
-                    MessageType.RoomLeave,
-                    $"{user.Username}님이 퇴장하셨습니다.");
-            }
-        });
-    }
-
-    // 채팅 메시지 처리
-    public void ProcessChatMessage(string userId, string content)
-    {
-        DoAsync(() => {
-            if (_users.TryGetValue(userId, out var sender))
-            {
-                Console.WriteLine($"방 채팅: {sender.Username} -> 방[{_roomId}]: {content}");
-
-                // 메시지 생성
-                var message = new ChatMessage(
-                    Guid.NewGuid(),
-                    MessageType.RoomChat,
-                    sender.Username,
-                    null,
-                    _roomId,
-                    content,
-                    DateTimeOffset.UtcNow);
-
-                // 모든 사용자에게 메시지 전송
-                foreach (var user in _users.Values)
-                {
-                    _ = user.SendMessageAsync(message);
-                }
-            }
-        });
-    }
-
-    // 시스템 메시지 브로드캐스트
-    private void BroadcastSystemMessage(MessageType type, string content)
-    {
         var message = new ChatMessage(
             Guid.NewGuid(),
-            type,
-            "시스템",
+            MessageType.RoomChat,
+            sender.Username,
             null,
             _roomId,
             content,
             DateTimeOffset.UtcNow);
 
         foreach (var user in _users.Values)
+            user.DeliverMessage(message);
+    }
+
+    private void ProcessForceRemoveAllUsers()
+    {
+        foreach (var user in _users.Values)
+            user.NoteRoomLeft(_roomId);
+
+        _users.Clear();
+        Console.WriteLine($"[Room {_roomId}] 모든 사용자 강제 제거됨");
+    }
+
+    /// <summary>
+    /// heartbeat 자기복제 패턴 — DoAsyncAfter 로 자기 자신을 다시 큐에 넣는다.
+    /// 락 없이 주기 작업이 가능한 이유: 모든 본문이 자기 actor 큐 안에서 직렬 실행되므로
+    /// _users 를 안전하게 읽을 수 있다.
+    /// </summary>
+    private void Heartbeat(TimeSpan period)
+    {
+        if (_stopped) return;
+
+        if (_users.Count > 0)
         {
-            _ = user.SendMessageAsync(message);
+            BroadcastSystem(MessageType.RoomChat,
+                $"[알림] 현재 {_name} 방에 {_users.Count}명이 있습니다.");
         }
+
+        DoAsyncAfter(period, () => Heartbeat(period));
     }
 
-    // 사용자 강제 퇴장 (서버 종료 등에 사용)
-    public void ForceRemoveAllUsers()
+    private void BroadcastSystem(MessageType type, string content)
     {
-        DoAsync(() => {
-            foreach (var user in _users.Values)
-            {
-                user.JoinedRoomIds.Remove(_roomId);
-            }
+        var message = new ChatMessage(
+            Guid.NewGuid(), type, "시스템", null, _roomId, content, DateTimeOffset.UtcNow);
 
-            _users.Clear();
-            Console.WriteLine($"방 초기화: {_name} 모든 사용자 제거됨");
-        });
+        foreach (var user in _users.Values)
+            user.DeliverMessage(message);
     }
 
-    // 방 상태 출력
-    public void PrintStatus()
+    // ── 동기 read API ──────────────────────────────────────────────────
+
+    /// <summary>차단(blocking) 스냅샷.</summary>
+    public RoomSnapshot GetSnapshot()
     {
-        DoAsync(() => {
-            Console.WriteLine($"- {_name} ({_roomId}), 참여자: {_users.Count}명");
-            foreach (var user in _users.Values)
-            {
-                Console.WriteLine($"  * {user.Username} ({user.UserId})");
-            }
+        using var ev = new ManualResetEventSlim(false);
+        RoomSnapshot? result = null;
+        DoAsync(() =>
+        {
+            result = new RoomSnapshot(_roomId, _name, _users.Keys.ToList());
+            ev.Set();
         });
+        ev.Wait();
+        return result!;
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _stopped = true;
+        return base.DisposeAsync();
     }
 }

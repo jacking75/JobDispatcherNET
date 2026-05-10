@@ -1,0 +1,2027 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExampleMmorpgServer 코드 가이드</title>
+<style>
+:root {
+  --bg: #f7f8fb;
+  --bg-card: #ffffff;
+  --bg-code: #1a2332;
+  --bg-code-soft: #243044;
+  --text: #1e293b;
+  --text-muted: #64748b;
+  --text-light: #94a3b8;
+  --border: #e2e8f0;
+  --border-soft: #edf2f7;
+  --accent: #2563eb;
+  --accent-soft: #e0ecff;
+  --success: #059669;
+  --success-soft: #d1fae5;
+  --warning: #d97706;
+  --warning-soft: #fef3c7;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+  --purple: #7c3aed;
+  --purple-soft: #ede9fe;
+  --pink: #db2777;
+  --orange: #ea580c;
+  --code-text: #e2e8f0;
+  --code-kw: #93c5fd;
+  --code-str: #fcd34d;
+  --code-cm: #6b7e9c;
+  --code-num: #fda4af;
+  --code-fn: #c4b5fd;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+    "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.75;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Hero ────────────────────────────────────────────────── */
+.hero {
+  background:
+    radial-gradient(1200px 600px at 90% -20%, rgba(124, 58, 237, 0.35), transparent),
+    radial-gradient(1000px 500px at -10% 110%, rgba(37, 99, 235, 0.4), transparent),
+    linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  color: white;
+  padding: 88px 24px 96px;
+  text-align: center;
+}
+.hero .badge {
+  display: inline-block;
+  font-size: 12px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #93c5fd;
+  background: rgba(147, 197, 253, 0.12);
+  border: 1px solid rgba(147, 197, 253, 0.3);
+  padding: 4px 14px;
+  border-radius: 999px;
+  margin-bottom: 24px;
+  font-weight: 600;
+}
+.hero h1 {
+  font-size: 52px;
+  margin: 0 0 16px;
+  font-weight: 800;
+  letter-spacing: -1px;
+  line-height: 1.15;
+}
+.hero h1 .accent { color: #93c5fd; }
+.hero .sub {
+  font-size: 20px;
+  opacity: 0.9;
+  margin: 0 0 8px;
+  font-weight: 500;
+  max-width: 720px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.hero .lead {
+  font-size: 15px;
+  opacity: 0.65;
+  margin: 16px 0 0;
+}
+
+/* ── TOC ─────────────────────────────────────────────────── */
+.toc {
+  max-width: 720px;
+  margin: -56px auto 64px;
+  padding: 28px 36px;
+  background: var(--bg-card);
+  border-radius: 18px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12), 0 2px 8px rgba(15, 23, 42, 0.04);
+  border: 1px solid var(--border);
+  position: relative;
+  z-index: 1;
+}
+.toc h2 {
+  margin: 0 0 16px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.toc ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: toc;
+}
+.toc li {
+  counter-increment: toc;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.toc li:last-child { border-bottom: none; }
+.toc li::before {
+  content: counter(toc, decimal-leading-zero);
+  display: inline-block;
+  width: 40px;
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  font-weight: 700;
+}
+.toc a {
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.15s;
+}
+.toc a:hover { color: var(--accent); }
+
+/* ── Containers ──────────────────────────────────────────── */
+.container {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+.wide {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+section {
+  padding: 56px 0 48px;
+  border-bottom: 1px solid var(--border-soft);
+}
+section:last-child { border-bottom: none; }
+
+.section-num {
+  display: inline-block;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 4px 10px;
+  border-radius: 999px;
+  margin-bottom: 14px;
+}
+h2.section-title {
+  font-size: 34px;
+  font-weight: 800;
+  margin: 0 0 12px;
+  letter-spacing: -0.8px;
+  color: var(--text);
+  line-height: 1.25;
+}
+.section-lead {
+  font-size: 17px;
+  color: var(--text-muted);
+  margin: 0 0 32px;
+  line-height: 1.7;
+}
+
+h3 {
+  font-size: 24px;
+  font-weight: 700;
+  margin: 48px 0 14px;
+  color: var(--text);
+  letter-spacing: -0.3px;
+}
+h3 .num {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 18px;
+  margin-right: 8px;
+}
+h4 {
+  font-size: 17px;
+  font-weight: 700;
+  margin: 28px 0 10px;
+  color: var(--text);
+}
+p { margin: 0 0 14px; }
+ul, ol { margin: 0 0 14px; padding-left: 22px; }
+li { margin: 4px 0; }
+
+/* ── Cards ───────────────────────────────────────────────── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  margin: 16px 0;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin: 28px 0;
+}
+.card-grid .card {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+.card-grid .icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  margin-bottom: 14px;
+}
+.card-grid h4 { margin: 0 0 8px; font-size: 16px; }
+.card-grid .card p { font-size: 14px; color: var(--text-muted); margin: 0; line-height: 1.6; }
+
+/* ── Code ────────────────────────────────────────────────── */
+pre {
+  background: var(--bg-code);
+  color: var(--code-text);
+  padding: 20px 24px;
+  border-radius: 10px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.65;
+  margin: 16px 0;
+  border: 1px solid #0f172a;
+}
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+pre code { background: transparent; padding: 0; font-size: inherit; }
+:not(pre) > code {
+  background: rgba(99, 102, 241, 0.1);
+  color: #4338ca;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 0.88em;
+  font-weight: 500;
+}
+.kw { color: var(--code-kw); }
+.str { color: var(--code-str); }
+.cm { color: var(--code-cm); font-style: italic; }
+.fn { color: var(--code-fn); }
+.num { color: var(--code-num); }
+.ty { color: #7dd3fc; }
+
+.code-label {
+  display: block;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: var(--text-light);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin: 18px 0 -8px 4px;
+  font-weight: 700;
+}
+
+/* ── Callouts ────────────────────────────────────────────── */
+.callout {
+  border-left: 4px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 14px 18px;
+  border-radius: 0 8px 8px 0;
+  margin: 18px 0;
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+.callout.warn { border-color: var(--warning); background: var(--warning-soft); }
+.callout.tip { border-color: var(--success); background: var(--success-soft); }
+.callout.note { border-color: var(--purple); background: var(--purple-soft); }
+.callout strong { font-weight: 700; }
+.callout p:last-child { margin-bottom: 0; }
+
+/* ── Diagrams ────────────────────────────────────────────── */
+.diagram {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 20px 20px;
+  margin: 28px 0;
+  text-align: center;
+}
+.diagram svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+.diagram-caption {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: 16px;
+  font-style: italic;
+}
+
+/* ── Animation stage ─────────────────────────────────────── */
+.anim-stage {
+  background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 24px 22px;
+  margin: 24px 0;
+}
+.anim-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-bottom: 18px;
+}
+.anim-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+}
+.anim-label {
+  flex: 0 0 110px;
+  font-size: 12px;
+  color: var(--text);
+  font-family: ui-monospace, monospace;
+  text-align: right;
+  font-weight: 600;
+}
+.anim-track {
+  flex: 1;
+  height: 38px;
+  background: white;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  position: relative;
+  overflow: hidden;
+}
+.timeline-axis {
+  position: absolute;
+  bottom: 4px;
+  left: 0;
+  right: 0;
+  text-align: right;
+  font-size: 10px;
+  color: var(--text-light);
+  font-family: ui-monospace, monospace;
+  padding-right: 6px;
+}
+.job-bar {
+  position: absolute;
+  top: 5px;
+  height: 28px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  white-space: nowrap;
+  padding: 0 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+.j-blue   { background: #3b82f6; }
+.j-green  { background: #10b981; }
+.j-orange { background: #f59e0b; }
+.j-purple { background: #a855f7; }
+.j-pink   { background: #ec4899; }
+.j-red    { background: #ef4444; }
+.j-cyan   { background: #06b6d4; }
+
+/* ── Anim 1: 직렬화 (single actor) ─ */
+@keyframes a1-run {
+  0%, 100% { opacity: 1; transform: scaleY(1); }
+  50%      { opacity: 1; transform: scaleY(1.06); box-shadow: 0 4px 12px rgba(0,0,0,0.18); }
+}
+.a1-bar { animation: a1-run 0.6s ease-in-out infinite; transform-origin: center; }
+
+/* ── Anim 2: 자기복제 RegenTick ─ */
+@keyframes regen-cycle {
+  0%   { transform: translateX(0); opacity: 0; }
+  4%   { transform: translateX(0); opacity: 1; }
+  20%  { transform: translateX(0); opacity: 1; }
+  24%  { transform: translateX(280px); opacity: 1; }   /* run */
+  44%  { transform: translateX(280px); opacity: 1; }
+  48%  { transform: translateX(580px); opacity: 1; }   /* timer 3s */
+  88%  { transform: translateX(580px); opacity: 1; }
+  92%  { transform: translateX(0); opacity: 1; }       /* re-enqueue */
+  96%  { transform: translateX(0); opacity: 0; }
+  100% { transform: translateX(0); opacity: 0; }
+}
+
+/* ── 라벨/배지 ── */
+.pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--accent-soft);
+  color: var(--accent);
+  margin-right: 6px;
+}
+.pill.green { background: var(--success-soft); color: var(--success); }
+.pill.warn  { background: var(--warning-soft); color: var(--warning); }
+.pill.purple{ background: var(--purple-soft); color: var(--purple); }
+
+/* ── Tables ──────────────────────────────────────────────── */
+.tbl-wrap { overflow-x: auto; margin: 16px 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  background: var(--bg-card);
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+th, td {
+  border-bottom: 1px solid var(--border-soft);
+  padding: 11px 14px;
+  text-align: left;
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+th {
+  background: #f3f6fb;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+
+/* ── Q&A ─────────────────────────────────────────────────── */
+.qa { margin: 22px 0; padding: 18px 22px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; }
+.qa .q {
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 10px;
+  font-size: 16.5px;
+  line-height: 1.5;
+}
+.qa .q::before { content: "Q "; font-family: ui-monospace, monospace; font-weight: 800; }
+.qa .a {
+  font-size: 15px;
+  color: var(--text);
+  line-height: 1.75;
+}
+.qa .a::before { content: "A "; font-family: ui-monospace, monospace; font-weight: 800; color: var(--success); margin-right: 4px; }
+
+/* ── Footer ──────────────────────────────────────────────── */
+footer {
+  background: #0f172a;
+  color: #94a3b8;
+  padding: 48px 24px;
+  text-align: center;
+  font-size: 14px;
+}
+footer p { margin: 4px 0; }
+footer code {
+  background: rgba(255,255,255,0.06);
+  color: #cbd5e1;
+}
+
+@media (max-width: 720px) {
+  .hero { padding: 64px 20px 56px; }
+  .hero h1 { font-size: 36px; }
+  .hero .sub { font-size: 17px; }
+  .container, .wide { padding: 0 18px; }
+  h2.section-title { font-size: 26px; }
+  h3 { font-size: 20px; }
+  pre { font-size: 12px; padding: 14px 16px; }
+  .anim-label { flex-basis: 80px; font-size: 11px; }
+  .toc { padding: 22px 24px; }
+}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <span class="badge">Code Guide · 2026</span>
+  <h1><span class="accent">ExampleMmorpgServer</span><br>한 단계씩 이해하기</h1>
+  <p class="sub">JobDispatcherNET 라이브러리로 만든 단일 존 MMO 서버 코드를,<br>초보 서버 개발자의 눈높이에서 풀어보는 가이드.</p>
+  <p class="lead">소스: <code style="background:rgba(255,255,255,0.08);color:#e2e8f0">ExampleMmorpgServer/</code></p>
+</header>
+
+<nav class="toc">
+  <h2>이 가이드에서 다루는 것</h2>
+  <ol>
+    <li><a href="#intro">이 예제가 보여주려는 것</a></li>
+    <li><a href="#big">큰 그림 한눈에 보기</a></li>
+    <li><a href="#core">핵심 개념 4가지 — Actor / DoAsync / 워커 / 타이머</a></li>
+    <li><a href="#components">컴포넌트 한 명씩 보기</a></li>
+    <li><a href="#flows">코드 호출 흐름 — 입장부터 부활까지</a></li>
+    <li><a href="#decisions">왜 이렇게 만들었나 — 설계 Q&amp;A</a></li>
+    <li><a href="#run">실행해보기</a></li>
+    <li><a href="#sync-io">동기 IO와 스레드 분리 — 한 자리에서</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 1: 이 예제가 보여주려는 것
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="intro">
+  <span class="section-num">SECTION 01</span>
+  <h2 class="section-title">이 예제가 보여주려는 것</h2>
+  <p class="section-lead">
+    <code>ExampleMmorpgServer</code>는 진짜 게임을 굴리려는 게 아니라,
+    <strong>JobDispatcherNET 라이브러리가 어떻게 동시성 문제를 푸는지</strong>를
+    MMO 서버라는 익숙한 시나리오로 보여주는 학습용 예제다.
+    "여러 명의 플레이어가 같은 시각에 서로 공격하는데, 어떻게 데이터가 깨지지 않을까?"
+    — 이 질문에 답한다.
+  </p>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="icon">🔓</div>
+      <h4>락 없이 동시성</h4>
+      <p><code>lock</code>, <code>Mutex</code>, <code>ReaderWriterLockSlim</code>이 단 하나도 등장하지 않는다. 그런데도 데이터 경쟁이 일어나지 않는다.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🚦</div>
+      <h4>같은 객체 = 자동 직렬</h4>
+      <p>한 플레이어를 두 명이 동시에 공격해도, 그 플레이어의 HP 갱신은 한 번에 하나씩 안전하게 처리된다.</p>
+    </div>
+    <div class="card">
+      <div class="icon">⚡</div>
+      <h4>다른 객체 = 자동 병렬</h4>
+      <p>서로 다른 플레이어의 이동·공격은 완전 병렬로 동시에 처리된다. 개발자가 신경 쓸 일이 없다.</p>
+    </div>
+    <div class="card">
+      <div class="icon">⏱️</div>
+      <h4>타이머도 락 없이</h4>
+      <p>"3초마다 HP 회복", "5초 후 부활" 같은 주기·지연 작업도 <code>DoAsyncAfter</code>로 자기복제 한 줄.</p>
+    </div>
+    <div class="card">
+      <div class="icon">📷</div>
+      <h4>외부 read는 스냅샷</h4>
+      <p>모니터링·디버깅을 위해 외부에서 상태를 읽을 때도 <code>GetSnapshot</code> 패턴으로 일관성 있게 받는다.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🛡️</div>
+      <h4>예외도 한 곳에서</h4>
+      <p>actor 큐 안에서 발생한 모든 예외는 <code>AsyncExecutable.OnError</code> 한 콜백으로 모인다.</p>
+    </div>
+    <div class="card">
+      <div class="icon" style="background:var(--pink);color:white">🔀</div>
+      <h4>IO ↔ 패킷 처리 분리</h4>
+      <p>RecvIO/SendIO 전용 스레드가 동기 Read/Write를 맡고, actor Flush는 워커 스레드에서. <strong>IO 스레드는 actor 람다를 절대 실행하지 않는다.</strong></p>
+    </div>
+    <div class="card">
+      <div class="icon" style="background:var(--orange);color:white">🚫</div>
+      <h4>async/await 0개</h4>
+      <p>코드 전체에 <code>async</code>/<code>await</code> 키워드가 단 한 번도 등장하지 않는다. 대기는 전용 스레드에서, 종료는 1회 동기 차단으로.</p>
+    </div>
+  </div>
+
+  <div class="callout note">
+    <strong>한 줄 요약 ·</strong> 이 라이브러리의 본질은 <em>"객체마다 자기 큐를 주고, 큐는 한 번에 하나씩만 실행한다"</em>는 단 하나의 규칙이다. 이 규칙으로부터 위 8가지 효과가 자연스럽게 따라온다.
+  </div>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 2: 큰 그림
+     ═══════════════════════════════════════════════════════════ -->
+<div class="wide">
+<section id="big">
+  <span class="section-num">SECTION 02</span>
+  <h2 class="section-title">큰 그림 한눈에 보기</h2>
+  <p class="section-lead">
+    클라이언트가 쏜 패킷이 서버 안에서 어디로 흘러가는지 먼저 보자.
+    파란색은 큐(Queue), 보라색은 actor, 회색은 데이터 저장소다.
+  </p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 880 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="시스템 구조">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
+        </marker>
+        <marker id="arrBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#2563eb"/>
+        </marker>
+      </defs>
+
+      <!-- Client side -->
+      <rect x="20" y="40" width="160" height="80" rx="10" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+      <text x="100" y="68" text-anchor="middle" font-size="14" font-weight="700" fill="#92400e">클라이언트</text>
+      <text x="100" y="90" text-anchor="middle" font-size="11" fill="#92400e">TCP 패킷 전송</text>
+      <text x="100" y="106" text-anchor="middle" font-size="11" fill="#92400e">"Move|52|50"</text>
+
+      <!-- Network IO threads -->
+      <rect x="220" y="20" width="170" height="120" rx="10" fill="#fce7f3" stroke="#db2777" stroke-width="1.5"/>
+      <text x="305" y="42" text-anchor="middle" font-size="13" font-weight="700" fill="#9f1239">NetworkServer</text>
+      <text x="305" y="60" text-anchor="middle" font-size="10.5" fill="#9f1239">RecvIO + SendIO × N</text>
+      <rect x="240" y="74" width="40" height="22" rx="4" fill="#fff" stroke="#db2777"/>
+      <text x="260" y="89" text-anchor="middle" font-size="10" fill="#9f1239">IO#1</text>
+      <rect x="288" y="74" width="40" height="22" rx="4" fill="#fff" stroke="#db2777"/>
+      <text x="308" y="89" text-anchor="middle" font-size="10" fill="#9f1239">IO#2</text>
+      <rect x="336" y="74" width="40" height="22" rx="4" fill="#fff" stroke="#db2777"/>
+      <text x="356" y="89" text-anchor="middle" font-size="10" fill="#9f1239">IO#N</text>
+      <text x="305" y="125" text-anchor="middle" font-size="10.5" fill="#9f1239">동기 Read/Write 전용</text>
+
+      <!-- Arrow from client to network -->
+      <line x1="180" y1="80" x2="220" y2="80" stroke="#475569" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <!-- GameZone Actor -->
+      <rect x="430" y="20" width="220" height="160" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+      <text x="540" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">GameZone (Actor)</text>
+      <text x="540" y="60" text-anchor="middle" font-size="11" fill="#5b21b6">단일 존 라우터</text>
+
+      <!-- GameZone queue -->
+      <rect x="450" y="76" width="180" height="34" rx="6" fill="#fff" stroke="#7c3aed" stroke-width="1.2"/>
+      <text x="540" y="98" text-anchor="middle" font-size="11" fill="#5b21b6" font-weight="600">GameZone 작업 큐</text>
+      <rect x="456" y="84" width="22" height="18" rx="3" fill="#a78bfa"/>
+      <rect x="482" y="84" width="22" height="18" rx="3" fill="#c4b5fd"/>
+      <rect x="508" y="84" width="22" height="18" rx="3" fill="#ddd6fe"/>
+
+      <text x="540" y="130" text-anchor="middle" font-size="10.5" fill="#5b21b6">EnterZone / Move / Attack</text>
+      <text x="540" y="146" text-anchor="middle" font-size="10.5" fill="#5b21b6">→ 해당 PlayerActor로 라우팅</text>
+      <text x="540" y="170" text-anchor="middle" font-size="10" fill="#5b21b6">_actors: Dictionary (lock-free)</text>
+
+      <!-- IO → InboundCommands → Worker → GameZone (no direct call) -->
+      <line x1="390" y1="80" x2="430" y2="80" stroke="#2563eb" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrBlue)"/>
+      <text x="410" y="68" text-anchor="middle" font-size="9.5" fill="#2563eb" font-weight="600">InboundCommands</text>
+      <text x="410" y="92" text-anchor="middle" font-size="9" fill="#2563eb" font-style="italic">(워커 경유)</text>
+
+      <!-- PlayerActors -->
+      <g transform="translate(700, 30)">
+        <rect x="0" y="0" width="160" height="62" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="80" y="22" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">PlayerActor #1</text>
+        <rect x="10" y="32" width="140" height="22" rx="4" fill="#fff" stroke="#3b82f6" stroke-width="1"/>
+        <rect x="14" y="36" width="16" height="14" rx="2" fill="#3b82f6"/>
+        <rect x="34" y="36" width="16" height="14" rx="2" fill="#60a5fa"/>
+        <text x="120" y="48" text-anchor="middle" font-size="10" fill="#1e3a8a">자기 큐</text>
+      </g>
+      <g transform="translate(700, 100)">
+        <rect x="0" y="0" width="160" height="62" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="80" y="22" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">PlayerActor #2</text>
+        <rect x="10" y="32" width="140" height="22" rx="4" fill="#fff" stroke="#3b82f6" stroke-width="1"/>
+        <rect x="14" y="36" width="16" height="14" rx="2" fill="#3b82f6"/>
+        <text x="120" y="48" text-anchor="middle" font-size="10" fill="#1e3a8a">자기 큐</text>
+      </g>
+      <g transform="translate(700, 170)">
+        <rect x="0" y="0" width="160" height="62" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="80" y="22" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">PlayerActor #N</text>
+        <rect x="10" y="32" width="140" height="22" rx="4" fill="#fff" stroke="#3b82f6" stroke-width="1"/>
+        <text x="120" y="48" text-anchor="middle" font-size="10" fill="#1e3a8a">자기 큐</text>
+      </g>
+
+      <!-- Arrows GameZone → PlayerActors -->
+      <line x1="650" y1="60" x2="700" y2="60" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrBlue)"/>
+      <line x1="650" y1="100" x2="700" y2="130" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrBlue)"/>
+      <line x1="650" y1="140" x2="700" y2="200" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrBlue)"/>
+
+      <!-- SpatialIndex -->
+      <rect x="220" y="220" width="430" height="80" rx="10" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+      <text x="435" y="248" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">SpatialIndex (ConcurrentDictionary)</text>
+      <text x="435" y="270" text-anchor="middle" font-size="11" fill="#475569">격자 기반 공간 조회 — Add / Remove / UpdatePosition / QueryRadius</text>
+      <text x="435" y="288" text-anchor="middle" font-size="10.5" fill="#475569" font-style="italic">스레드 안전, 외부 락 없음 (내부 버킷 락만)</text>
+
+      <line x1="540" y1="180" x2="540" y2="220" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="3,3"/>
+      <line x1="780" y1="232" x2="780" y2="220" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="3,3"/>
+      <line x1="780" y1="220" x2="650" y2="220" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="3,3"/>
+
+      <!-- JobDispatcher workers -->
+      <rect x="20" y="340" width="840" height="120" rx="12" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+      <text x="440" y="364" text-anchor="middle" font-size="14" font-weight="700" fill="#713f12">JobDispatcher&lt;GameWorker&gt;  ·  전용 OS 스레드 풀</text>
+      <text x="440" y="382" text-anchor="middle" font-size="11" fill="#713f12">ThreadLocal 안정성 보장 — 각 스레드가 자기 TimerQueue / TickCount 소유</text>
+
+      <g transform="translate(60, 396)">
+        <rect width="160" height="48" rx="6" fill="white" stroke="#ca8a04"/>
+        <text x="80" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#713f12">워커 #1</text>
+        <text x="80" y="36" text-anchor="middle" font-size="10" fill="#92400e">ThreadLocal Tick</text>
+      </g>
+      <g transform="translate(240, 396)">
+        <rect width="160" height="48" rx="6" fill="white" stroke="#ca8a04"/>
+        <text x="80" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#713f12">워커 #2</text>
+        <text x="80" y="36" text-anchor="middle" font-size="10" fill="#92400e">ThreadLocal Tick</text>
+      </g>
+      <g transform="translate(420, 396)">
+        <rect width="160" height="48" rx="6" fill="white" stroke="#ca8a04"/>
+        <text x="80" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#713f12">워커 #3</text>
+        <text x="80" y="36" text-anchor="middle" font-size="10" fill="#92400e">ThreadLocal Tick</text>
+      </g>
+      <g transform="translate(600, 396)">
+        <rect width="160" height="48" rx="6" fill="white" stroke="#ca8a04"/>
+        <text x="80" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#713f12">워커 #4</text>
+        <text x="80" y="36" text-anchor="middle" font-size="10" fill="#92400e">ThreadLocal Tick</text>
+      </g>
+    </svg>
+    <p class="diagram-caption">패킷이 들어오면 GameZone 큐 → 해당 PlayerActor 큐로 차례차례 흘러간다. 각 큐는 "한 번에 하나"라는 규칙으로 동작한다.</p>
+  </div>
+
+  <h3>흐름을 한 문장으로</h3>
+  <p>
+    <strong>클라이언트가 패킷을 보내면</strong>
+    → <strong>RecvIO 스레드</strong>(세션 전용 OS 스레드)가 동기 <code>Read</code>로 받아
+    → 그 패킷을 <strong>세션 자체의 패킷 큐</strong>에 적재 + <code>InboundCommands</code>에 drain 명령을 1회 등록
+    → <strong>워커 스레드</strong>가 그 명령을 꺼내 세션 큐를 순서대로 drain (한 세션은 한 워커가 순차로!)
+    → <code>PacketHandler</code> → <code>GameServer.HandleX</code>로
+    → <code>GameZone</code>의 작업 큐에 "할 일"로 등록
+    → <code>GameZone</code>이 자기 차례에 그 일을 꺼내 처리하면서
+    → 해당 <code>PlayerActor</code>의 작업 큐에 다시 "할 일"로 등록
+    → <code>PlayerActor</code>가 자기 차례에 실제 로직(이동·데미지 적용 등)을 수행한다.
+    → 응답이 필요하면 워커는 <strong>SendIO 스레드</strong>의 송신 큐에 push (워커는 절대 Write로 블로킹되지 않음).
+  </p>
+
+  <div class="callout">
+    <strong>두 가지 라우팅이 동시에 일어난다.</strong><br>
+    ① <em>스레드 라우팅</em> — IO 스레드(Recv/Send) ↔ 워커 스레드 사이는 큐로만 연결. IO 스레드는 절대 actor 람다를 실행하지 않는다.<br>
+    ② <em>actor 라우팅</em> — <code>GameZone</code> → <code>PlayerActor</code>의 두 단계 큐. 같은 플레이어를 동시에 공격해도 그 플레이어 큐 안에서 자연히 한 줄로 줄 서게 된다.
+  </div>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 3: 핵심 개념 4가지
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="core">
+  <span class="section-num">SECTION 03</span>
+  <h2 class="section-title">핵심 개념 4가지</h2>
+  <p class="section-lead">
+    이 예제 코드를 이해하려면 <code>JobDispatcherNET</code>의 이 4가지만 알면 된다.
+    하나씩 그림과 함께 본다.
+  </p>
+
+  <!-- 3.1 AsyncExecutable -->
+  <h3><span class="num">3.1</span> AsyncExecutable — "객체마다 자기 큐"</h3>
+  <p>
+    <code>AsyncExecutable</code>은 <strong>"자기만의 작업 큐를 가진 객체"</strong>의 부모 클래스다.
+    이 클래스를 상속받으면 그 객체는 다음 두 가지를 갖게 된다.
+  </p>
+  <ul>
+    <li><code>DoAsync(Action)</code> — "이 일을 내 큐에 넣어두고 알아서 처리해"</li>
+    <li><code>DoAsyncAfter(TimeSpan, Action)</code> — "n초 뒤에 내 큐에 넣어줘"</li>
+  </ul>
+  <p>핵심 규칙: <strong>한 객체의 큐는 한 번에 한 개의 작업만 실행한다.</strong> 그래서 객체 안의 필드를 락 없이 안전하게 읽고 쓸 수 있다.</p>
+
+  <pre><code><span class="cm">// ExampleMmorpgServer/PlayerActor.cs (요약)</span>
+<span class="kw">public class</span> <span class="ty">PlayerActor</span> : <span class="ty">AsyncExecutable</span>
+{
+    <span class="kw">private readonly</span> <span class="ty">Player</span> _player;
+
+    <span class="kw">public void</span> <span class="fn">Move</span>(<span class="kw">float</span> newX, <span class="kw">float</span> newY)
+    {
+        <span class="fn">DoAsync</span>(() =>
+        {
+            <span class="cm">// 이 람다는 PlayerActor 큐 안에서 한 번에 하나만 실행됨.</span>
+            <span class="cm">// → _player.X / _player.Y는 락 없이 안전하게 갱신할 수 있다.</span>
+            _player.X = newX;
+            _player.Y = newY;
+        });
+    }
+}</code></pre>
+
+  <p>"같은 객체의 큐는 한 번에 하나"라는 규칙이 어떻게 보이는지 살펴보자.</p>
+
+  <div class="anim-stage">
+    <div class="anim-title">시나리오 A · 같은 PlayerActor에 작업 3개 — 자동 직렬화</div>
+    <div class="anim-row">
+      <div class="anim-label">PlayerActor #1</div>
+      <div class="anim-track">
+        <div class="job-bar j-blue a1-bar"   style="left:0%;   width:18%;">Move</div>
+        <div class="job-bar j-green a1-bar"  style="left:20%;  width:22%;">Damage</div>
+        <div class="job-bar j-orange a1-bar" style="left:44%;  width:18%;">Move</div>
+        <div class="job-bar j-purple a1-bar" style="left:64%;  width:24%;">AreaDamage</div>
+        <span class="timeline-axis">시간 →</span>
+      </div>
+    </div>
+    <p style="margin:14px 0 0;font-size:13px;color:var(--text-muted);">하나가 끝나야 다음이 시작된다. <code>_player.Hp</code> 같은 필드를 읽고 쓰는 사이에 다른 작업이 끼어들 수 없다.</p>
+  </div>
+
+  <div class="anim-stage">
+    <div class="anim-title">시나리오 B · 다른 PlayerActor 두 개 — 완전 병렬</div>
+    <div class="anim-row">
+      <div class="anim-label">PlayerActor A</div>
+      <div class="anim-track">
+        <div class="job-bar j-blue a1-bar"   style="left:0%;   width:30%;">Move</div>
+        <div class="job-bar j-green a1-bar"  style="left:32%;  width:28%;">Damage</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">PlayerActor B</div>
+      <div class="anim-track">
+        <div class="job-bar j-pink a1-bar"   style="left:0%;   width:24%;">Move</div>
+        <div class="job-bar j-orange a1-bar" style="left:26%;  width:22%;">Damage</div>
+        <div class="job-bar j-purple a1-bar" style="left:50%;  width:24%;">Move</div>
+      </div>
+    </div>
+    <p style="margin:14px 0 0;font-size:13px;color:var(--text-muted);">서로 다른 객체의 큐는 서로를 막지 않는다. 5명이 동시에 이동해도 5개의 PlayerActor가 같은 시각에 자기 일을 한다.</p>
+  </div>
+
+  <!-- 3.2 DoAsync 의미 -->
+  <h3><span class="num">3.2</span> DoAsync — "메서드 직접 호출 ≠ DoAsync"</h3>
+  <p>가장 흔한 초보 실수는 <code>DoAsync</code>가 그냥 비동기 호출이라고 생각하는 것이다. 실제로는 다르다.</p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div>
+      <span class="code-label">❌ 직접 호출</span>
+      <pre style="margin-top:0;"><code><span class="cm">// 호출 즉시 실행됨</span>
+<span class="cm">// 누가 호출했냐에 따라 어느 스레드</span>
+<span class="cm">// 인지 알 수 없음 → 락 필요</span>
+player.X = newX;
+player.Y = newY;</code></pre>
+    </div>
+    <div>
+      <span class="code-label">✅ DoAsync로 큐에 등록</span>
+      <pre style="margin-top:0;"><code><span class="cm">// 람다를 큐에 넣기만 함</span>
+<span class="cm">// 실행은 actor 큐가 자기 차례에</span>
+<span class="cm">// → 항상 직렬, 락 불필요</span>
+<span class="fn">DoAsync</span>(() => {
+    player.X = newX;
+    player.Y = newY;
+});</code></pre>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <strong>코딩 컨벤션 ·</strong> 이 예제는 <code>public Handle*()</code>는 <strong>큐에 푸시만</strong> 하고, 실제 본문은 <code>private Process*()</code>로 분리한다. 디버거에서 스택을 봤을 때 "어디서 락이 잠겼는지"가 아니라 "어떤 일이 큐에서 처리되고 있는지"가 한눈에 보인다.
+  </div>
+
+  <pre><code><span class="cm">// GameZone.cs — 컨벤션 예시</span>
+<span class="kw">public void</span> <span class="fn">HandleMove</span>(<span class="kw">string</span> playerId, <span class="kw">float</span> nx, <span class="kw">float</span> ny)
+    => <span class="fn">DoAsync</span>(() => <span class="fn">ProcessMove</span>(playerId, nx, ny));   <span class="cm">// 큐에 푸시만</span>
+
+<span class="kw">private void</span> <span class="fn">ProcessMove</span>(<span class="kw">string</span> playerId, <span class="kw">float</span> nx, <span class="kw">float</span> ny)
+{
+    <span class="cm">// 실제 본문 — GameZone 큐 안에서만 호출되므로 락 불필요</span>
+    <span class="kw">if</span> (_actors.<span class="fn">TryGetValue</span>(playerId, <span class="kw">out var</span> actor))
+        actor.<span class="fn">Move</span>(nx, ny);
+}</code></pre>
+
+  <!-- 3.3 JobDispatcher / IRunnable -->
+  <h3><span class="num">3.3</span> JobDispatcher와 IRunnable — 전용 OS 스레드</h3>
+  <p>
+    <code>JobDispatcher&lt;T&gt;</code>는 <strong>전용 OS 스레드 N개</strong>를 만들어 풀로 관리한다.
+    왜 .NET <code>ThreadPool</code>을 쓰지 않을까?
+  </p>
+  <p>
+    답은 <strong><code>ThreadLocal</code> 안정성</strong>이다.
+    이 라이브러리는 각 워커 스레드마다 자기만의 <code>TimerQueue</code>(<code>DoAsyncAfter</code>가 쓰는 타이머)와 <code>TickCount</code>(현재 시각 캐시)를 두는데,
+    이게 안정적으로 살아있으려면 <strong>스레드가 사라지거나 다른 일에 끌려가면 안 된다</strong>.
+    <code>ThreadPool</code>은 OS가 공유하는 풀이라 이 보장이 없다.
+  </p>
+
+  <pre><code><span class="cm">// ExampleMmorpgServer/GameWorker.cs</span>
+<span class="kw">public class</span> <span class="ty">GameWorker</span> : <span class="ty">IRunnable</span>   <span class="cm">// JobDispatcher가 사용할 워커 정의</span>
+{
+    <span class="kw">public bool</span> <span class="fn">Run</span>(<span class="ty">CancellationToken</span> ct)
+    {
+        <span class="kw">if</span> (ct.IsCancellationRequested) <span class="kw">return false</span>;
+
+        <span class="cm">// ThreadContext.TickCount는 이 워커 전용 스레드의 ThreadLocal 시각.</span>
+        <span class="cm">// 다른 워커와 완전히 독립 → 락 없이 워커별 주기 통계 가능.</span>
+        <span class="kw">long</span> now = <span class="ty">ThreadContext</span>.TickCount;
+        <span class="kw">if</span> (now - _lastHeartbeatTick >= <span class="num">5000</span>)
+        {
+            _lastHeartbeatTick = now;
+            <span class="ty">Console</span>.<span class="fn">WriteLine</span>($<span class="str">"[워커 #{_workerId}] alive tick={now}ms"</span>);
+        }
+
+        <span class="ty">Thread</span>.<span class="fn">Sleep</span>(<span class="num">1</span>);     <span class="cm">// 전용 스레드라 sleep해도 다른 사람 안 막음</span>
+        <span class="kw">return true</span>;          <span class="cm">// true면 계속 실행, false면 종료</span>
+    }
+
+    <span class="kw">public void</span> <span class="fn">Dispose</span>() { <span class="cm">/* 종료 시 호출됨 */</span> }
+}</code></pre>
+
+  <p>실제 사용은 한 줄이다.</p>
+
+  <pre><code><span class="cm">// GameServer.cs</span>
+_dispatcher = <span class="kw">new</span> <span class="ty">JobDispatcher</span>&lt;<span class="ty">GameWorker</span>&gt;(workerCount: <span class="num">4</span>);
+_ = _dispatcher.<span class="fn">RunWorkerThreadsAsync</span>();    <span class="cm">// 4개의 OS 스레드 시작</span></code></pre>
+
+  <!-- 3.4 DoAsyncAfter -->
+  <h3><span class="num">3.4</span> DoAsyncAfter — 자기복제 주기 작업</h3>
+  <p>
+    "3초마다 HP 회복" 같은 주기 작업을 흔히 <code>Timer</code>나 <code>Task.Delay</code>로 만들지만,
+    이 라이브러리에서는 더 단순한 패턴이 있다.
+    <strong>"자기 자신을 다음 타이밍에 자기 큐에 다시 등록한다."</strong>
+  </p>
+
+  <pre><code><span class="cm">// PlayerActor.cs — 자가 회복 heartbeat</span>
+<span class="kw">public void</span> <span class="fn">StartRegen</span>() => <span class="fn">DoAsync</span>(<span class="fn">RegenTick</span>);
+
+<span class="kw">private void</span> <span class="fn">RegenTick</span>()
+{
+    <span class="kw">if</span> (_despawned) <span class="kw">return</span>;
+
+    <span class="kw">if</span> (_player.IsAlive &amp;&amp; _player.Hp &lt; _player.MaxHp)
+    {
+        _player.Hp = <span class="ty">Math</span>.<span class="fn">Min</span>(_player.MaxHp, _player.Hp + <span class="num">30</span>);
+        <span class="ty">Console</span>.<span class="fn">WriteLine</span>($<span class="str">"  [{_player.Name}] 자동회복"</span>);
+    }
+
+    <span class="cm">// 자기복제 — 3초 뒤에 자기 큐에 다시 RegenTick을 등록</span>
+    <span class="fn">DoAsyncAfter</span>(<span class="ty">TimeSpan</span>.<span class="fn">FromSeconds</span>(<span class="num">3</span>), <span class="fn">RegenTick</span>);
+}</code></pre>
+
+  <div class="anim-stage">
+    <div class="anim-title">애니메이션 · RegenTick의 자기복제 사이클</div>
+    <div class="anim-row">
+      <div class="anim-label">큐</div>
+      <div class="anim-track" style="height: 56px;">
+        <div style="position:absolute;left:0;top:0;height:100%;width:32%;background:#dbeafe;border-right:2px dashed #93c5fd;"></div>
+        <div style="position:absolute;left:34%;top:0;height:100%;width:30%;background:#fef3c7;border-right:2px dashed #fcd34d;"></div>
+        <div style="position:absolute;left:66%;top:0;height:100%;width:32%;background:#fce7f3;"></div>
+        <div style="position:absolute;left:1%;top:8px;font-size:11px;color:#1e3a8a;font-weight:700;">① 큐 대기</div>
+        <div style="position:absolute;left:35%;top:8px;font-size:11px;color:#92400e;font-weight:700;">② 실행 (Hp+=30)</div>
+        <div style="position:absolute;left:67%;top:8px;font-size:11px;color:#9f1239;font-weight:700;">③ 3초 타이머</div>
+        <div class="job-bar j-green" style="top:24px; width:60px; left:6px; animation: regen-cycle 5s linear infinite;">RegenTick</div>
+      </div>
+    </div>
+    <p style="margin:14px 0 0;font-size:13px;color:var(--text-muted);">람다가 큐 → 실행 → 타이머 → 다시 큐로 무한 루프. 외부 스레드/타이머 객체가 없으므로 락이 0개다.</p>
+  </div>
+
+  <p>같은 패턴으로 <code>GameZone</code>의 5초마다 인원 통계도 만들어진다.</p>
+  <pre><code><span class="cm">// GameZone.cs</span>
+<span class="kw">private void</span> <span class="fn">Heartbeat</span>(<span class="ty">TimeSpan</span> period)
+{
+    <span class="kw">if</span> (_stopped) <span class="kw">return</span>;
+    <span class="kw">if</span> (_actors.Count > <span class="num">0</span>) {
+        <span class="ty">Console</span>.<span class="fn">WriteLine</span>($<span class="str">"  [{_name}] heartbeat 인원={_actors.Count}"</span>);
+    }
+    <span class="fn">DoAsyncAfter</span>(period, () => <span class="fn">Heartbeat</span>(period));    <span class="cm">// 자기복제</span>
+}</code></pre>
+
+  <p>그리고 1회성 지연 작업도 같은 함수다.</p>
+  <pre><code><span class="cm">// PlayerActor.cs — 사망 후 5초 뒤 부활 (1회만)</span>
+<span class="fn">DoAsyncAfter</span>(<span class="ty">TimeSpan</span>.<span class="fn">FromSeconds</span>(<span class="num">5</span>), () => {
+    _player.Hp = _player.MaxHp;
+    <span class="cm">// 부활 처리...</span>
+});</code></pre>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 4: 컴포넌트
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="components">
+  <span class="section-num">SECTION 04</span>
+  <h2 class="section-title">컴포넌트 한 명씩 보기</h2>
+  <p class="section-lead">
+    파일별로 어떤 역할을 하는지, 왜 그렇게 분리되어 있는지 본다.
+    중요한 것부터 순서대로.
+  </p>
+
+  <div class="tbl-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 24%;">파일</th>
+        <th style="width: 12%;">종류</th>
+        <th>역할</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Program.cs</code></td><td>진입점</td><td>모드 분기 (시뮬레이션 vs 네트워크), <code>OnError</code> 후킹, 시나리오 실행. <strong>모두 동기</strong> — async/await 없음.</td></tr>
+      <tr><td><code>GameServer.cs</code></td><td>조립</td><td><code>JobDispatcher</code>, <code>GameZone</code> 라이프사이클 조립 + 패킷 핸들러 외부 진입점. Start/Stop 동기.</td></tr>
+      <tr><td><code>GameZone.cs</code></td><td><strong>Actor</strong></td><td>월드 라우터. 패킷을 받아 PlayerActor로 분배. AoE 공간조회 fan-out</td></tr>
+      <tr><td><code>PlayerActor.cs</code></td><td><strong>Actor</strong></td><td>플레이어 한 명의 두뇌. 이동·공격·피격·자동회복·부활을 자기 큐에서</td></tr>
+      <tr><td><code>Player.cs</code></td><td>데이터</td><td>이름·좌표·HP·공격력 같은 순수 상태 (락 없음)</td></tr>
+      <tr><td><code>SpatialIndex.cs</code></td><td>유틸</td><td>격자 기반 공간 조회 (<code>ConcurrentDictionary</code>)</td></tr>
+      <tr><td><code>GameWorker.cs</code></td><td>워커</td><td><code>IRunnable</code> 구현. <code>InboundCommands</code> 큐를 dequeue해 <code>HandleX</code> 실행 → actor Flush가 워커 스레드에서 일어남.</td></tr>
+      <tr><td><code>NetworkServer.cs</code></td><td>네트워크</td><td>Accept/Recv/Send <strong>전용 OS 스레드</strong> + 세션별 패킷 큐 + CAS drain 락. 동기 IO 기반.</td></tr>
+      <tr><td><code>Packets.cs</code></td><td>네트워크</td><td>텍스트 프로토콜 파서 + 핸들러 라우팅 (워커 스레드에서 실행됨).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- Player -->
+  <h3><span class="num">4.1</span> Player — "그냥 데이터"</h3>
+  <p>
+    <code>Player</code>는 <strong>actor가 아니다</strong>. <code>AsyncExecutable</code>을 상속받지 않는다.
+    그저 이름·좌표·HP 같은 상태 필드를 가진 평범한 데이터 객체다.
+    안전성은 <strong>"이 객체를 누가 만지느냐"</strong>로 보장한다 — 항상 그 플레이어의 <code>PlayerActor</code> 큐 안에서만 만진다.
+  </p>
+  <pre><code><span class="cm">// Player.cs</span>
+<span class="kw">public class</span> <span class="ty">Player</span>
+{
+    <span class="kw">public string</span> PlayerId { <span class="kw">get</span>; }
+    <span class="kw">public float</span> X { <span class="kw">get</span>; <span class="kw">set</span>; }    <span class="cm">// 락 없음 — PlayerActor 큐 안에서만 set</span>
+    <span class="kw">public float</span> Y { <span class="kw">get</span>; <span class="kw">set</span>; }
+    <span class="kw">public int</span>   Hp { <span class="kw">get</span>; <span class="kw">set</span>; }
+    <span class="kw">public</span> <span class="ty">Action</span>&lt;<span class="kw">string</span>&gt;? SendPacket { <span class="kw">get</span>; <span class="kw">set</span>; }   <span class="cm">// 송신 콜백</span>
+
+    <span class="kw">public int</span> <span class="fn">TakeDamage</span>(<span class="kw">int</span> raw)
+    {
+        <span class="kw">int</span> dmg = <span class="ty">Math</span>.<span class="fn">Max</span>(<span class="num">1</span>, raw - Defense);
+        Hp = <span class="ty">Math</span>.<span class="fn">Max</span>(<span class="num">0</span>, Hp - dmg);
+        <span class="kw">return</span> dmg;
+    }
+}</code></pre>
+
+  <!-- PlayerActor -->
+  <h3><span class="num">4.2</span> PlayerActor — 플레이어 한 명의 두뇌</h3>
+  <p>
+    각 플레이어마다 한 개씩 만들어진다. <code>AsyncExecutable</code>을 상속해서 <strong>자기만의 작업 큐</strong>를 가진다.
+    이 큐 덕분에 같은 플레이어에 대한 작업은 자동으로 순서가 보장되고, 다른 플레이어와는 병렬로 처리된다.
+  </p>
+  <p><strong>주요 메서드 분류:</strong></p>
+  <div class="card-grid">
+    <div class="card">
+      <h4>입력 처리</h4>
+      <p><code>Move</code>, <code>MeleeAttack</code>, <code>AreaAttack</code> — 자신이 발생시키는 행동.</p>
+    </div>
+    <div class="card">
+      <h4>입력 수신</h4>
+      <p><code>ReceiveMeleeDamage</code>, <code>ReceiveAreaDamage</code> — 다른 actor가 주는 데미지.</p>
+    </div>
+    <div class="card">
+      <h4>주기 작업</h4>
+      <p><code>StartRegen</code> → <code>RegenTick</code> — DoAsyncAfter 자기복제 회복.</p>
+    </div>
+    <div class="card">
+      <h4>라이프사이클</h4>
+      <p><code>Despawn</code>, <code>HandleDeath</code> — 종료 처리, 5초 뒤 부활.</p>
+    </div>
+  </div>
+
+  <p>한 가지 패턴이 반복된다 — <strong>actor → actor 메시지 전달은 항상 "스냅샷"으로</strong>.</p>
+  <pre><code><span class="cm">// PlayerActor.cs — 근접 공격</span>
+<span class="kw">public void</span> <span class="fn">MeleeAttack</span>(<span class="kw">string</span> targetId, <span class="kw">float</span> meleeRange)
+{
+    <span class="fn">DoAsync</span>(() =>
+    {
+        <span class="kw">if</span> (_despawned || !_player.IsAlive) <span class="kw">return</span>;
+
+        <span class="cm">// 1단계: 공격자 정보를 불변 record struct로 "복사"한다.</span>
+        <span class="cm">// 이렇게 안 하고 _player를 그대로 넘기면 대상 actor 큐에서 _player.X를</span>
+        <span class="cm">// 읽는 사이에 내가 _player.X를 갱신해 race가 발생할 수 있다.</span>
+        <span class="kw">var</span> snapshot = <span class="kw">new</span> <span class="ty">AttackerSnapshot</span>(
+            _player.PlayerId, _player.Name,
+            _player.X, _player.Y, _player.Attack);
+
+        <span class="cm">// 2단계: 대상 lookup은 GameZone 큐로 위임 → race 없음</span>
+        _zone.<span class="fn">SendMeleeDamage</span>(targetId, snapshot, meleeRange);
+    });
+}</code></pre>
+
+  <div class="callout note">
+    <strong>왜 record struct인가? ·</strong> <code>AttackerSnapshot</code>은 <code>readonly record struct</code> — 불변 + 값 타입이다. 한 번 만들고 나면 바뀔 수 없으므로 어떤 스레드가 읽어도 항상 같은 값을 본다. <strong>스레드 간 데이터 전달은 항상 불변으로</strong> — actor 모델의 황금률이다.
+  </div>
+
+  <!-- GameZone -->
+  <h3><span class="num">4.3</span> GameZone — 월드의 우체국</h3>
+  <p>
+    <code>GameZone</code>도 <code>AsyncExecutable</code>이다. 자기만의 큐가 있고,
+    "어떤 패킷이 어떤 PlayerActor로 가야 하는지"를 결정하는 라우터 역할이다.
+    플레이어 사전(<code>_actors</code>)을 들고 있는데, <strong>일반 <code>Dictionary</code>로 충분하다</strong> —
+    모든 접근이 <code>GameZone</code> 큐 안에서 일어나므로.
+  </p>
+  <pre><code><span class="cm">// GameZone.cs</span>
+<span class="kw">public class</span> <span class="ty">GameZone</span> : <span class="ty">AsyncExecutable</span>
+{
+    <span class="kw">private readonly</span> <span class="ty">Dictionary</span>&lt;<span class="kw">string</span>, <span class="ty">PlayerActor</span>&gt; _actors = [];   <span class="cm">// 락 없음!</span>
+    <span class="kw">private readonly</span> <span class="ty">SpatialIndex</span> _spatialIndex;
+
+    <span class="cm">// 외부 진입점은 모두 큐에 푸시만 (코딩 컨벤션)</span>
+    <span class="kw">public void</span> <span class="fn">EnterZone</span>(<span class="ty">Player</span> p, <span class="kw">float</span> sx, <span class="kw">float</span> sy)
+        => <span class="fn">DoAsync</span>(() => <span class="fn">ProcessEnterZone</span>(p, sx, sy));
+
+    <span class="kw">public void</span> <span class="fn">HandleMove</span>(<span class="kw">string</span> id, <span class="kw">float</span> nx, <span class="kw">float</span> ny)
+        => <span class="fn">DoAsync</span>(() => <span class="fn">ProcessMove</span>(id, nx, ny));
+
+    <span class="cm">// PlayerActor → GameZone으로 위임되는 melee 라우팅</span>
+    <span class="kw">internal void</span> <span class="fn">SendMeleeDamage</span>(<span class="kw">string</span> targetId, <span class="ty">AttackerSnapshot</span> atk, <span class="kw">float</span> range)
+        => <span class="fn">DoAsync</span>(() =>
+        {
+            <span class="kw">if</span> (_actors.<span class="fn">TryGetValue</span>(targetId, <span class="kw">out var</span> target))
+                target.<span class="fn">ReceiveMeleeDamage</span>(atk, range);
+        });
+}</code></pre>
+
+  <div class="callout warn">
+    <strong>주의 ·</strong> 만약 <code>_actors</code>를 외부 스레드(예: 네트워크 IO 스레드)에서 직접 만지면 race가 생긴다. 그래서 <code>GameZone</code>도 actor가 되어야 한다 — 모든 접근을 자기 큐 안으로 모은다.
+  </div>
+
+  <!-- GameServer -->
+  <h3><span class="num">4.4</span> GameServer — 조립공장</h3>
+  <p>
+    <code>GameServer</code>는 actor가 아니다. 그냥 <code>JobDispatcher</code>와 <code>GameZone</code>의 수명주기를 묶어주는 조립공장이다.
+    외부 진입점도 모두 <code>GameZone</code>으로 단순 위임한다.
+  </p>
+  <p>
+    Start/Stop 모두 <strong>동기</strong>다. 라이브러리가 반환하는 <code>ValueTask</code>는 종료 경로에서
+    <code>.AsTask().Wait()</code> 한 번만 차단해 처리한다 — 코드 전체에 <code>async</code>/<code>await</code>가
+    한 번도 등장하지 않는다.
+  </p>
+  <pre><code><span class="kw">public void</span> <span class="fn">Start</span>()
+{
+    _dispatcher = <span class="kw">new</span> <span class="ty">JobDispatcher</span>&lt;<span class="ty">GameWorker</span>&gt;(_workerCount);
+    _ = _dispatcher.<span class="fn">RunWorkerThreadsAsync</span>();           <span class="cm">// 워커 풀 시작 (Task 즉시 반환)</span>
+    _zone.<span class="fn">StartHeartbeat</span>(<span class="ty">TimeSpan</span>.<span class="fn">FromSeconds</span>(<span class="num">5</span>));   <span class="cm">// 자기복제 통계</span>
+}
+
+<span class="kw">public void</span> <span class="fn">Stop</span>()
+{
+    <span class="cm">// ValueTask를 1회만 차단해 동기적으로 drain</span>
+    _zone.<span class="fn">DisposeAsync</span>().<span class="fn">AsTask</span>().<span class="fn">Wait</span>();   <span class="cm">// actor 큐들 drain</span>
+    _dispatcher?.<span class="fn">Dispose</span>();                  <span class="cm">// 워커 스레드 join (동기)</span>
+    <span class="ty">TimerRegistry</span>.<span class="fn">DisposeAll</span>();             <span class="cm">// 비-워커 TimerQueue 정리</span>
+}</code></pre>
+
+  <div class="callout note">
+    <strong>왜 async/await을 안 쓰나? ·</strong> 실제 게임 서버는 IO 대기를 <strong>전용 OS 스레드</strong>로 처리하므로
+    async 상태머신 비용을 지불할 이유가 없다. 패킷 처리 자체에는 대기가 없고, 대기가 발생하는 지점(소켓 Read/Write,
+    actor 큐 drain 종료)은 동기 차단으로 짧게 끝난다. 자세한 설명은 <a href="#sync-io">Section 8</a> 참고.
+  </div>
+
+  <!-- NetworkServer -->
+  <h3><span class="num">4.5</span> NetworkServer — IO 스레드와 패킷 처리 스레드의 완전 분리</h3>
+  <p>
+    네트워크 모듈의 설계 원칙은 단순하다.
+    <strong>"IO 스레드는 절대로 actor의 람다를 직접 실행하지 않는다."</strong>
+    Read/Write 같은 IO 대기는 전용 OS 스레드에서, 게임 로직(actor Flush)은 <code>JobDispatcher</code>
+    워커 스레드에서. 두 영역이 큐 하나로만 연결된다.
+  </p>
+
+  <h4>스레드 구성 — 한 세션에 IO 스레드가 두 개</h4>
+  <div class="card-grid">
+    <div class="card">
+      <div class="icon" style="background:var(--pink);color:white">📥</div>
+      <h4>RecvIO 스레드</h4>
+      <p>동기 <code>Read</code>로 블로킹. 줄 단위로 잘라 <strong>세션 자체의 패킷 큐</strong>에 push 한 뒤
+        <code>InboundCommands</code>에 drain 명령을 1회 등록하고 즉시 다음 <code>Read</code>로 돌아간다.</p>
+    </div>
+    <div class="card">
+      <div class="icon" style="background:var(--orange);color:white">📤</div>
+      <h4>SendIO 스레드</h4>
+      <p>세션의 <code>BlockingCollection</code>에서 byte[]를 꺼내 동기 <code>Write</code>. 워커가
+        <code>SendPacket</code>을 호출하면 큐에 push만 — 송신 대기로 워커가 막히지 않는다.</p>
+    </div>
+    <div class="card">
+      <div class="icon" style="background:var(--purple);color:white">👂</div>
+      <h4>Accept 스레드</h4>
+      <p>전용 한 개. <code>AcceptTcpClient()</code>를 동기 호출하며 새 연결을 받아 위 두 스레드를 띄운다.</p>
+    </div>
+    <div class="card">
+      <div class="icon">⚙️</div>
+      <h4>Worker 스레드 (JobDispatcher)</h4>
+      <p><code>InboundCommands</code>에서 명령을 dequeue 하여 세션의 패킷 큐를 drain → <code>GameServer.HandleX</code> → actor Flush.
+        <strong>실제 게임 로직은 모두 여기서</strong> 실행된다.</p>
+    </div>
+  </div>
+
+  <h4>RecvIO — 받기만 하고 즉시 빠져나간다</h4>
+  <pre><code><span class="cm">// NetworkServer.cs — RecvLoop 요약 (동기 Read)</span>
+<span class="kw">private void</span> <span class="fn">RecvLoop</span>()
+{
+    <span class="kw">var</span> buffer = <span class="kw">new byte</span>[<span class="num">1024</span>];
+    <span class="kw">var</span> pendingText = <span class="kw">new</span> <span class="ty">StringBuilder</span>();   <span class="cm">// 토막난 패킷 보관</span>
+    <span class="kw">while</span> (<span class="kw">true</span>)
+    {
+        <span class="kw">int</span> n = _stream.<span class="fn">Read</span>(buffer, <span class="num">0</span>, buffer.Length);   <span class="cm">// 동기 블로킹</span>
+        <span class="kw">if</span> (n == <span class="num">0</span>) <span class="kw">break</span>;
+
+        pendingText.<span class="fn">Append</span>(<span class="ty">Encoding</span>.UTF8.<span class="fn">GetString</span>(buffer, <span class="num">0</span>, n));
+
+        <span class="kw">bool</span> pushedAny = <span class="kw">false</span>;
+        <span class="kw">while</span> (/* '\n' 발견 */) {
+            _packetQueue.<span class="fn">Enqueue</span>(line);   <span class="cm">// 세션 자체의 큐로 적재</span>
+            pushedAny = <span class="kw">true</span>;
+        }
+
+        <span class="kw">if</span> (pushedAny)
+            <span class="fn">TryScheduleDrain</span>();           <span class="cm">// 워커 큐에 drain 명령 1회 등록</span>
+    }
+}</code></pre>
+
+  <div class="callout warn">
+    <strong>핵심 ·</strong> RecvIO 스레드는 <code>PacketHandler.Handle</code>이나 <code>GameServer.HandleX</code>를
+    <em>직접 호출하지 않는다</em>. 직접 호출하면 actor 큐가 비어있을 때 <code>AsyncExecutable.DoTask</code>의
+    leader 경로가 IO 스레드에서 <code>Flush</code>를 실행해 버린다. 이 한 줄의 우회가 "IO 스레드와 패킷 처리 스레드 완전 분리"의 핵심.
+  </div>
+
+  <h4>세션별 drain — 같은 클라이언트의 패킷 순서 보장</h4>
+  <p>
+    여러 워커가 <code>InboundCommands</code>에서 동시에 명령을 꺼내 <code>_zone.DoAsync</code>를 부르면,
+    라이브러리의 <code>Increment + TryWrite</code>가 원자적이지 않아서 같은 세션의
+    <code>EnterZone → Move</code>가 채널 안에서 <code>Move → EnterZone</code>으로 뒤집힐 수 있다 (실제 발견된 race).
+    이를 막기 위해 한 세션의 패킷은 항상 <strong>한 워커가 순차로</strong> drain 한다.
+  </p>
+
+  <pre><code><span class="cm">// 세션별 큐 + CAS 락 = "한 시점에 한 워커만 이 세션을 drain"</span>
+<span class="kw">private readonly</span> <span class="ty">ConcurrentQueue</span>&lt;<span class="kw">string</span>&gt; _packetQueue = <span class="kw">new</span>();
+<span class="kw">private int</span> _drainScheduled;   <span class="cm">// 0=idle, 1=drain 중/예약</span>
+
+<span class="kw">private void</span> <span class="fn">TryScheduleDrain</span>()
+{
+    <span class="cm">// CAS로 한 스레드만 drain 명령을 InboundCommands에 등록한다.</span>
+    <span class="kw">if</span> (<span class="ty">Interlocked</span>.<span class="fn">CompareExchange</span>(<span class="kw">ref</span> _drainScheduled, <span class="num">1</span>, <span class="num">0</span>) != <span class="num">0</span>)
+        <span class="kw">return</span>;
+    <span class="ty">GameWorker</span>.InboundCommands.<span class="fn">Enqueue</span>(<span class="fn">DrainPackets</span>);
+}
+
+<span class="kw">private void</span> <span class="fn">DrainPackets</span>()    <span class="cm">// 워커 스레드에서 실행</span>
+{
+    <span class="kw">try</span>
+    {
+        <span class="kw">while</span> (_packetQueue.<span class="fn">TryDequeue</span>(<span class="kw">out var</span> line))
+        {
+            <span class="kw">if</span> (<span class="ty">ReferenceEquals</span>(line, DisconnectMarker))
+                _gameServer.<span class="fn">HandlePlayerDisconnect</span>(Player.PlayerId);
+            <span class="kw">else</span>
+                <span class="ty">PacketHandler</span>.<span class="fn">Handle</span>(_gameServer, Player, line);
+        }
+    }
+    <span class="kw">finally</span>
+    {
+        <span class="ty">Volatile</span>.<span class="fn">Write</span>(<span class="kw">ref</span> _drainScheduled, <span class="num">0</span>);
+        <span class="cm">// drain 종료와 RecvIO push 사이 race 처리</span>
+        <span class="kw">if</span> (!_packetQueue.IsEmpty)
+            <span class="fn">TryScheduleDrain</span>();
+    }
+}</code></pre>
+
+  <div class="callout tip">
+    <strong>Disconnect도 같은 큐로 ·</strong> 연결 종료 처리 역시 <code>DisconnectMarker</code>라는 sentinel 문자열로
+    같은 <code>_packetQueue</code>에 넣는다. 그래야 큐에 줄 서 있던 EnterZone/Move/Attack이 모두 처리된 뒤에야
+    <code>HandlePlayerDisconnect</code>가 실행된다. <code>ReferenceEquals</code>로 식별하므로 사용자가 같은
+    문자열을 보내도 절대 일치하지 않는다 (서로 다른 string 인스턴스).
+  </div>
+
+  <h4>SendIO — 송신 대기는 워커가 아니라 전용 스레드에서</h4>
+  <pre><code><span class="cm">// 워커가 actor 람다 안에서 호출하는 것은 큐 push 하나뿐</span>
+<span class="kw">private void</span> <span class="fn">EnqueueSend</span>(<span class="kw">string</span> message)
+{
+    <span class="kw">try</span>
+    {
+        _sendQueue.<span class="fn">Add</span>(<span class="ty">Encoding</span>.UTF8.<span class="fn">GetBytes</span>(message + <span class="str">"\n"</span>));
+    }
+    <span class="kw">catch</span> (<span class="ty">InvalidOperationException</span>) { <span class="cm">/* CompleteAdding/Disposed — 무시 */</span> }
+}
+
+<span class="cm">// 전용 SendIO 스레드 — 동기 Write가 블로킹되어도 워커는 영향 없음</span>
+<span class="kw">private void</span> <span class="fn">SendLoop</span>()
+{
+    <span class="kw">foreach</span> (<span class="kw">var</span> data <span class="kw">in</span> _sendQueue.<span class="fn">GetConsumingEnumerable</span>())
+    {
+        <span class="kw">try</span> { _stream.<span class="fn">Write</span>(data, <span class="num">0</span>, data.Length); }
+        <span class="kw">catch</span> { <span class="kw">break</span>; }
+    }
+    <span class="fn">CloseSocket</span>();   <span class="cm">// 송신 실패 시 RecvLoop도 깨운다</span>
+}</code></pre>
+
+  <div class="callout note">
+    <strong>왜 BlockingCollection을 Dispose하지 않나? ·</strong> 워커가 <code>PlayerActor</code> 큐에 남은
+    잔여 패킷을 늦게 처리하면서 <code>SendPacket</code>을 호출하는 race가 흔하다. 이때 큐가 disposed라면
+    <code>ObjectDisposedException</code>이 actor Flush 안에서 터진다. <code>CompleteAdding</code>만 호출하고
+    Dispose는 GC에 맡기는 편이 안전하다.
+  </div>
+
+  <!-- SpatialIndex -->
+  <h3><span class="num">4.6</span> SpatialIndex — 유일하게 락이 있는 곳</h3>
+  <p>
+    AoE 공격 같은 "주변 5m 안에 있는 모든 플레이어 찾기"를 빠르게 하기 위한 격자 기반 공간 자료구조.
+    이건 <code>ConcurrentDictionary</code>를 쓴다 — 여러 PlayerActor가 자기 위치를 갱신하면서 동시에 GameZone이 범위 조회를 하기 때문.
+  </p>
+  <p>이 라이브러리 전체에서 <strong>"락"이 등장하는 유일한 곳</strong>이 바로 <code>ConcurrentDictionary</code>의 내부 버킷 락뿐이다. 외부 락은 0개.</p>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 5: 코드 호출 흐름
+     ═══════════════════════════════════════════════════════════ -->
+<div class="wide">
+<section id="flows">
+  <span class="section-num">SECTION 05</span>
+  <h2 class="section-title">코드 호출 흐름</h2>
+  <p class="section-lead">
+    실제 시나리오에서 코드가 어떤 순서로 호출되는지 시퀀스 다이어그램으로 본다.
+    가로축은 actor, 세로축은 시간이다.
+  </p>
+
+  <!-- 5.1 입장 -->
+  <h3><span class="num">5.1</span> 플레이어 입장 (EnterZone)</h3>
+  <p>패킷 <code>EnterZone|field|50|50</code>이 들어오면:</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg">
+      <!-- Lifelines -->
+      <g font-family="-apple-system, sans-serif">
+        <text x="70"  y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#9f1239">RecvIO</text>
+        <text x="210" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#ea580c">세션 패킷 큐</text>
+        <text x="360" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#713f12">Worker (drain)</text>
+        <text x="500" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#5b21b6">GameZone (큐)</text>
+        <text x="680" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#0e7490">PlayerActor (큐)</text>
+        <text x="820" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#475569">SpatialIndex</text>
+
+        <line x1="70"  y1="42" x2="70"  y2="410" stroke="#fda4af" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="210" y1="42" x2="210" y2="410" stroke="#fdba74" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="360" y1="42" x2="360" y2="410" stroke="#fcd34d" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="500" y1="42" x2="500" y2="410" stroke="#c4b5fd" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="680" y1="42" x2="680" y2="410" stroke="#67e8f9" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="820" y1="42" x2="820" y2="410" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4"/>
+      </g>
+
+      <defs>
+        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
+        </marker>
+      </defs>
+
+      <!-- 1. RecvIO → 세션 패킷 큐 -->
+      <line x1="72" y1="70" x2="208" y2="70" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arr2)"/>
+      <text x="140" y="64" text-anchor="middle" font-size="10.5" fill="#9f1239">① _packetQueue.Enqueue(line)</text>
+
+      <!-- 2. RecvIO → InboundCommands (drain 명령 1회) -->
+      <line x1="72" y1="98" x2="358" y2="98" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr2)"/>
+      <text x="215" y="92" text-anchor="middle" font-size="10.5" fill="#713f12">② TryScheduleDrain → InboundCommands</text>
+
+      <!-- 3. Worker drain → 세션 패킷 큐 dequeue -->
+      <line x1="358" y1="124" x2="212" y2="124" stroke="#ca8a04" stroke-width="1.5" marker-end="url(#arr2)"/>
+      <text x="285" y="118" text-anchor="middle" font-size="10.5" fill="#713f12">③ TryDequeue (워커가 세션 큐 drain)</text>
+      <rect x="355" y="120" width="10" height="40" fill="#facc15"/>
+
+      <!-- 4. Worker → GameServer.HandleEnterZone -->
+      <text x="362" y="178" text-anchor="middle" font-size="10.5" fill="#713f12" font-style="italic">PacketHandler.Handle → server.HandleEnterZone</text>
+
+      <!-- 5. Worker → GameZone DoAsync -->
+      <line x1="362" y1="200" x2="498" y2="200" stroke="#7c3aed" stroke-width="2" marker-end="url(#arr2)"/>
+      <text x="430" y="194" text-anchor="middle" font-size="10.5" fill="#5b21b6" font-weight="600">④ DoAsync(ProcessEnterZone)</text>
+      <rect x="495" y="196" width="10" height="36" fill="#a78bfa"/>
+
+      <!-- inside GameZone queue -->
+      <text x="586" y="240" font-size="10.5" fill="#5b21b6" font-style="italic">[GameZone 큐 차례]</text>
+      <text x="500" y="258" text-anchor="middle" font-size="10.5" fill="#5b21b6">_actors[id] = actor</text>
+
+      <!-- 6. GameZone → SpatialIndex.Add -->
+      <line x1="502" y1="280" x2="818" y2="280" stroke="#475569" stroke-width="1.4" marker-end="url(#arr2)"/>
+      <text x="660" y="274" text-anchor="middle" font-size="10.5" fill="#334155">⑤ Spatial.Add(player)</text>
+
+      <!-- 7. GameZone → PlayerActor.StartRegen -->
+      <line x1="502" y1="316" x2="678" y2="316" stroke="#0891b2" stroke-width="2" marker-end="url(#arr2)"/>
+      <text x="590" y="310" text-anchor="middle" font-size="10.5" fill="#0e7490" font-weight="600">⑥ StartRegen → DoAsync(RegenTick)</text>
+
+      <rect x="675" y="310" width="10" height="50" fill="#22d3ee"/>
+      <text x="760" y="346" font-size="10.5" fill="#0e7490" font-style="italic">[PlayerActor 큐]</text>
+      <text x="680" y="362" font-size="10.5" fill="#0e7490">RegenTick → DoAsyncAfter(3s)</text>
+
+      <!-- 8. SendPacket via SendIO -->
+      <line x1="498" y1="392" x2="72" y2="392" stroke="#db2777" stroke-width="1.4" stroke-dasharray="3,2" marker-end="url(#arr2)"/>
+      <text x="280" y="386" text-anchor="middle" font-size="10.5" fill="#9f1239">⑦ SendPacket → SendIO 큐 → Write</text>
+    </svg>
+    <p class="diagram-caption">RecvIO 스레드는 ①②만 하고 즉시 다음 <code>Read</code>로. 실제 작업(actor 생성, spatial 등록, regen 시작)은 워커가 시작하고 actor 큐들이 이어받아 직렬 처리.</p>
+  </div>
+
+  <!-- 5.2 근접 공격 -->
+  <h3><span class="num">5.2</span> 근접 공격 (A → B)</h3>
+  <p>이 흐름이 actor 모델의 진수다. <strong>두 actor 사이의 메시지 패싱이 4번의 큐 hop으로 일어난다.</strong></p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 880 460" xmlns="http://www.w3.org/2000/svg">
+      <g font-family="-apple-system, sans-serif">
+        <text x="80"  y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#9f1239">IO 스레드</text>
+        <text x="280" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#5b21b6">GameZone</text>
+        <text x="500" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#0e7490">PlayerActor A (공격자)</text>
+        <text x="780" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#dc2626">PlayerActor B (대상)</text>
+
+        <line x1="80"  y1="42" x2="80"  y2="450" stroke="#fda4af" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="280" y1="42" x2="280" y2="450" stroke="#c4b5fd" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="500" y1="42" x2="500" y2="450" stroke="#67e8f9" stroke-width="1.5" stroke-dasharray="4,4"/>
+        <line x1="780" y1="42" x2="780" y2="450" stroke="#fca5a5" stroke-width="1.5" stroke-dasharray="4,4"/>
+      </g>
+
+      <defs>
+        <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
+        </marker>
+      </defs>
+
+      <!-- step 1 -->
+      <line x1="82" y1="76" x2="278" y2="76" stroke="#475569" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <text x="180" y="70" text-anchor="middle" font-size="11" fill="#334155">① HandleMeleeAttack("A", "B")</text>
+
+      <!-- step 2 -->
+      <rect x="275" y="98" width="10" height="36" fill="#a78bfa"/>
+      <text x="370" y="120" font-size="11" fill="#5b21b6" font-style="italic">[GameZone 큐] _actors lookup</text>
+
+      <line x1="282" y1="148" x2="498" y2="148" stroke="#0891b2" stroke-width="2" marker-end="url(#arr3)"/>
+      <text x="390" y="142" text-anchor="middle" font-size="11" fill="#0e7490" font-weight="600">② attacker.MeleeAttack("B", range)</text>
+
+      <!-- step 3 -->
+      <rect x="495" y="170" width="10" height="50" fill="#22d3ee"/>
+      <text x="568" y="190" font-size="11" fill="#0e7490" font-style="italic">[A 큐] _player.IsAlive 체크</text>
+      <text x="568" y="205" font-size="11" fill="#0e7490" font-style="italic">AttackerSnapshot 생성 (불변 복사)</text>
+
+      <!-- step 4: A → GameZone (SendMeleeDamage) -->
+      <line x1="498" y1="234" x2="282" y2="234" stroke="#7c3aed" stroke-width="2" marker-end="url(#arr3)"/>
+      <text x="390" y="228" text-anchor="middle" font-size="11" fill="#5b21b6" font-weight="600">③ _zone.SendMeleeDamage("B", snap, range)</text>
+
+      <!-- step 5: GameZone → B -->
+      <rect x="275" y="252" width="10" height="36" fill="#a78bfa"/>
+      <text x="380" y="270" font-size="11" fill="#5b21b6" font-style="italic">[GameZone 큐] B lookup</text>
+
+      <line x1="282" y1="304" x2="778" y2="304" stroke="#dc2626" stroke-width="2" marker-end="url(#arr3)"/>
+      <text x="500" y="298" text-anchor="middle" font-size="11" fill="#9f1239" font-weight="600">④ targetB.ReceiveMeleeDamage(snap, range)</text>
+
+      <!-- step 6: B 처리 -->
+      <rect x="775" y="324" width="10" height="80" fill="#fca5a5"/>
+      <text x="730" y="348" text-anchor="end" font-size="11" fill="#9f1239" font-style="italic">[B 큐] 거리 검증</text>
+      <text x="730" y="364" text-anchor="end" font-size="11" fill="#9f1239" font-style="italic">_player.TakeDamage(snap.Attack)</text>
+      <text x="730" y="380" text-anchor="end" font-size="11" fill="#9f1239" font-style="italic">SendPacket("DAMAGE|...")</text>
+      <text x="730" y="396" text-anchor="end" font-size="11" fill="#9f1239" font-style="italic">if (Hp == 0) HandleDeath</text>
+
+      <!-- step 7: SendPacket back -->
+      <line x1="775" y1="430" x2="82" y2="430" stroke="#db2777" stroke-width="1.4" stroke-dasharray="3,2" marker-end="url(#arr3)"/>
+      <text x="430" y="424" text-anchor="middle" font-size="11" fill="#9f1239">⑤ SendPacket("DAMAGE|...|hp=...")</text>
+    </svg>
+    <p class="diagram-caption">A의 상태 읽기는 A 큐에서, B의 상태 변경은 B 큐에서. 둘 사이에 흐르는 건 <strong>불변 스냅샷 한 덩어리</strong>뿐.</p>
+  </div>
+
+  <p>흐름의 핵심을 코드로 다시 보면:</p>
+  <pre><code><span class="cm">// ① 외부에서</span>
+gameServer.<span class="fn">HandleMeleeAttack</span>(<span class="str">"A"</span>, <span class="str">"B"</span>);
+<span class="cm">// ↓ GameZone.HandleMeleeAttack → DoAsync(ProcessMeleeAttack)</span>
+<span class="cm">// ↓ ProcessMeleeAttack: _actors.TryGetValue → attacker.MeleeAttack("B", range)</span>
+
+<span class="cm">// ③ A 큐 안에서</span>
+<span class="fn">DoAsync</span>(() => {
+    <span class="kw">var</span> snap = <span class="kw">new</span> <span class="ty">AttackerSnapshot</span>(...);
+    _zone.<span class="fn">SendMeleeDamage</span>(<span class="str">"B"</span>, snap, range);
+    <span class="cm">// ↓ GameZone.DoAsync(_actors[B].ReceiveMeleeDamage(snap, range))</span>
+});
+
+<span class="cm">// ⑤ B 큐 안에서 (다른 스레드에서 병렬로 실행 가능)</span>
+<span class="fn">DoAsync</span>(() => {
+    <span class="kw">if</span> (_player.<span class="fn">DistanceTo</span>(snap.X, snap.Y) > range) <span class="kw">return</span>;
+    <span class="kw">int</span> dmg = _player.<span class="fn">TakeDamage</span>(snap.Attack);
+    _player.<span class="fn">SendPacket</span>?.<span class="fn">Invoke</span>($<span class="str">"DAMAGE|..."</span>);
+});</code></pre>
+
+  <!-- 5.3 AoE -->
+  <h3><span class="num">5.3</span> 범위 공격 (AoE) — fan-out</h3>
+  <p>
+    범위 공격은 한 발이 여러 명에게 가는 흐름이다. <code>SpatialIndex</code> 조회를 <code>GameZone</code> 큐 안에서 하고,
+    각 대상에게 따로 DoAsync로 데미지를 보낸다 — <strong>대상별 병렬 처리!</strong>
+  </p>
+
+  <pre><code><span class="cm">// PlayerActor.AreaAttack — 공격자 큐 안에서</span>
+<span class="fn">DoAsync</span>(() =>
+{
+    <span class="kw">var</span> snap = <span class="kw">new</span> <span class="ty">AttackerSnapshot</span>(...);
+    _zone.<span class="fn">DispatchAreaDamage</span>(snap, cx, cy, radius);   <span class="cm">// GameZone에 위임</span>
+});
+
+<span class="cm">// GameZone.DispatchAreaDamage — GameZone 큐 안에서</span>
+<span class="fn">DoAsync</span>(() =>
+{
+    <span class="kw">var</span> nearby = _spatialIndex.<span class="fn">QueryRadius</span>(cx, cy, radius);
+    <span class="kw">foreach</span> (<span class="kw">var</span> p <span class="kw">in</span> nearby)
+    {
+        <span class="kw">if</span> (p.PlayerId == snap.PlayerId) <span class="kw">continue</span>;
+        <span class="kw">if</span> (_actors.<span class="fn">TryGetValue</span>(p.PlayerId, <span class="kw">out var</span> ta))
+            ta.<span class="fn">ReceiveAreaDamage</span>(snap, cx, cy, radius);   <span class="cm">// 각자의 큐로 분배 → 병렬</span>
+    }
+});</code></pre>
+
+  <div class="anim-stage">
+    <div class="anim-title">애니메이션 · AoE fan-out — 한 번의 시전, 4명이 동시에 데미지 처리</div>
+    <div class="anim-row">
+      <div class="anim-label">공격자 A</div>
+      <div class="anim-track">
+        <div class="job-bar j-blue a1-bar" style="left:0%; width:18%;">AreaAttack</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">GameZone</div>
+      <div class="anim-track">
+        <div class="job-bar j-purple a1-bar" style="left:20%; width:22%;">QueryRadius + fan-out</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">대상 B</div>
+      <div class="anim-track">
+        <div class="job-bar j-pink a1-bar" style="left:46%; width:24%;">ReceiveAreaDamage</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">대상 C</div>
+      <div class="anim-track">
+        <div class="job-bar j-orange a1-bar" style="left:46%; width:24%;">ReceiveAreaDamage</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">대상 D</div>
+      <div class="anim-track">
+        <div class="job-bar j-green a1-bar" style="left:46%; width:24%;">ReceiveAreaDamage</div>
+      </div>
+    </div>
+    <div class="anim-row">
+      <div class="anim-label">대상 E</div>
+      <div class="anim-track">
+        <div class="job-bar j-cyan a1-bar" style="left:46%; width:24%;">ReceiveAreaDamage</div>
+      </div>
+    </div>
+    <p style="margin:14px 0 0;font-size:13px;color:var(--text-muted);">대상 4명의 데미지 처리가 같은 시각에 동시에 일어난다. 락이 0개. 각 대상의 HP 갱신은 각자의 큐 안에서 직렬.</p>
+  </div>
+
+  <!-- 5.4 사망 부활 -->
+  <h3><span class="num">5.4</span> 사망 → 5초 후 부활 (DoAsyncAfter 1회)</h3>
+  <p>HP가 0이 되면 <code>HandleDeath</code>가 호출되고, 5초 뒤 부활 람다를 자기 큐에 예약한다.</p>
+
+  <pre><code><span class="cm">// PlayerActor.HandleDeath — B 큐 안에서</span>
+<span class="kw">private void</span> <span class="fn">HandleDeath</span>(<span class="kw">string</span> killerName)
+{
+    <span class="ty">Console</span>.<span class="fn">WriteLine</span>($<span class="str">"  ★ {_player.Name} 사망!"</span>);
+    _player.<span class="fn">SendPacket</span>?.<span class="fn">Invoke</span>($<span class="str">"DEATH|{killerName}"</span>);
+
+    <span class="cm">// 5초 뒤 자기 큐에 부활 작업 예약 (외부 타이머 객체 없음)</span>
+    <span class="fn">DoAsyncAfter</span>(<span class="ty">TimeSpan</span>.<span class="fn">FromSeconds</span>(<span class="num">5</span>), () =>
+    {
+        <span class="kw">if</span> (_despawned) <span class="kw">return</span>;            <span class="cm">// 그 사이에 디스폰됐으면 무시</span>
+
+        _player.Hp = _player.MaxHp;
+        _player.X = ...; _player.Y = ...;
+        _zone.Spatial.<span class="fn">UpdatePosition</span>(_player, oldX, oldY);
+        _player.<span class="fn">SendPacket</span>?.<span class="fn">Invoke</span>($<span class="str">"RESPAWN|..."</span>);
+    });
+}</code></pre>
+
+  <div class="callout tip">
+    <strong>죽은 채로 들어오는 데미지는 어떻게? ·</strong> HP가 0이어도 큐에는 다른 공격자들의 <code>ReceiveMeleeDamage</code>가 줄 서 있을 수 있다. 람다 첫 줄의 <code>if (!_player.IsAlive) return;</code> 체크 하나로 안전하게 흘려보낸다. 출력 로그에 <em>"마법사이영희 이미 사망 — 전사김철수의 공격 무효"</em>가 그것.
+  </div>
+
+  <!-- 5.5 자동 회복 -->
+  <h3><span class="num">5.5</span> 자동 회복 (자기복제 RegenTick)</h3>
+  <p>입장하면 <code>StartRegen()</code>이 호출되고, 그 다음부터는 영원히 자기 자신을 다시 큐에 등록한다.</p>
+
+  <pre><code><span class="cm">// 입장 시 한 번만 시동</span>
+actor.<span class="fn">StartRegen</span>();   <span class="cm">// → DoAsync(RegenTick)</span>
+
+<span class="kw">private void</span> <span class="fn">RegenTick</span>()
+{
+    <span class="kw">if</span> (_despawned) <span class="kw">return</span>;            <span class="cm">// 디스폰되면 사슬이 끊긴다 → 자연 종료</span>
+
+    <span class="kw">if</span> (_player.IsAlive &amp;&amp; _player.Hp &lt; _player.MaxHp)
+        _player.Hp = <span class="ty">Math</span>.<span class="fn">Min</span>(_player.MaxHp, _player.Hp + <span class="num">30</span>);
+
+    <span class="fn">DoAsyncAfter</span>(<span class="ty">TimeSpan</span>.<span class="fn">FromSeconds</span>(<span class="num">3</span>), <span class="fn">RegenTick</span>);   <span class="cm">// 다시 자기 자신</span>
+}</code></pre>
+
+  <div class="callout">
+    <strong>핵심 ·</strong> 외부의 <code>System.Timers.Timer</code> 같은 객체가 필요 없다. <code>DoAsyncAfter</code>가 알아서 actor의 <code>TimerQueue</code>를 통해 정해진 시간 뒤에 자기 큐로 람다를 다시 보내준다. 락 0개. 종료도 단순 — <code>_despawned</code> 체크 한 줄로 사슬이 끊긴다.
+  </div>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 6: 왜 이렇게 만들었나
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="decisions">
+  <span class="section-num">SECTION 06</span>
+  <h2 class="section-title">왜 이렇게 만들었나 — 설계 Q&amp;A</h2>
+  <p class="section-lead">
+    코드를 읽다 보면 떠오르는 자연스러운 질문들에 답한다.
+    각 답이 "이 코드의 왜"를 풀어 준다.
+  </p>
+
+  <div class="qa">
+    <div class="q">왜 GameZone도 actor로 만들었나? ConcurrentDictionary면 충분하지 않나?</div>
+    <div class="a">
+      얼핏 충분해 보이지만 <code>_actors</code>의 한 항목과 그 항목이 가리키는 <code>PlayerActor</code>·<code>SpatialIndex</code>의 변경을 묶어서 일관성 있게 처리할 곳이 필요하다.
+      예를 들어 <code>LeaveZone</code>은 <code>_actors</code>에서 제거 + spatial 제거 + 잔여 작업 흐름 정리를 함께 해야 하는데, 이걸 외부 IO 스레드에서 직접 하면 동시에 들어온 <code>Move</code>와 race가 난다.
+      <strong>GameZone을 actor로 만들면 이 모든 묶음이 자동으로 직렬화되어 race가 없어진다.</strong>
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">그럼 _actors가 일반 Dictionary여도 되는 이유는?</div>
+    <div class="a">
+      모든 접근이 <code>GameZone</code>의 큐 안에서만 일어나기 때문이다.
+      "한 번에 하나만 실행" 규칙이 곧 단일 스레드 접근을 보장하므로 <code>ConcurrentDictionary</code>가 줄 락이 불필요하다.
+      이게 actor 모델의 핵심 가성비 — <strong>락을 안 쓰는데도 안전한 이유</strong>.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">SpatialIndex는 왜 ConcurrentDictionary인가? 일관성 위반 아닌가?</div>
+    <div class="a">
+      <code>SpatialIndex</code>는 여러 actor에 걸쳐 공유된다. 각 <code>PlayerActor</code>가 자기 위치를 갱신하면서, 동시에 <code>GameZone</code>이 AoE 범위 조회를 한다.
+      각 작업이 actor의 큐 밖에서도 발생하기 때문에 <strong>이 자료구조 자체가 스레드 안전이어야 한다</strong>.
+      반면 <code>_actors</code>는 GameZone 큐 안에서만 만져지므로 일반 Dictionary로 충분.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">Player.X / Y / Hp는 왜 평범한 필드인가? volatile도 lock도 없다.</div>
+    <div class="a">
+      그 필드들은 <strong>오직 그 플레이어의 PlayerActor 큐 안에서만</strong> 읽고 쓰여진다.
+      "한 큐는 한 번에 하나만 실행" 규칙이 단일 스레드 접근을 보장하므로, 단순 필드만으로 안전하다.
+      "스냅샷"으로 다른 actor에 전달할 때만 record struct로 값을 복사한다 — 그래서 <code>AttackerSnapshot</code>이 등장한다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">_despawned는 왜 volatile인가?</div>
+    <div class="a">
+      <code>_despawned</code> 플래그를 쓰는 곳은 <strong>actor 큐 밖에서도</strong> 읽힐 수 있다.
+      예를 들어 종료 직전에 GameZone이 actor 컬렉션을 순회하면서 잔여 상태를 확인할 때.
+      이런 cross-thread 단일-bool read는 가벼운 메모리 가시성 보장이 필요해서 <code>volatile</code>로 둔다.
+      단일 bool에 대한 race는 의미가 없고(true/false 둘 중 하나), <code>volatile</code>은 그 쓰기/읽기가 다른 스레드에 즉시 보이도록만 보장한다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">Despawn은 왜 GameZone에서 직접 spatial을 정리하지 않고 PlayerActor 큐로 보내는가?</div>
+    <div class="a">
+      <code>SpatialIndex.Remove</code>가 일어나는 시점에 그 PlayerActor 큐에는 아직 처리되지 않은 <code>Move</code>나 <code>Damage</code>가 줄 서 있을 수 있다.
+      만약 GameZone이 <code>Spatial.Remove</code>를 먼저 호출해 버리면, 잔여 <code>Move</code>가 spatial에 위치를 다시 등록할 위험이 있다.
+      <strong>"같은 actor의 작업은 같은 큐에서 순서대로"</strong>라는 규칙으로 정렬하기 위해, Despawn도 actor의 큐 마지막에 넣는다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">GetSnapshot은 왜 ManualResetEventSlim으로 동기 대기하는가? Task로 안 되나?</div>
+    <div class="a">
+      <code>Task</code>로도 가능하지만 actor 큐 안에서 결과를 한 번 캡처하면 끝이라 <code>ManualResetEventSlim</code>이 더 가볍다.
+      중요한 제약: <strong>호출자는 다른 actor의 Flush 컨텍스트가 아니어야 한다</strong>.
+      만약 actor의 람다 안에서 <code>GetSnapshot</code>을 부르면 자기가 자기를 기다리는 데드락이 가능하다.
+      그래서 디버깅·모니터링 같은 외부(메인 스레드, REPL) 호출에서만 쓴다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">JobDispatcher 워커는 actor 작업을 어떻게 처리하나? 외부에서 어떻게 워커로 일을 넘기지?</div>
+    <div class="a">
+      이 예제(MMORPG)에서는 <strong>워커가 능동적으로 일감을 가져온다</strong>. 외부(IO 스레드, 메인 스레드)는 <code>GameWorker.InboundCommands</code>라는 <code>ConcurrentQueue&lt;Action&gt;</code>에 명령을 push만 한다. 워커의 <code>Run()</code> 메서드가 한 틱마다 그 큐에서 dequeue 하여 invoke 하고, 그 invoke 가 결국 <code>GameServer.HandleX → DoAsync → Flush</code>를 호출하므로 <strong>actor의 Flush가 워커 스레드에서 일어난다</strong>.
+      라이브러리 자체는 "DoAsync를 처음 호출한 스레드가 Flush 한다"는 단순한 규칙뿐이다 — 누가 호출자가 되느냐를 외부 큐로 통제해 IO 스레드와 패킷 처리 스레드를 분리한 것이 이 예제의 설계 포인트.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">시뮬레이션 모드도 같은 InboundCommands를 쓰나?</div>
+    <div class="a">
+      그렇다. 시뮬레이션의 메인 스레드도 네트워크 모드의 IO 스레드와 똑같이 <code>GameWorker.InboundCommands.Enqueue(() =&gt; gameServer.HandleX(...))</code> 패턴으로 명령만 등록한다. 실제 처리는 모두 워커 스레드에서 일어나므로 두 모드의 코드 흐름이 동일하다 — 콘솔 로그의 <code>[스레드:N]</code> 표시가 워커 스레드 ID 또는 timer 스레드 ID로 찍히는 것이 그 증거.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">왜 async/await을 안 쓰나? .NET이라면 그게 표준 아닌가?</div>
+    <div class="a">
+      이 서버에서 진짜 IO 대기는 <strong>전용 OS 스레드</strong>가 맡는다 — RecvIO 스레드의 동기 <code>Read</code>, SendIO 스레드의 동기 <code>Write</code>, Accept 스레드의 동기 <code>AcceptTcpClient</code>. 패킷 처리 자체에는 어떤 대기도 없다(actor 큐 push는 즉시 반환, in-memory 작업뿐). 그러므로 async 상태머신이 만드는 컨티뉴에이션·스레드 풀 점유·Task allocation 같은 비용을 지불할 이유가 없다.
+      단 한 곳에서 동기 차단이 필요한데, 종료 경로의 <code>_zone.DisposeAsync().AsTask().Wait()</code>다. 라이브러리가 반환하는 <code>ValueTask</code>를 단 한 번만 차단해 흡수한다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">"IO 스레드와 패킷 처리 스레드 완전 분리" — 정확히 어떻게 보장하나?</div>
+    <div class="a">
+      <code>AsyncExecutable.DoTask</code>는 leader 경로에서 <strong>호출 스레드</strong>가 직접 <code>Flush</code>를 수행한다. 만약 IO 스레드가 직접 <code>server.HandleX</code>를 호출하면, GameZone 큐가 비어있을 때 IO 스레드가 leader가 되어 actor 람다를 실행해 버린다.
+      이 예제는 그래서 IO 스레드가 절대 게임 코드를 직접 호출하지 않는다. 대신 <code>GameWorker.InboundCommands</code>에 <code>Action</code>을 push만 하고 즉시 다음 <code>Read</code>로. <code>Action</code>을 dequeue해 invoke 하는 순간이 워커 스레드이므로, leader는 항상 워커가 된다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">같은 클라이언트의 패킷 순서는 어떻게 보장되나? 워커가 4개라면 race가 나지 않나?</div>
+    <div class="a">
+      실제로 발견된 race가 있었다. 4개 워커가 동시에 <code>InboundCommands</code>에서 한 클라이언트의 4개 패킷(EnterZone, Move, AreaAttack, Disconnect)을 dequeue한 뒤 각자 <code>_zone.DoAsync</code>를 호출하면, 라이브러리 내부의 <code>Increment + TryWrite</code>가 원자적이지 않아서 채널 안에서 순서가 뒤집힐 수 있다 — Move가 EnterZone보다 먼저 실행되어 actor 미등록 상태로 무시되는 식.
+      해결책: 한 세션의 패킷은 항상 <strong>같은 한 워커가 순차로</strong> drain. 세션마다 자기 <code>ConcurrentQueue&lt;string&gt;</code>를 두고, CAS 락 <code>_drainScheduled</code>로 한 시점에 한 워커만 그 세션의 큐를 drain 한다 — RecvIO는 push만, drain 명령은 <code>InboundCommands</code>에 1회만 등록. 자세한 패턴은 <a href="#sync-io">Section 8</a>.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">송신(SendPacket)은 왜 별도 스레드가 필요한가? 워커가 그냥 Write 하면 안 되나?</div>
+    <div class="a">
+      <code>NetworkStream.Write</code>는 동기 호출이고, TCP 송신 버퍼가 가득 차면 블로킹된다. actor의 람다는 워커 스레드에서 실행되므로, 거기서 Write를 직접 부르면 <strong>슬로우 클라이언트 한 명이 워커를 통째로 점유</strong>한다 — 다른 모든 actor의 작업이 멈춘다.
+      그래서 세션마다 <code>BlockingCollection&lt;byte[]&gt;</code> 송신 큐와 전용 SendIO 스레드를 둔다. 워커는 큐에 push만 하고 즉시 빠져나오고, 실제 Write 블로킹은 SendIO 스레드가 먹는다 — 이 스레드가 막혀도 게임 로직은 그대로 진행된다.
+    </div>
+  </div>
+
+  <div class="qa">
+    <div class="q">AsyncExecutable.OnError는 한 번만 설정하는데 어떻게 모든 actor에 적용되나?</div>
+    <div class="a">
+      <code>OnError</code>는 정적(static) 콜백이다. 라이브러리 내부의 <code>Flush</code>가 람다를 실행할 때 try/catch로 감싸고, 잡힌 예외를 이 콜백으로 보낸다.
+      덕분에 코드의 어떤 actor에서 예외가 나도 한 곳에서 받을 수 있다.
+      이 예제에서는 <code>Program.cs</code> 첫 줄에서 단 한 번 설정한다.
+    </div>
+  </div>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 7: 실행해보기
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="run">
+  <span class="section-num">SECTION 07</span>
+  <h2 class="section-title">실행해보기</h2>
+  <p class="section-lead">
+    예제는 두 가지 모드로 실행된다 — 시뮬레이션과 네트워크. 둘 다 같은 코드 흐름을 사용한다.
+  </p>
+
+  <h3><span class="num">7.1</span> 시뮬레이션 모드 (인자 없이)</h3>
+  <p>자동으로 8개의 시나리오를 차례로 실행하면서 콘솔에 흐름을 출력한다.</p>
+  <pre><code>dotnet run --project ExampleMmorpgServer</code></pre>
+  <p>출력에서 주의 깊게 볼 부분:</p>
+  <ul>
+    <li><strong>스레드 ID</strong> — <code>[스레드:13]</code>처럼 각 작업이 어느 스레드에서 처리되는지 보인다. 같은 actor의 작업은 같은 스레드일 때가 많다.</li>
+    <li><strong>이미 사망 — 공격 무효</strong> — 죽은 후 큐에 쌓여 있던 공격이 안전하게 흘러가는 모습.</li>
+    <li><strong>워커 #N alive tick=5009ms</strong> — 4개 워커가 각자의 ThreadLocal 시각으로 5초마다 신호 보내는 것.</li>
+    <li><strong>자동회복 +30</strong> — RegenTick의 자기복제 사슬이 3초마다 돌고 있음.</li>
+    <li><strong>heartbeat 인원=5 (생존4/사망1)</strong> — GameZone heartbeat가 5초마다 한 번.</li>
+  </ul>
+
+  <h3><span class="num">7.2</span> 네트워크 모드 (--network)</h3>
+  <p>TCP 9000 포트를 열고 텔넷으로 직접 패킷을 쳐볼 수 있다.</p>
+  <pre><code>dotnet run --project ExampleMmorpgServer -- --network
+
+<span class="cm"># 다른 터미널에서</span>
+telnet localhost 9000
+
+<span class="cm"># 패킷 예시</span>
+EnterZone|field|50|50
+Move|60|70
+MeleeAttack|player_2
+AreaAttack|55|55|10</code></pre>
+
+  <p>텍스트 프로토콜인 이유는 <strong>이 예제가 보여주려는 것이 actor 모델이지 네트워크 직렬화가 아니기 때문</strong>이다. 진짜 게임 서버에서는 바이너리 직렬화 + 길이 prefix를 쓰지만, 학습용 예제에서는 텔넷으로 즉시 시도해 볼 수 있는 편이 더 가치 있다.</p>
+
+  <p>출력에서 주의 깊게 볼 부분:</p>
+  <ul>
+    <li><code>[NetAccept]</code>, <code>SendIO 시작</code>, <code>RecvIO 시작</code> 로그 — 연결당 IO 스레드 한 쌍이 실제로 떠 있다는 증거.</li>
+    <li>패킷 처리 로그의 <code>[스레드:N]</code> — 항상 <strong>워커 스레드 ID</strong>(JobDispatcher의 OS 스레드)로 찍힌다. RecvIO 스레드 ID로는 절대 찍히지 않는다.</li>
+    <li>같은 클라이언트가 빠르게 여러 패킷을 보내도 콘솔 로그 순서가 항상 EnterZone → Move → Attack 순서 — 세션별 drain이 동작 중인 증거.</li>
+  </ul>
+
+  <h3><span class="num">7.3</span> 다음 단계로</h3>
+  <p>이 예제를 완전히 이해했다면 다음 두 길이 있다.</p>
+  <div class="card-grid">
+    <div class="card">
+      <h4 style="color:var(--accent)">📚 ExampleChatServer</h4>
+      <p>같은 라이브러리로 만든 채팅 서버. <code>ChatServer / Room / User</code>의 3계층 actor와 <code>InboundCommands</code> 패턴을 본다 — 워커 스레드가 실제로 일하는 모델.</p>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--purple)">🚀 AdvancedMmorpgServer</h4>
+      <p>50마리 NPC가 각자 AI tick(<code>DoAsyncAfter</code> 자기복제)을 돌리고 16개 봇 클라이언트가 동시 접속하는 부하 테스트용 샘플. 이 예제의 발전형.</p>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <strong>마지막으로 ·</strong> 이 라이브러리를 쓸 때 가장 중요한 한 가지 — <em>actor 안의 상태는 그 actor의 큐 안에서만 읽고 써라</em>. 외부에 노출해야 하는 순간이 오면 <code>readonly record struct</code> 스냅샷이나 <code>GetSnapshot</code> 패턴을 써라. 이 두 줄이면 락 없는 안전한 동시성이 거의 다 된다.
+  </div>
+</section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SECTION 8: 동기 IO와 스레드 분리
+     ═══════════════════════════════════════════════════════════ -->
+<div class="container">
+<section id="sync-io">
+  <span class="section-num">SECTION 08</span>
+  <h2 class="section-title">동기 IO와 스레드 분리 — 한 자리에서</h2>
+  <p class="section-lead">
+    이 예제가 일반적인 .NET 서버 샘플과 가장 다른 점이 이 부분이다.
+    <strong>async/await 미사용 + IO 스레드와 패킷 처리 스레드의 완전 분리</strong>를 어떻게 보장하고
+    그 과정에서 어떤 race를 만났고 어떻게 풀었는지 한 곳에 모았다.
+  </p>
+
+  <!-- 8.1 -->
+  <h3><span class="num">8.1</span> 왜 async/await 없이 가는가</h3>
+  <p>
+    async/await의 가치는 "IO 대기 중에 스레드를 양보해 더 많은 동시 요청을 처리"하는 것이다.
+    이 가치는 <strong>스레드가 비싸고 IO가 자주 막히는 환경</strong>에서 빛난다 — 예를 들어 DB·HTTP API 호출이 많은 백엔드.
+  </p>
+  <p>
+    실시간 게임 서버는 다르다.
+  </p>
+  <ul>
+    <li><strong>IO 대기는 거의 발생하지 않는다.</strong> 패킷이 도착하면 즉시 처리하고 다음을 기다린다. 처리 자체는 in-memory actor 작업이라 대기가 0.</li>
+    <li><strong>대기가 발생하는 지점은 따로 있다.</strong> 소켓 Read/Write의 블로킹, accept 대기 — 이건 <em>전용 OS 스레드</em>가 먹는다.</li>
+    <li><strong>전용 스레드는 비싸지 않다.</strong> 동시 접속 N명에 대해 (Recv + Send) × N + 워커 K 정도. 진짜 대규모(만 단위)에서는 IOCP/epoll로 가지만, 그것도 async가 아니라 다른 모델이다.</li>
+  </ul>
+  <p>
+    그러므로 이 예제는 async/await을 쓰지 않는다. 대신 <strong>"대기는 전용 스레드에서, 처리는 워커 스레드에서"</strong>로 명확하게 역할을 나눈다.
+  </p>
+
+  <div class="callout note">
+    <strong>딱 하나의 동기 차단 ·</strong> 종료 경로의 <code>_zone.DisposeAsync().AsTask().Wait()</code>가 유일한 sync-over-async 호출이다. 라이브러리가 노출하는 <code>ValueTask</code>를 1회 흡수한다. 그 외에는 코드 전체에 <code>async</code>/<code>await</code>가 한 번도 없다.
+  </div>
+
+  <!-- 8.2 -->
+  <h3><span class="num">8.2</span> 스레드 지도 — 누가 어떤 일을 하나</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th style="width:24%">스레드</th>
+        <th style="width:14%">개수</th>
+        <th>맡는 일</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>NetAccept</code></td>
+        <td>1</td>
+        <td>동기 <code>AcceptTcpClient()</code>로 새 TCP 연결을 받음. 연결마다 RecvIO + SendIO 스레드 한 쌍을 띄운다.</td>
+      </tr>
+      <tr>
+        <td><code>NetRecv-{playerId}</code></td>
+        <td>세션당 1</td>
+        <td>동기 <code>Read</code>로 블로킹. 패킷을 줄 단위로 잘라 세션 자체의 <code>_packetQueue</code>에 push 후 <code>InboundCommands</code>에 drain 명령 1회 등록.</td>
+      </tr>
+      <tr>
+        <td><code>NetSend-{playerId}</code></td>
+        <td>세션당 1</td>
+        <td><code>BlockingCollection</code>에서 byte[]를 꺼내 동기 <code>Write</code>. Write 블로킹은 여기서만 일어나므로 워커는 절대 막히지 않는다.</td>
+      </tr>
+      <tr>
+        <td><code>JobWorker-{N}</code></td>
+        <td>설정값 (기본 4)</td>
+        <td><code>InboundCommands</code>에서 명령을 dequeue해 invoke. 그 invoke 가 <code>HandleX → DoAsync → Flush</code>를 트리거하므로 actor Flush가 워커에서 실행됨.</td>
+      </tr>
+      <tr>
+        <td>Timer 스레드</td>
+        <td>전용 스레드별 1 (lazy)</td>
+        <td><code>DoAsyncAfter</code>로 예약된 작업을 정해진 시점에 actor 큐에 다시 푸시. 라이브러리의 <code>TimerQueue</code>가 ThreadLocal로 만든다.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout">
+    <strong>핵심 규칙 ·</strong> RecvIO/SendIO 스레드는 <em>절대로</em> <code>HandleX</code>·<code>DoAsync</code>·<code>Flush</code>를 직접 호출하지 않는다. 그렇게 호출하면 <code>AsyncExecutable</code>의 leader 경로가 IO 스레드 위에서 actor 람다를 실행해 버린다 — "IO와 처리 분리"가 깨진다.
+  </div>
+
+  <!-- 8.3 -->
+  <h3><span class="num">8.3</span> 패킷이 큐를 거치는 두 단계</h3>
+  <p>한 패킷이 IO 스레드에서 actor까지 가는 길에 큐를 두 번 거친다.</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 880 200" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrSio" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
+        </marker>
+      </defs>
+
+      <!-- RecvIO -->
+      <rect x="20" y="60" width="140" height="80" rx="10" fill="#fce7f3" stroke="#db2777" stroke-width="1.5"/>
+      <text x="90" y="92" text-anchor="middle" font-size="13" font-weight="700" fill="#9f1239">RecvIO 스레드</text>
+      <text x="90" y="112" text-anchor="middle" font-size="11" fill="#9f1239">동기 Read</text>
+
+      <!-- 1) Session packet queue -->
+      <rect x="200" y="60" width="180" height="80" rx="10" fill="#ffedd5" stroke="#ea580c" stroke-width="1.5"/>
+      <text x="290" y="86" text-anchor="middle" font-size="12.5" font-weight="700" fill="#9a3412">① 세션 _packetQueue</text>
+      <text x="290" y="104" text-anchor="middle" font-size="10.5" fill="#9a3412">ConcurrentQueue&lt;string&gt;</text>
+      <text x="290" y="122" text-anchor="middle" font-size="10" fill="#9a3412">단일 producer (RecvIO)</text>
+      <line x1="162" y1="100" x2="198" y2="100" stroke="#475569" stroke-width="1.5" marker-end="url(#arrSio)"/>
+
+      <!-- 2) Global InboundCommands -->
+      <rect x="420" y="60" width="180" height="80" rx="10" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.5"/>
+      <text x="510" y="86" text-anchor="middle" font-size="12.5" font-weight="700" fill="#713f12">② InboundCommands</text>
+      <text x="510" y="104" text-anchor="middle" font-size="10.5" fill="#713f12">ConcurrentQueue&lt;Action&gt;</text>
+      <text x="510" y="122" text-anchor="middle" font-size="10" fill="#713f12">drain 명령 1회 (CAS)</text>
+      <line x1="382" y1="100" x2="418" y2="100" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arrSio)"/>
+      <text x="400" y="92" text-anchor="middle" font-size="9.5" fill="#713f12">TryScheduleDrain</text>
+
+      <!-- 3) Worker -->
+      <rect x="640" y="60" width="220" height="80" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+      <text x="750" y="86" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">③ 워커 스레드</text>
+      <text x="750" y="104" text-anchor="middle" font-size="10.5" fill="#1e3a8a">DrainPackets() 실행</text>
+      <text x="750" y="122" text-anchor="middle" font-size="10" fill="#1e3a8a">→ HandleX → actor Flush</text>
+      <line x1="602" y1="100" x2="638" y2="100" stroke="#475569" stroke-width="1.5" marker-end="url(#arrSio)"/>
+
+      <!-- Caption labels -->
+      <text x="80" y="40" font-size="10.5" fill="#475569">"Read" 블로킹</text>
+      <text x="245" y="40" font-size="10.5" fill="#475569">패킷 순서 보장 (단일 producer)</text>
+      <text x="660" y="40" font-size="10.5" fill="#475569">한 시점에 한 워커만 drain</text>
+
+      <!-- Loop arrow back: Worker drains 세션 _packetQueue directly -->
+      <path d="M 750 145 Q 600 175 460 175 Q 320 175 290 145" stroke="#1e3a8a" stroke-width="1.4" stroke-dasharray="3,3" fill="none" marker-end="url(#arrSio)"/>
+      <text x="500" y="190" text-anchor="middle" font-size="10" fill="#1e3a8a" font-style="italic">워커가 세션 _packetQueue 를 직접 dequeue</text>
+    </svg>
+    <p class="diagram-caption">①은 세션별 큐(per-session) — 같은 클라이언트 패킷의 순서를 보장한다. ②는 전역 큐(global) — 어떤 워커가 이 세션을 다음에 처리할지 선택한다. 두 큐의 역할이 다르다.</p>
+  </div>
+
+  <!-- 8.4 -->
+  <h3><span class="num">8.4</span> 발견된 race — Move가 EnterZone보다 먼저 실행된 사건</h3>
+  <p>
+    초기 구현은 RecvIO가 패킷마다 <code>InboundCommands</code>에 한 개의 <code>Action</code>을 push 했다. 그러면 4개 워커가 동시에 그 Action들을 dequeue하여 각자 <code>_zone.DoAsync</code>를 호출하는데...
+  </p>
+
+  <pre><code><span class="cm">// AsyncExecutable.DoTask 의 leader 경로 (간략화)</span>
+<span class="kw">if</span> (<span class="ty">Interlocked</span>.<span class="fn">Increment</span>(<span class="kw">ref</span> _remainingTaskCount) > <span class="num">1</span>) {
+    _jobQueue.Writer.<span class="fn">TryWrite</span>(task);   <span class="cm">// follower</span>
+} <span class="kw">else</span> {
+    _jobQueue.Writer.<span class="fn">TryWrite</span>(task);   <span class="cm">// leader — Increment 와 별도 단계</span>
+    ...
+}</code></pre>
+
+  <p>
+    문제는 <code>Increment</code>와 <code>TryWrite</code>가 <strong>원자적이지 않다</strong>는 점이다. 시간순으로 다음과 같은 인터리브가 가능하다.
+  </p>
+
+  <ol>
+    <li>워커 A: <code>Increment → 1</code> (leader 경로 진입)</li>
+    <li>워커 B: <code>Increment → 2</code> (follower 경로). <code>TryWrite(Move)</code> — <strong>채널에 Move가 먼저 들어감</strong></li>
+    <li>워커 A: <code>TryWrite(EnterZone)</code> — Move 다음에 들어감</li>
+    <li>워커 A: <code>Flush</code> 시작 → 채널에서 <code>Move</code>를 먼저 꺼내 <code>ProcessMove</code> 실행 → <code>_actors</code>에 actor 미등록 → 무시</li>
+    <li>이어서 <code>EnterZone</code> 실행 — 늦었음</li>
+  </ol>
+
+  <p>
+    실제 TCP 테스트로 이 reorder를 재현했다. 클라이언트가 <code>EnterZone | Move | AreaAttack</code> 세 패킷을 한 번에 보내면 Move 로그가 사라졌다.
+  </p>
+
+  <h4>해결 — 세션별 단일 워커 drain</h4>
+  <p>
+    한 세션의 패킷은 항상 <strong>같은 한 워커가 순차로</strong> 처리하면 race가 사라진다. 한 워커가 단일 producer로 <code>_zone.DoAsync</code>를 부르므로 채널 안에서도 자연히 순서 유지.
+  </p>
+
+  <pre><code><span class="cm">// ClientSession.cs — 핵심 4가지 필드</span>
+<span class="kw">private readonly</span> <span class="ty">ConcurrentQueue</span>&lt;<span class="kw">string</span>&gt; _packetQueue = <span class="kw">new</span>();
+<span class="kw">private int</span> _drainScheduled;             <span class="cm">// 0=idle, 1=drain 중</span>
+<span class="kw">private const string</span> DisconnectMarker = <span class="str">"\0__DISCONNECT__\0"</span>;
+
+<span class="kw">private void</span> <span class="fn">TryScheduleDrain</span>()
+{
+    <span class="cm">// CAS 로 권한을 획득한 한 스레드만 InboundCommands 에 명령 등록</span>
+    <span class="kw">if</span> (<span class="ty">Interlocked</span>.<span class="fn">CompareExchange</span>(<span class="kw">ref</span> _drainScheduled, <span class="num">1</span>, <span class="num">0</span>) != <span class="num">0</span>) <span class="kw">return</span>;
+    <span class="ty">GameWorker</span>.InboundCommands.<span class="fn">Enqueue</span>(<span class="fn">DrainPackets</span>);
+}
+
+<span class="kw">private void</span> <span class="fn">DrainPackets</span>()
+{
+    <span class="kw">try</span>
+    {
+        <span class="kw">while</span> (_packetQueue.<span class="fn">TryDequeue</span>(<span class="kw">out var</span> line))
+        {
+            <span class="kw">if</span> (<span class="ty">ReferenceEquals</span>(line, DisconnectMarker))
+                _gameServer.<span class="fn">HandlePlayerDisconnect</span>(Player.PlayerId);
+            <span class="kw">else</span>
+                <span class="ty">PacketHandler</span>.<span class="fn">Handle</span>(_gameServer, Player, line);
+        }
+    }
+    <span class="kw">finally</span>
+    {
+        <span class="ty">Volatile</span>.<span class="fn">Write</span>(<span class="kw">ref</span> _drainScheduled, <span class="num">0</span>);
+        <span class="cm">// drain 종료 ↔ RecvIO push 사이 race 처리</span>
+        <span class="kw">if</span> (!_packetQueue.<span class="fn">IsEmpty</span>) <span class="fn">TryScheduleDrain</span>();
+    }
+}</code></pre>
+
+  <div class="callout tip">
+    <strong>왜 잘 동작하는가? ·</strong>
+    한 세션의 <code>_packetQueue</code>는 <em>RecvIO 한 스레드만</em> push 한다 → 큐 안 순서가 보장된다.
+    drain 권한은 CAS 로 항상 한 워커만 가진다 → 그 워커가 <code>_zone.DoAsync</code>를 부를 때 single producer
+    가 되어 채널 reorder가 일어나지 않는다. 다른 세션의 워커들은 자기 세션을 별도로 drain — 세션 간 병렬은 그대로.
+  </div>
+
+  <h4>Disconnect 도 같은 큐로</h4>
+  <p>
+    연결이 끊어지면 <code>HandlePlayerDisconnect</code>를 호출해야 하는데, 이걸 별도로 <code>InboundCommands</code>에 직접 넣으면
+    EnterZone/Move 등이 처리되기 전에 disconnect가 먼저 실행되는 경우가 생긴다. 그래서 sentinel 문자열
+    <code>DisconnectMarker</code>를 같은 <code>_packetQueue</code> 끝에 넣고, drain이 그것을 만나면 disconnect 로직을 실행한다.
+    <strong>모든 패킷과 disconnect가 동일한 순서 보장 트랙</strong>을 탄다.
+  </p>
+
+  <!-- 8.5 -->
+  <h3><span class="num">8.5</span> 그 외 다듬은 자잘한 것들</h3>
+  <ul>
+    <li><strong>RecvLoop finally의 자체 정리</strong> — 정상 종료 경로(Read==0)에서도 <code>Dispose()</code>를 호출하도록 변경. 자기 스레드 join 데드락은 <code>Thread.CurrentThread != _recvThread</code> 체크로 회피.</li>
+    <li><strong>BlockingCollection은 Dispose하지 않음</strong> — 워커가 <code>PlayerActor</code> 큐에 남은 잔여 패킷을 늦게 처리하면서 <code>SendPacket</code>을 호출하는 race가 흔하다. 큐가 disposed라면 <code>ObjectDisposedException</code>이 actor Flush 안에서 터진다. <code>CompleteAdding</code>만 하고 GC에 맡긴다.</li>
+    <li><strong>EnqueueSend는 InvalidOperationException 흡수</strong> — 위 race에 대비해 <code>Add</code> 호출의 모든 실패를 silently 무시. 송신 실패가 actor 크래시로 번지지 않도록.</li>
+    <li><strong>pendingText 64KB 상한</strong> — <code>\n</code> 없는 입력으로 <code>StringBuilder</code>가 무한 커지지 않도록 방어적 상한.</li>
+    <li><strong>Accept loop의 종료 race</strong> — accept 직후 종료가 트리거되면 새 TcpClient를 즉시 닫고 break 해 leak 방지.</li>
+  </ul>
+
+  <div class="callout note">
+    <strong>요점 ·</strong> 동기 IO 모델은 단순해 보이지만, 멀티 워커가 actor 큐를 공유하는 순간 미묘한 ordering race들이 튀어나온다. <em>"같은 도메인 객체에 대한 일은 같은 한 스레드가 순차로"</em>라는 규칙을 세션 레벨까지 적용해야 안전하다.
+  </div>
+</section>
+</div>
+
+</main>
+
+<footer>
+  <p><strong>ExampleMmorpgServer</strong> · JobDispatcherNET 학습용 예제</p>
+  <p>관련 파일: <code>Program.cs</code> · <code>GameServer.cs</code> · <code>GameZone.cs</code> · <code>PlayerActor.cs</code> · <code>GameWorker.cs</code> · <code>NetworkServer.cs</code> · <code>Packets.cs</code> · <code>SpatialIndex.cs</code> · <code>Player.cs</code></p>
+  <p style="margin-top:18px;opacity:0.6;">자세한 라이브러리 본체 가이드는 <code>docs/JobDispatcherNET_CompleteGuide.md</code> 참고.</p>
+</footer>
+
+</body>
+</html>

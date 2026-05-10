@@ -1,404 +1,281 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using JobDispatcherNET;
 
 namespace ExampleChatServer;
 
-// 채팅 서버 클래스
-public class ChatServer : AsyncExecutable
+// ─────────────────────────────────────────────────────────────────────
+// ChatServer — JobDispatcherNET 활용을 보여주기 위한 actor 기반 채팅 서버
+//
+// 코딩 컨벤션:
+//   public Handle*(args)  → DoAsync(() => Process*(args))   (큐에 푸시만)
+//   private Process*(args) → 실제 본문 (디버거 / 스택트레이스 / grep 친화적)
+//
+// 동기식 (async/await 키워드 미사용):
+//   - Start / Stop / GetSnapshot 모두 차단(blocking) API.
+//   - 라이브러리 내부의 Task 는 호출 끝에서 .AsTask().Wait() 로만 1회 차단한다.
+//
+// 학습 포인트:
+//   1) actor = AsyncExecutable. ChatServer / Room / User 모두 자기 큐를 가진다.
+//      → 클래스 안에 lock / Mutex / ReaderWriterLockSlim 이 단 하나도 없다.
+//   2) 외부 read 는 ManualResetEventSlim 신호 대기.
+//   3) IRunnable + AsyncExecutable 협업 — 워커가 InboundCommands 를 dequeue.
+//   4) DoAsyncAfter 로 주기 작업 자기복제.
+// ─────────────────────────────────────────────────────────────────────
+
+public sealed record ServerSnapshot(
+    IReadOnlyList<UserSnapshot> Users,
+    IReadOnlyList<RoomSnapshot> Rooms);
+
+public sealed class ChatServer : AsyncExecutable
 {
     private readonly Dictionary<string, User> _users = [];
     private readonly Dictionary<string, Room> _rooms = [];
-    private readonly ReaderWriterLockSlim _usersLock = new();
-    private readonly object _roomsLock = new(); // 방 컬렉션에만 락 사용
     private readonly int _workerCount;
-    private JobDispatcher<ChatWorker>? _dispatcher;
+    private readonly TimeSpan _statsPeriod;
+    private readonly TimeSpan _idleScanPeriod;
+    private readonly long _idleThresholdMs;
 
-    public ChatServer(int workerCount = 4)
+    private JobDispatcher<ChatWorker>? _dispatcher;
+    private volatile bool _stopped;
+
+    public ChatServer(
+        int workerCount = 4,
+        TimeSpan? statsPeriod = null,
+        TimeSpan? idleScanPeriod = null,
+        long idleThresholdMs = 30_000)
     {
         _workerCount = workerCount;
+        _statsPeriod = statsPeriod ?? TimeSpan.FromSeconds(5);
+        _idleScanPeriod = idleScanPeriod ?? TimeSpan.FromSeconds(10);
+        _idleThresholdMs = idleThresholdMs;
     }
 
-    // 서버 시작
-    public async Task StartAsync()
+    public void Start()
     {
-        Console.WriteLine("채팅 서버를 시작합니다...");
+        Console.WriteLine($"[Server] 시작 (워커 {_workerCount}개, 유휴 임계 {_idleThresholdMs}ms)");
 
-        // 기본 채팅방 생성
-        CreateDefaultRooms();
+        DoAsync(CreateDefaultRooms);
 
-        // JobDispatcher 시작
         _dispatcher = new JobDispatcher<ChatWorker>(_workerCount);
+        // RunWorkerThreadsAsync 는 스레드를 시작하고 Task 를 즉시 반환 — await 불필요
+        _ = _dispatcher.RunWorkerThreadsAsync();
 
-        // 비동기로 워커 스레드 실행
-        _ = Task.Run(async () => await _dispatcher.RunWorkerThreadsAsync());
-
-        Console.WriteLine($"채팅 서버가 {_workerCount}개의 워커로 시작되었습니다.");
+        // 자기복제 heartbeat 두 종류 시작
+        DoAsync(StatsHeartbeat);
+        DoAsync(IdleScanHeartbeat);
     }
 
-    // 서버 종료
-    public async Task StopAsync()
+    public void Stop()
     {
-        Console.WriteLine("채팅 서버를 종료합니다...");
+        Console.WriteLine("[Server] 종료 시작");
+        _stopped = true;
 
-        // 모든 방에서 사용자 강제 퇴장
-        lock (_roomsLock)
-        {
-            foreach (var room in _rooms.Values)
-            {
-                room.ForceRemoveAllUsers();
-            }
-        }
+        DoAsync(ForceCleanupAllRooms);
 
-        if (_dispatcher is not null)
-        {
-            await _dispatcher.DisposeAsync();
-        }
+        // 자기 큐 drain 대기 (라이브러리의 ValueTask 를 Task 로 바꿔 한 번만 차단)
+        DisposeAsync().AsTask().Wait();
 
-        Console.WriteLine("채팅 서버가 종료되었습니다.");
+        // 워커 스레드 정지 + Join (동기)
+        _dispatcher?.Dispose();
+
+        TimerRegistry.DisposeAll();
+        Console.WriteLine("[Server] 종료 완료");
     }
 
-    // 기본 채팅방 생성
     private void CreateDefaultRooms()
     {
-        lock (_roomsLock)
-        {
-            _rooms["general"] = new Room("일반 채팅");
-            _rooms["game"] = new Room("게임 채팅");
-            _rooms["dev"] = new Room("개발자 채팅");
-        }
+        _rooms["general"] = MakeRoom("general", "일반 채팅");
+        _rooms["game"] = MakeRoom("game", "게임 채팅");
+        _rooms["dev"] = MakeRoom("dev", "개발자 채팅");
     }
 
-    #region 사용자 관리
-
-    // 사용자 접속 처리
-    public void HandleUserConnect(IChatClient client)
+    private Room MakeRoom(string id, string name)
     {
-        DoAsync(() => ProcessUserConnect(client));
+        var room = new Room(id, name);
+        room.StartHeartbeat(TimeSpan.FromSeconds(15));
+        return room;
     }
+
+    private void ForceCleanupAllRooms()
+    {
+        foreach (var room in _rooms.Values)
+            room.ForceRemoveAllUsers();
+    }
+
+    // ── 외부 진입점 (큐에 푸시만) ──────────────────────────────────────
+
+    public void HandleUserConnect(IChatClient client)
+        => DoAsync(() => ProcessUserConnect(client));
+
+    public void HandleUserDisconnect(string userId)
+        => DoAsync(() => ProcessUserDisconnect(userId));
+
+    public void HandleRoomJoin(string userId, string roomId)
+        => DoAsync(() => ProcessRoomJoin(userId, roomId));
+
+    public void HandleRoomLeave(string userId, string roomId)
+        => DoAsync(() => ProcessRoomLeave(userId, roomId));
+
+    public void HandleRoomChat(string userId, string roomId, string content)
+        => DoAsync(() => ProcessRoomChat(userId, roomId, content));
+
+    public void HandlePrivateChat(string senderId, string recipientId, string content)
+        => DoAsync(() => ProcessPrivateChat(senderId, recipientId, content));
+
+    public void HandleInstantMessage(string senderId, string recipientId, string content)
+        => DoAsync(() => ProcessInstantMessage(senderId, recipientId, content));
+
+    // ── 실제 본문 (private, 자기 큐에서 직렬 실행) ─────────────────────
 
     private void ProcessUserConnect(IChatClient client)
     {
-        Console.WriteLine($"사용자 접속: {client.Username} ({client.UserId})");
+        if (_users.ContainsKey(client.UserId))
+        {
+            Console.WriteLine($"[Server] 이미 접속 중: {client.UserId}");
+            return;
+        }
 
         var user = new User(client);
+        _users[user.UserId] = user;
+        Console.WriteLine($"[Server] 접속: {user.Username} ({user.UserId})");
 
-        _usersLock.EnterWriteLock();
-        try
-        {
-            _users[user.UserId] = user;
-        }
-        finally
-        {
-            _usersLock.ExitWriteLock();
-        }
-
-        // 모든 사용자에게 새 사용자 접속 알림
-        BroadcastSystemMessage(
-            MessageType.UserConnect,
-            $"{user.Username}님이 접속하셨습니다.",
-            null);
-    }
-
-    // 사용자 접속 종료 처리
-    public void HandleUserDisconnect(string userId)
-    {
-        DoAsync(() => ProcessUserDisconnect(userId));
+        BroadcastSystemToAll(MessageType.UserConnect, $"{user.Username}님이 접속하셨습니다.");
     }
 
     private void ProcessUserDisconnect(string userId)
     {
-        User? user = null;
+        if (!_users.Remove(userId, out var user))
+            return;
 
-        _usersLock.EnterUpgradeableReadLock();
-        try
-        {
-            if (_users.TryGetValue(userId, out user))
-            {
-                _usersLock.EnterWriteLock();
-                try
-                {
-                    _users.Remove(userId);
-                }
-                finally
-                {
-                    _usersLock.ExitWriteLock();
-                }
-            }
-        }
-        finally
-        {
-            _usersLock.ExitUpgradeableReadLock();
-        }
+        Console.WriteLine($"[Server] 종료: {user.Username} ({user.UserId})");
 
-        if (user is not null)
-        {
-            Console.WriteLine($"사용자 접속 종료: {user.Username} ({user.UserId})");
+        // 참여 중이던 방에서 퇴장 — 방 actor 큐가 처리한다
+        foreach (var room in _rooms.Values)
+            room.RemoveUser(userId);
 
-            // 참여 중인 모든 방에서 퇴장 처리
-            var roomIds = new List<string>(user.JoinedRoomIds);
-            foreach (var roomId in roomIds)
-            {
-                // 방의 DoAsync를 사용하여 방 내부 스레드에서 안전하게 처리
-                Room? room = GetRoom(roomId);
-                if (room != null)
-                {
-                    room.RemoveUser(userId);
-                }
-            }
-
-            // 모든 사용자에게 접속 종료 알림
-            BroadcastSystemMessage(
-                MessageType.UserDisconnect,
-                $"{user.Username}님이 접속을 종료하셨습니다.",
-                null);
-        }
-    }
-
-    #endregion
-
-    #region 채팅방 관리
-
-    // 방 가져오기
-    private Room? GetRoom(string roomId)
-    {
-        lock (_roomsLock)
-        {
-            return _rooms.TryGetValue(roomId, out var room) ? room : null;
-        }
-    }
-
-    // 채팅방 입장 처리
-    public void HandleRoomJoin(string userId, string roomId)
-    {
-        DoAsync(() => ProcessRoomJoin(userId, roomId));
+        BroadcastSystemToAll(MessageType.UserDisconnect, $"{user.Username}님이 접속을 종료하셨습니다.");
     }
 
     private void ProcessRoomJoin(string userId, string roomId)
     {
-        User? user = null;
-        Room? room = GetRoom(roomId);
-
-        _usersLock.EnterReadLock();
-        try
+        if (_users.TryGetValue(userId, out var user) &&
+            _rooms.TryGetValue(roomId, out var room))
         {
-            _users.TryGetValue(userId, out user);
-        }
-        finally
-        {
-            _usersLock.ExitReadLock();
-        }
-
-        if (user is not null && room is not null)
-        {
-            // Room의 DoAsync를 사용하여 이 작업을 Room의 스레드에서 처리
             room.AddUser(user);
-
-            // 사용자의 참여 방 목록 업데이트
-            user.JoinedRoomIds.Add(roomId);
         }
-    }
-
-    // 채팅방 퇴장 처리
-    public void HandleRoomLeave(string userId, string roomId)
-    {
-        DoAsync(() => ProcessRoomLeave(userId, roomId));
+        else
+        {
+            Console.WriteLine($"[Server] 입장 실패: user={userId}, room={roomId}");
+        }
     }
 
     private void ProcessRoomLeave(string userId, string roomId)
     {
-        User? user = null;
-        Room? room = GetRoom(roomId);
-
-        _usersLock.EnterReadLock();
-        try
-        {
-            _users.TryGetValue(userId, out user);
-        }
-        finally
-        {
-            _usersLock.ExitReadLock();
-        }
-
-        if (user is not null && room is not null)
-        {
-            // Room의 DoAsync를 사용하여 이 작업을 Room의 스레드에서 처리
+        if (_rooms.TryGetValue(roomId, out var room))
             room.RemoveUser(userId);
-
-            // 사용자의 참여 방 목록 업데이트
-            user.JoinedRoomIds.Remove(roomId);
-        }
     }
 
-    #endregion
-
-    #region 메시지 처리
-
-    // 방 채팅 메시지 처리
-    public void HandleRoomChat(string userId, string roomId, string content)
+    private void ProcessRoomChat(string userId, string roomId, string content)
     {
-        Room? room = GetRoom(roomId);
-
-        if (room != null)
-        {
-            // Room의 DoAsync를 사용하여 이 작업을 Room의 스레드에서 처리
-            room.ProcessChatMessage(userId, content);
-        }
-    }
-
-    // 1:1 채팅 메시지 처리
-    public void HandlePrivateChat(string senderId, string recipientId, string content)
-    {
-        DoAsync(() => ProcessPrivateChat(senderId, recipientId, content));
+        if (_rooms.TryGetValue(roomId, out var room))
+            room.BroadcastChat(userId, content);
     }
 
     private void ProcessPrivateChat(string senderId, string recipientId, string content)
     {
-        User? sender = null;
-        User? recipient = null;
+        if (!_users.TryGetValue(senderId, out var sender) ||
+            !_users.TryGetValue(recipientId, out var recipient))
+            return;
 
-        _usersLock.EnterReadLock();
-        try
-        {
-            _users.TryGetValue(senderId, out sender);
-            _users.TryGetValue(recipientId, out recipient);
-        }
-        finally
-        {
-            _usersLock.ExitReadLock();
-        }
+        sender.TouchActivity();
 
-        if (sender is not null && recipient is not null)
-        {
-            Console.WriteLine($"1:1 채팅: {sender.Username} -> {recipient.Username}: {content}");
+        var msg = new ChatMessage(
+            Guid.NewGuid(), MessageType.PrivateChat,
+            sender.Username, recipient.Username, null, content, DateTimeOffset.UtcNow);
 
-            // 메시지 생성
-            var message = new ChatMessage(
-                Guid.NewGuid(),
-                MessageType.PrivateChat,
-                sender.Username,
-                recipient.Username,
-                null,
-                content,
-                DateTimeOffset.UtcNow);
-
-            // 발신자와 수신자에게 전송
-            _ = sender.SendMessageAsync(message);
-            _ = recipient.SendMessageAsync(message);
-        }
-    }
-
-    // 쪽지 보내기 처리
-    public void HandleInstantMessage(string senderId, string recipientId, string content)
-    {
-        DoAsync(() => ProcessInstantMessage(senderId, recipientId, content));
+        sender.DeliverMessage(msg);
+        recipient.DeliverMessage(msg);
     }
 
     private void ProcessInstantMessage(string senderId, string recipientId, string content)
     {
-        User? sender = null;
-        User? recipient = null;
+        if (!_users.TryGetValue(senderId, out var sender) ||
+            !_users.TryGetValue(recipientId, out var recipient))
+            return;
 
-        _usersLock.EnterReadLock();
-        try
-        {
-            _users.TryGetValue(senderId, out sender);
-            _users.TryGetValue(recipientId, out recipient);
-        }
-        finally
-        {
-            _usersLock.ExitReadLock();
-        }
+        sender.TouchActivity();
 
-        if (sender is not null && recipient is not null)
-        {
-            Console.WriteLine($"쪽지: {sender.Username} -> {recipient.Username}: {content}");
+        var msg = new ChatMessage(
+            Guid.NewGuid(), MessageType.InstantMessage,
+            sender.Username, recipient.Username, null, content, DateTimeOffset.UtcNow);
 
-            // 메시지 생성
-            var message = new ChatMessage(
-                Guid.NewGuid(),
-                MessageType.InstantMessage,
-                sender.Username,
-                recipient.Username,
-                null,
-                content,
-                DateTimeOffset.UtcNow);
-
-            // 발신자와 수신자에게 전송
-            _ = sender.SendMessageAsync(message);
-            _ = recipient.SendMessageAsync(message);
-        }
+        sender.DeliverMessage(msg);
+        recipient.DeliverMessage(msg);
     }
 
-    #endregion
+    // ── 동기 read API ──────────────────────────────────────────────────
 
-    #region 시스템 메시지
-
-    // 모든 사용자에게 시스템 메시지 전송
-    private void BroadcastSystemMessage(MessageType type, string content, string? roomId)
+    /// <summary>
+    /// 차단(blocking) 스냅샷. 호출자는 actor Flush 컨텍스트 밖(메인 스레드)에서 호출해야 한다.
+    /// 두 단계로 동작:
+    ///   1) server actor 큐에서 user/room 참조만 복사 (signaling)
+    ///   2) 호출자 스레드에서 각 actor 의 GetSnapshot() 호출 — actor flush 안이 아니므로 데드락 없음
+    /// </summary>
+    public ServerSnapshot GetSnapshot()
     {
-        List<User> allUsers = [];
-
-        _usersLock.EnterReadLock();
-        try
+        User[] userArr;
+        Room[] roomArr;
+        using (var ev = new ManualResetEventSlim(false))
         {
-            allUsers = _users.Values.ToList();
-        }
-        finally
-        {
-            _usersLock.ExitReadLock();
+            // 람다가 ev / 결과 변수를 closure 로 잡아야 해서 여기는 이름 추출이 어렵다.
+            // 짧은 본문이므로 인라인 람다 유지.
+            User[]? u = null; Room[]? r = null;
+            DoAsync(() =>
+            {
+                u = _users.Values.ToArray();
+                r = _rooms.Values.ToArray();
+                ev.Set();
+            });
+            ev.Wait();
+            userArr = u!;
+            roomArr = r!;
         }
 
-        var message = new ChatMessage(
-            Guid.NewGuid(),
-            type,
-            "시스템",
-            null,
-            roomId,
-            content,
-            DateTimeOffset.UtcNow);
-
-        foreach (var user in allUsers)
-        {
-            _ = user.SendMessageAsync(message);
-        }
+        // 2단계 — 호출자 스레드에서 fan-out (각 actor 가 자기 큐로 직렬화)
+        var users = userArr.Select(x => x.GetSnapshot()).ToArray();
+        var rooms = roomArr.Select(x => x.GetSnapshot()).ToArray();
+        return new ServerSnapshot(users, rooms);
     }
 
-    #endregion
+    // ── heartbeat (자기복제) ───────────────────────────────────────────
 
-    // 서버 상태 출력
-    public void PrintStatus()
+    private void StatsHeartbeat()
     {
-        DoAsync(() => {
-            Console.WriteLine("\n==== 채팅 서버 상태 ====");
+        if (_stopped) return;
 
-            _usersLock.EnterReadLock();
-            try
-            {
-                Console.WriteLine($"접속 중인 사용자: {_users.Count}명");
-                foreach (var user in _users.Values)
-                {
-                    Console.WriteLine($"- {user.Username} ({user.UserId}), 참여 중인 방: {user.JoinedRoomIds.Count}개");
-                }
-            }
-            finally
-            {
-                _usersLock.ExitReadLock();
-            }
+        Console.WriteLine($"\n==== [Stats] 사용자 {_users.Count}명 / 방 {_rooms.Count}개 / 워커 처리 {ChatWorker.TotalProcessed}건 ====\n");
 
-            Console.WriteLine($"\n채팅방 목록: {_rooms.Count}개");
-            lock (_roomsLock)
-            {
-                foreach (var room in _rooms.Values)
-                {
-                    room.PrintStatus();
-                }
-            }
+        DoAsyncAfter(_statsPeriod, StatsHeartbeat);
+    }
 
-            Console.WriteLine("========================\n");
-        });
+    private void IdleScanHeartbeat()
+    {
+        if (_stopped) return;
+
+        // 각 user actor 에게 자체 검사를 부탁 (lastActivity 는 user 본인만이 정확히 안다)
+        foreach (var user in _users.Values)
+            user.CheckIdleAndDisconnect(this, _idleThresholdMs);
+
+        DoAsyncAfter(_idleScanPeriod, IdleScanHeartbeat);
+    }
+
+    // ── 내부 helper ────────────────────────────────────────────────────
+
+    private void BroadcastSystemToAll(MessageType type, string content)
+    {
+        var msg = new ChatMessage(
+            Guid.NewGuid(), type, "시스템", null, null, content, DateTimeOffset.UtcNow);
+
+        foreach (var user in _users.Values)
+            user.DeliverMessage(msg);
     }
 }
