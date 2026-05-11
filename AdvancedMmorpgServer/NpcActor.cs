@@ -3,16 +3,19 @@ using JobDispatcherNET;
 namespace AdvancedMmorpgServer;
 
 /// <summary>
-/// NPC Actor. 자신만의 AI tick을 DoAsyncAfter로 자기 큐에 예약하므로
-/// 전체 NPC가 워커 풀에서 병렬로 처리된다.
+/// NPC Actor. 자신의 AI tick 을 <see cref="AsyncExecutable.DoAsyncAfter"/> 로 자기 큐에 예약하므로
+/// 전체 NPC 가 워커 풀에서 병렬 처리된다.
 ///
-/// 핵심 패턴:
-///   Start() → DoAsync(Tick) → 워커에서 Tick 실행 → DoAsyncAfter(interval, Tick)
-///   → 같은 NPC의 tick은 자기 Actor 큐에서 직렬화되므로 lock 없음
-///   → 서로 다른 NPC의 tick은 워커 풀에서 완전 병렬
+/// v2 라이브러리 활용:
+///   - hot path 진입점 (ReceiveDamage) 은 <c>DoAsync&lt;TState&gt;</c> 로 closure 회피
+///   - Tick / Respawn / Despawn / Start 는 method group 으로 closure 회피
+///   - <see cref="JobOptions"/> 로 큐 한도 명시 — 다수 공격자에게 동시 피격당해도 큐 폭주 방지
 /// </summary>
 public sealed class NpcActor : AsyncExecutable
 {
+    /// <summary>NPC 큐 한도. tick 1개 + 다수 공격자 피격 흡수.</summary>
+    private const int NpcQueueCapacity = 128;
+
     public enum AiState { Idle, Chase, Attack, Flee }
 
     private readonly Npc _npc;
@@ -41,6 +44,11 @@ public sealed class NpcActor : AsyncExecutable
     public bool Despawned => _despawned;
 
     public NpcActor(Npc npc, GameWorld world, TimeSpan tickInterval)
+        : base(new JobOptions
+        {
+            MaxQueueSize = NpcQueueCapacity,
+            DropPolicy = DropPolicy.Reject,
+        })
     {
         _npc = npc;
         _world = world;
@@ -48,64 +56,67 @@ public sealed class NpcActor : AsyncExecutable
     }
 
     /// <summary>
-    /// 첫 Tick을 예약한다. GameWorld의 부트스트랩 시점에 호출 — 이후 자가 스케줄링 루프 진입.
+    /// 첫 Tick 을 예약. 부트스트랩 시점에 호출 — 이후 자가 스케줄링 루프 진입.
     /// </summary>
     public void Start()
+        => DoAsync<NpcActor>(static a => a.ProcessStart(), this);
+
+    private void ProcessStart()
     {
-        // 분산을 위해 첫 Tick은 0~tick 사이 무작위 지연
+        if (_despawned) return;
+        // 분산을 위해 첫 Tick 은 0~tick 사이 무작위 지연
         var initial = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)_tickInterval.TotalMilliseconds));
-        DoAsync(() =>
-        {
-            if (_despawned) return;
-            DoAsyncAfter(initial, Tick);
-        });
+        DoAsyncAfter(initial, Tick);
     }
 
     public void Despawn()
+        => DoAsync<NpcActor>(static a => a.ProcessDespawn(), this);
+
+    private void ProcessDespawn()
     {
-        DoAsync(() =>
-        {
-            if (_despawned) return;
-            _despawned = true;
-            _world.Spatial.Remove(_npc);
-        });
+        if (_despawned) return;
+        _despawned = true;
+        _world.Spatial.Remove(_npc);
     }
 
+    /// <summary>hot path — closure 회피.</summary>
     public void ReceiveDamage(AttackerSnapshot atk, float meleeRange)
+        => DoAsync<(NpcActor A, AttackerSnapshot Atk, float R)>(
+            static t => t.A.ProcessReceiveDamage(t.Atk, t.R),
+            (this, atk, meleeRange));
+
+    private void ProcessReceiveDamage(AttackerSnapshot atk, float meleeRange)
     {
-        DoAsync(() =>
+        if (_despawned || !_npc.IsAlive) return;
+
+        float d = _npc.DistanceTo(atk.X, atk.Y);
+        if (d > meleeRange) return;
+
+        int dealt = _npc.TakeDamage(atk.Attack);
+        _world.NotifyAttack(atk.AttackerId, _npc.Id, dealt);
+
+        if (!_npc.IsAlive)
         {
-            if (_despawned || !_npc.IsAlive) return;
+            _state = AiState.Idle;
+            _targetId = -1;
+            _world.NotifyDeath(_npc.Id, atk.AttackerId);
+            DoAsyncAfter(TimeSpan.FromSeconds(_world.Config.Npc.RespawnSeconds), Respawn);
+            return;
+        }
 
-            float d = _npc.DistanceTo(atk.X, atk.Y);
-            if (d > meleeRange) return;
+        // 어그로
+        if (_targetId == -1 || _state == AiState.Idle)
+        {
+            _targetId = atk.AttackerId;
+            _state = AiState.Chase;
+        }
 
-            int dealt = _npc.TakeDamage(atk.Attack);
-            _world.NotifyAttack(atk.AttackerId, _npc.Id, dealt);
-
-            if (!_npc.IsAlive)
-            {
-                _state = AiState.Idle;
-                _targetId = -1;
-                _world.NotifyDeath(_npc.Id, atk.AttackerId);
-                DoAsyncAfter(TimeSpan.FromSeconds(_world.Config.Npc.RespawnSeconds), Respawn);
-                return;
-            }
-
-            // 어그로: 방금 때린 놈을 우선 타겟으로
-            if (_targetId == -1 || _state == AiState.Idle)
-            {
-                _targetId = atk.AttackerId;
-                _state = AiState.Chase;
-            }
-
-            // HP 낮으면 도망
-            if (_npc.FleeHpRatio > 0 && _npc.Hp < _npc.MaxHp * _npc.FleeHpRatio)
-            {
-                _state = AiState.Flee;
-                _fleeUntilMs = NowMs() + FleeDurationMs;
-            }
-        });
+        // HP 낮으면 도망
+        if (_npc.FleeHpRatio > 0 && _npc.Hp < _npc.MaxHp * _npc.FleeHpRatio)
+        {
+            _state = AiState.Flee;
+            _fleeUntilMs = NowMs() + FleeDurationMs;
+        }
     }
 
     private void Respawn()
@@ -127,18 +138,15 @@ public sealed class NpcActor : AsyncExecutable
         DoAsyncAfter(_tickInterval, Tick);
     }
 
-    /// <summary>AI 메인 tick. 자기 자신을 다음 tick에 다시 예약한다.</summary>
+    /// <summary>AI 메인 tick. 자기 자신을 다음 tick 에 다시 예약.</summary>
     private void Tick()
     {
-        if (_despawned)
-            return;
-
-        if (_world.IsStopping)
-            return; // 더 이상 재예약하지 않음 → DoAsyncAfter 체인 자연 종료
+        if (_despawned) return;
+        if (_world.IsStopping) return;  // 자가복제 종료
 
         if (!_npc.IsAlive)
         {
-            // 사망 상태: tick 체인을 끊고 Respawn에서 재시작 — 빈 tick CPU 낭비 방지
+            // 사망 상태: tick 체인을 끊고 Respawn 에서 재시작
             return;
         }
 
@@ -160,7 +168,6 @@ public sealed class NpcActor : AsyncExecutable
 
     private void TickIdle(long now, float dt)
     {
-        // 어그로: 주변 플레이어 탐색
         var target = _world.Spatial.FindNearestPlayer(_npc.X, _npc.Y, _npc.AggroRange);
         if (target is not null)
         {
@@ -169,7 +176,6 @@ public sealed class NpcActor : AsyncExecutable
             return;
         }
 
-        // 무작위 패트롤 — 일정 시간마다 방향 갱신
         if (now >= _wanderUntilMs)
         {
             float angle = Random.Shared.NextSingle() * MathF.Tau;
@@ -182,7 +188,6 @@ public sealed class NpcActor : AsyncExecutable
         float nx = _npc.X + _wanderDirX * step;
         float ny = _npc.Y + _wanderDirY * step;
 
-        // 스폰 반경 안에서만 패트롤
         float dx = nx - _npc.SpawnX, dy = ny - _npc.SpawnY;
         if (dx * dx + dy * dy > WanderRadius * WanderRadius)
         {
@@ -218,7 +223,6 @@ public sealed class NpcActor : AsyncExecutable
             return;
         }
 
-        // 타겟 방향으로 이동
         float dx = target.X - _npc.X, dy = target.Y - _npc.Y;
         float len = MathF.Sqrt(dx * dx + dy * dy);
         if (len < 0.001f) return;

@@ -3,9 +3,13 @@ using System.Diagnostics;
 namespace JobDispatcherNET;
 
 /// <summary>
-/// Manages timed jobs using Stopwatch for high-precision timing.
-/// Background PeriodicTimer ensures scheduled tasks fire even when
-/// DoAsyncAfter is called from non-worker threads.
+/// 고정밀 지연 작업 큐. <see cref="Stopwatch"/> 기반.
+///
+/// v2 변경점:
+///   - timer fire 시 owner.DoTask 를 직접 호출하지 않는다.
+///     대신 <see cref="TimerDispatchQueue"/> 에 (owner, job) 을 enqueue 한다.
+///     실제 owner.DoTask 는 워커 스레드의 Run() 루프에서 일어난다.
+///   - 이로써 actor 의 Flush 가 ThreadPool 스레드에서 실행되는 hijack 을 막는다.
 /// </summary>
 public sealed class TimerQueue : IDisposable
 {
@@ -17,18 +21,28 @@ public sealed class TimerQueue : IDisposable
     private readonly List<TimerJob> _jobBuffer = [];
     private int _disposed;
 
-    public TimerQueue()
+    private static long _pendingJobsAcrossAllInstances;
+
+    /// <summary>모든 TimerQueue 인스턴스의 대기 작업 합계 (메트릭).</summary>
+    public static long PendingJobsAcrossAllInstances => Interlocked.Read(ref _pendingJobsAcrossAllInstances);
+
+    public TimerQueue() : this(TimeSpan.FromMilliseconds(1)) { }
+
+    public TimerQueue(TimeSpan tickInterval)
     {
-        _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(1));
+        _timer = new PeriodicTimer(tickInterval);
         _processingTask = ProcessTimerJobsAsync();
     }
 
-    /// <summary>
-    /// Returns milliseconds since this TimerQueue was created.
-    /// Uses Stopwatch for sub-millisecond precision (vs DateTime.UtcNow's ~15ms).
-    /// </summary>
+    /// <summary>이 인스턴스 생성 후 경과 시간(ms).</summary>
     public long GetCurrentTick() =>
         (long)Stopwatch.GetElapsedTime(_startTicks).TotalMilliseconds;
+
+    /// <summary>이 인스턴스에 대기 중인 작업 수.</summary>
+    public int PendingCount
+    {
+        get { lock (_lock) return _queue.Count; }
+    }
 
     public void ScheduleTask(AsyncExecutable owner, TimeSpan delay, JobEntry task)
     {
@@ -41,6 +55,7 @@ public sealed class TimerQueue : IDisposable
         {
             _queue.Enqueue(new TimerJob(owner, task), dueTime);
         }
+        Interlocked.Increment(ref _pendingJobsAcrossAllInstances);
     }
 
     private async Task ProcessTimerJobsAsync()
@@ -53,6 +68,10 @@ public sealed class TimerQueue : IDisposable
             }
         }
         catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            JobLog.Error("TimerQueue processing loop terminated unexpectedly", ex);
+        }
     }
 
     private void ProcessDueJobs()
@@ -68,9 +87,15 @@ public sealed class TimerQueue : IDisposable
             }
         }
 
+        if (_jobBuffer.Count == 0) return;
+
+        Interlocked.Add(ref _pendingJobsAcrossAllInstances, -_jobBuffer.Count);
+
+        // ★ 핵심 변경: owner.DoTask 를 ThreadPool 에서 직접 호출하지 않는다.
+        // 워커 스레드의 Run() 루프가 TimerDispatchQueue 를 드레인하면서 자기 스레드에서 호출한다.
         foreach (var job in _jobBuffer)
         {
-            job.Owner.DoTask(job.Task);
+            TimerDispatchQueue.Enqueue(job.Owner, job.Task);
         }
     }
 
@@ -82,10 +107,15 @@ public sealed class TimerQueue : IDisposable
         _timer.Dispose();
         try { _processingTask.Wait(TimeSpan.FromSeconds(2)); }
         catch { /* shutdown */ }
+
+        // 잔여 큐 카운터 정리
+        lock (_lock)
+        {
+            if (_queue.Count > 0)
+                Interlocked.Add(ref _pendingJobsAcrossAllInstances, -_queue.Count);
+            _queue.Clear();
+        }
     }
 
-    /// <summary>
-    /// Value type — no heap allocation per schedule.
-    /// </summary>
     private readonly record struct TimerJob(AsyncExecutable Owner, JobEntry Task);
 }

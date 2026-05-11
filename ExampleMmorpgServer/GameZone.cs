@@ -27,6 +27,7 @@ public class GameZone : AsyncExecutable
     private readonly SpatialIndex _spatialIndex;
     private readonly Dictionary<string, PlayerActor> _actors = [];
     private volatile bool _stopped;
+    private TimeSpan _heartbeatPeriod;
 
     private const float MeleeRange = 3.0f;
     private const float MaxCastRange = 15.0f;
@@ -64,30 +65,14 @@ public class GameZone : AsyncExecutable
     /// 대상 lookup이 GameZone 큐 안에서 일어나므로 _actors race 없음.
     /// </summary>
     internal void SendMeleeDamage(string targetId, AttackerSnapshot attacker, float meleeRange)
-        => DoAsync(() =>
-        {
-            if (_actors.TryGetValue(targetId, out var target))
-                target.ReceiveMeleeDamage(attacker, meleeRange);
-        });
+        => DoAsync(() => ProcessSendMeleeDamage(targetId, attacker, meleeRange));
 
     /// <summary>
     /// PlayerActor → GameZone 큐로 위임되는 AoE fan-out.
     /// SpatialIndex 조회와 _actors lookup 모두 여기서 처리.
     /// </summary>
     internal void DispatchAreaDamage(AttackerSnapshot attacker, float centerX, float centerY, float radius)
-        => DoAsync(() =>
-        {
-            var nearby = _spatialIndex.QueryRadius(centerX, centerY, radius);
-            Console.WriteLine($"  [{_name}] AoE 대상탐색 → {nearby.Count}명 fan-out " +
-                              $"[스레드:{Environment.CurrentManagedThreadId}]");
-
-            foreach (var p in nearby)
-            {
-                if (p.PlayerId == attacker.PlayerId) continue;
-                if (_actors.TryGetValue(p.PlayerId, out var ta))
-                    ta.ReceiveAreaDamage(attacker, centerX, centerY, radius);
-            }
-        });
+        => DoAsync(() => ProcessDispatchAreaDamage(attacker, centerX, centerY, radius));
 
     // ── 실제 본문 (private, GameZone 큐에서 직렬 실행) ─────────────────
 
@@ -146,12 +131,39 @@ public class GameZone : AsyncExecutable
             attacker.AreaAttack(centerX, centerY, radius, MaxCastRange);
     }
 
+    private void ProcessSendMeleeDamage(string targetId, AttackerSnapshot attacker, float meleeRange)
+    {
+        if (_actors.TryGetValue(targetId, out var target))
+            target.ReceiveMeleeDamage(attacker, meleeRange);
+    }
+
+    private void ProcessDispatchAreaDamage(AttackerSnapshot attacker, float centerX, float centerY, float radius)
+    {
+        var nearby = _spatialIndex.QueryRadius(centerX, centerY, radius);
+        Console.WriteLine($"  [{_name}] AoE 대상탐색 → {nearby.Count}명 fan-out " +
+                          $"[스레드:{Environment.CurrentManagedThreadId}]");
+
+        foreach (var p in nearby)
+        {
+            if (p.PlayerId == attacker.PlayerId) continue;
+            if (_actors.TryGetValue(p.PlayerId, out var ta))
+                ta.ReceiveAreaDamage(attacker, centerX, centerY, radius);
+        }
+    }
+
     // ── 자기복제 heartbeat ─────────────────────────────────────────────
 
+    /// <summary>
+    /// 주기는 필드(<see cref="_heartbeatPeriod"/>)에 보관 → Heartbeat가 인자 없는 메서드가 되어
+    /// DoAsync(Heartbeat) / DoAsyncAfter(_heartbeatPeriod, Heartbeat) 처럼 메서드 그룹으로 등록 가능.
+    /// </summary>
     public void StartHeartbeat(TimeSpan period)
-        => DoAsync(() => Heartbeat(period));
+    {
+        _heartbeatPeriod = period;
+        DoAsync(Heartbeat);
+    }
 
-    private void Heartbeat(TimeSpan period)
+    private void Heartbeat()
     {
         if (_stopped) return;
 
@@ -166,7 +178,7 @@ public class GameZone : AsyncExecutable
                               $"[스레드:{Environment.CurrentManagedThreadId}]");
         }
 
-        DoAsyncAfter(period, () => Heartbeat(period));
+        DoAsyncAfter(_heartbeatPeriod, Heartbeat);
     }
 
     // ── 동기 read API (외부에서 안전한 상태 조회) ─────────────────────

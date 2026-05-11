@@ -25,7 +25,11 @@ await server.StopAsync();
 
 static async Task RunSimulation(GameServer server)
 {
-    Console.WriteLine("====== 시뮬레이션 시작 ======\n");
+    Console.WriteLine("====== 시뮬레이션 시작 ======");
+    Console.WriteLine($"  시뮬레이터 스레드(producer):{Environment.CurrentManagedThreadId}");
+    Console.WriteLine($"  → server.EnterZone/Move/Attack/Whisper 는 SectorWorker.InboundCommands 로 push 만");
+    Console.WriteLine($"  → 워커 스레드(consumer)들이 dequeue 하여 GameZone/ZoneSector 작업을 실행");
+    Console.WriteLine($"  로그의 [스레드:N] 표시로 producer/consumer 분리를 확인할 수 있다.\n");
 
     // ── 플레이어 생성 ──
     var players = new Player[]

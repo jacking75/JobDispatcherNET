@@ -44,10 +44,16 @@ public class ZoneSector : AsyncExecutable
     //  같은 섹터 내 작업 — lock 불필요, 완전 안전
     // ════════════════════════════════════════════════
 
-    public void AddPlayer(Player player)
+    /// <summary>
+    /// 플레이어 추가 — 좌표 mutation도 이 섹터 큐 안에서 일어남.
+    /// "Player 상태는 그 시점 owner 섹터 큐에서만 변경" 컨벤션을 준수.
+    /// </summary>
+    public void AddPlayer(Player player, float spawnX, float spawnY)
     {
         DoAsync(() =>
         {
+            player.X = spawnX;
+            player.Y = spawnY;
             _players[player.PlayerId] = player;
             player.IsTransferring = false;
             Console.WriteLine($"  [섹터{SectorId}] {player.Name} 진입 " +
@@ -65,10 +71,10 @@ public class ZoneSector : AsyncExecutable
     }
 
     /// <summary>
-    /// 같은 섹터 내 이동. 섹터 경계를 넘으면 onCrossBoundary 콜백 호출.
+    /// 같은 섹터 내 이동. GameZone 큐가 경계 통과 여부를 미리 판정하므로
+    /// 여기서는 항상 같은 섹터 내부 이동이라 가정한다. 방어적으로 범위 확인만.
     /// </summary>
-    public void MovePlayer(string playerId, float newX, float newY,
-        Action<Player, float, float>? onCrossBoundary = null)
+    public void MovePlayer(string playerId, float newX, float newY)
     {
         DoAsync(() =>
         {
@@ -79,17 +85,17 @@ public class ZoneSector : AsyncExecutable
             player.X = newX;
             player.Y = newY;
 
-            // 섹터 경계를 넘었는지 확인
             if (!ContainsPoint(newX, newY))
             {
-                Console.WriteLine($"  [섹터{SectorId}] ⚠ {player.Name} 섹터 경계 초과! " +
-                                  $"({oldX:F0},{oldY:F0})→({newX:F0},{newY:F0}) [스레드:{Environment.CurrentManagedThreadId}]");
-                onCrossBoundary?.Invoke(player, newX, newY);
+                Console.WriteLine($"  [섹터{SectorId}] ⚠ {player.Name} 좌표가 섹터 범위 밖! " +
+                                  $"({oldX:F0},{oldY:F0})→({newX:F0},{newY:F0}) " +
+                                  $"[스레드:{Environment.CurrentManagedThreadId}]");
                 return;
             }
 
             Console.WriteLine($"  [섹터{SectorId}] {player.Name} 이동 " +
-                              $"({oldX:F0},{oldY:F0})→({newX:F0},{newY:F0}) [스레드:{Environment.CurrentManagedThreadId}]");
+                              $"({oldX:F0},{oldY:F0})→({newX:F0},{newY:F0}) " +
+                              $"[스레드:{Environment.CurrentManagedThreadId}]");
         });
     }
 
@@ -316,11 +322,13 @@ public class ZoneSector : AsyncExecutable
     }
 
     /// <summary>
-    /// 섹터 이동 [1단계] — 구 섹터에서 플레이어 제거, 이동 중 플래그 설정.
+    /// 섹터 이동 [1단계] — 구 섹터에서 플레이어 제거, IsTransferring 설정.
+    /// 라우팅 맵(<see cref="GameZone._playerSectorMap"/>)은 이 호출 전에 GameZone 큐에서
+    /// 이미 신 섹터로 갱신된 상태. 좌표 mutation은 신 섹터 큐의 AddPlayer 안에서 일어남.
     /// 이동 중(IsTransferring=true)인 플레이어는 공격 대상에서 제외된다.
     /// </summary>
     public void BeginTransferOut(string playerId, ZoneSector newSector,
-        Action<Player> onRemoved)
+        float newX, float newY)
     {
         DoAsync(() =>
         {
@@ -330,25 +338,31 @@ public class ZoneSector : AsyncExecutable
             Console.WriteLine($"  [섹터{SectorId}] → {player.Name} 섹터 이동 시작 " +
                               $"→ 섹터{newSector.SectorId} [스레드:{Environment.CurrentManagedThreadId}]");
 
-            onRemoved(player);
-
-            // [2단계] 신 섹터에 추가 — 신 섹터의 DoAsync에서 IsTransferring 해제
-            newSector.AddPlayer(player);
+            // [2단계] 신 섹터에 추가 — 신 섹터 큐에서 좌표 설정 + IsTransferring 해제
+            newSector.AddPlayer(player, newX, newY);
         });
     }
 
-    // ── 상태 출력 ──
+    // ── 동기 read API ──
 
-    public void PrintStatus()
+    /// <summary>
+    /// 차단 스냅샷. caller 스레드에서 호출하면 섹터 큐가 처리할 때까지 대기 후
+    /// 일관된 플레이어 상태를 반환한다. GameZone.GetStatus 에서 호출됨.
+    /// </summary>
+    public SectorStatus GetStatus()
     {
+        using var ev = new ManualResetEventSlim(false);
+        PlayerStatus[]? players = null;
         DoAsync(() =>
         {
-            if (_players.Count == 0) return;
-            Console.WriteLine($"    섹터{SectorId} [{OriginX:F0},{OriginY:F0}]~" +
-                              $"[{OriginX + Width:F0},{OriginY + Height:F0}]: {_players.Count}명");
-            foreach (var p in _players.Values)
-                Console.WriteLine($"      - {p.Name} ({p.X:F0},{p.Y:F0}) HP:{p.Hp}/{p.MaxHp} " +
-                                  $"{(p.IsAlive ? "생존" : "사망")}{(p.IsTransferring ? " [이동중]" : "")}");
+            players = _players.Values
+                .Select(p => new PlayerStatus(
+                    p.PlayerId, p.Name, p.X, p.Y,
+                    p.Hp, p.MaxHp, p.IsAlive, p.IsTransferring))
+                .ToArray();
+            ev.Set();
         });
+        ev.Wait();
+        return new SectorStatus(SectorId, OriginX, OriginY, Width, Height, players!);
     }
 }
