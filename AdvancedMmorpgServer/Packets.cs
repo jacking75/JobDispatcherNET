@@ -31,6 +31,9 @@ public static class Packets
     public static string Spawn(Entity e) =>
         $"SPAWN|{e.Id}|{e.Kind}|{e.Name}|{e.X.ToString("F1", Inv)}|{e.Y.ToString("F1", Inv)}|{e.Hp}|{e.MaxHp}|{e.Color}";
 
+    public static string StateOne(Entity e) =>
+        $"STATE|{e.Id},{e.X.ToString("F1", Inv)},{e.Y.ToString("F1", Inv)},{e.Hp}";
+
     public static string Despawn(int id) => $"DESPAWN|{id}";
     public static string Attack(int aId, int tId, int dmg) => $"ATTACK|{aId}|{tId}|{dmg}";
     public static string Death(int id, int killerId) => $"DEATH|{id}|{killerId}";
@@ -66,6 +69,8 @@ public static class PacketHandler
                 break;
 
             case "LEAVE":
+                if (session.PlayerId != 0)
+                    server.World.RemovePlayer(session.PlayerId);
                 session.Close();
                 break;
         }

@@ -12,5 +12,6 @@
     "tickIntervalMs": 250,
     "spawnSpacingPixels": 200,
     "namePrefix": "Bot"
-  }
+  },
+  "entityTtlMs": 10000
 }

@@ -8,7 +8,6 @@ public sealed class BotClient
 {
     private enum AiState { Wander, Engage, Flee }
 
-    private readonly WorldState _world;
     private readonly ClientConfig _cfg;
     private readonly string _name;
     private readonly NetworkClient _net;
@@ -29,14 +28,14 @@ public sealed class BotClient
     public int PlayerId => _net.MyPlayerId;
     public string Name => _name;
     public bool Connected => _net.Connected;
+    public WorldState World { get; } = new();
 
-    public BotClient(WorldState world, ClientConfig cfg, string name, int seed)
+    public BotClient(ClientConfig cfg, string name, int seed)
     {
-        _world = world;
         _cfg = cfg;
         _name = name;
         _rng = new Random(seed);
-        _net = new NetworkClient(world);
+        _net = new NetworkClient(World);
     }
 
     public async Task ConnectAsync(CancellationToken ct)
@@ -63,7 +62,7 @@ public sealed class BotClient
     private void TickAi()
     {
         if (PlayerId == 0) return;
-        if (!_world.Entities.TryGetValue(PlayerId, out var me)) return;
+        if (!World.Entities.TryGetValue(PlayerId, out var me)) return;
         if (!me.IsAlive) return;
 
         long now = Environment.TickCount64;
@@ -111,8 +110,8 @@ public sealed class BotClient
         if (now >= _wanderRetargetAt ||
             (Sq(_wanderTargetX - me.X) + Sq(_wanderTargetY - me.Y)) < 4f)
         {
-            _wanderTargetX = _rng.NextSingle() * _world.WorldWidth;
-            _wanderTargetY = _rng.NextSingle() * _world.WorldHeight;
+            _wanderTargetX = _rng.NextSingle() * World.WorldWidth;
+            _wanderTargetY = _rng.NextSingle() * World.WorldHeight;
             _wanderRetargetAt = now + 3000 + _rng.Next(0, 2000);
         }
 
@@ -121,7 +120,7 @@ public sealed class BotClient
 
     private void DoEngage(EntityView me, long now)
     {
-        if (!_world.Entities.TryGetValue(_engageTargetId, out var target) || !target.IsAlive)
+        if (!World.Entities.TryGetValue(_engageTargetId, out var target) || !target.IsAlive)
         {
             _state = AiState.Wander;
             _stateChangedAt = now;
@@ -173,8 +172,8 @@ public sealed class BotClient
             dirX = MathF.Cos(a); dirY = MathF.Sin(a);
         }
 
-        float nx = Math.Clamp(me.X + dirX * 6f, 0, _world.WorldWidth);
-        float ny = Math.Clamp(me.Y + dirY * 6f, 0, _world.WorldHeight);
+        float nx = Math.Clamp(me.X + dirX * 6f, 0, World.WorldWidth);
+        float ny = Math.Clamp(me.Y + dirY * 6f, 0, World.WorldHeight);
         _net.SendMove(nx, ny);
     }
 
@@ -182,7 +181,7 @@ public sealed class BotClient
     {
         EntityView? best = null;
         float bestSq = EngageRange * EngageRange;
-        foreach (var e in _world.Entities.Values)
+        foreach (var e in World.Entities.Values)
         {
             if (e.Id == me.Id) continue;
             if (!e.IsAlive) continue;
@@ -201,8 +200,8 @@ public sealed class BotClient
         float len = MathF.Sqrt(dx * dx + dy * dy);
         if (len < 0.001f) return;
         float k = MathF.Min(1f, maxStep / len);
-        float nx = Math.Clamp(me.X + dx * k, 0, _world.WorldWidth);
-        float ny = Math.Clamp(me.Y + dy * k, 0, _world.WorldHeight);
+        float nx = Math.Clamp(me.X + dx * k, 0, World.WorldWidth);
+        float ny = Math.Clamp(me.Y + dy * k, 0, World.WorldHeight);
         _net.SendMove(nx, ny);
     }
 

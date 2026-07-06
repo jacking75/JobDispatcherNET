@@ -76,7 +76,7 @@ public sealed class NpcActor : AsyncExecutable
     {
         if (_despawned) return;
         _despawned = true;
-        _world.Spatial.Remove(_npc);
+        Aoi.LeaveWorldNpc(_world.Spatial, _npc);
     }
 
     /// <summary>hot path — closure 회피.</summary>
@@ -93,13 +93,15 @@ public sealed class NpcActor : AsyncExecutable
         if (d > meleeRange) return;
 
         int dealt = _npc.TakeDamage(atk.Attack);
-        _world.NotifyAttack(atk.AttackerId, _npc.Id, dealt);
+        var s = _world.Spatial.SectorAt(_npc.X, _npc.Y);
+        Aoi.Publish(s, Packets.Attack(atk.AttackerId, _npc.Id, dealt));
+        Aoi.Publish(s, Packets.StateOne(_npc));
 
         if (!_npc.IsAlive)
         {
             _state = AiState.Idle;
             _targetId = -1;
-            _world.NotifyDeath(_npc.Id, atk.AttackerId);
+            Aoi.Publish(s, Packets.Death(_npc.Id, atk.AttackerId));
             DoAsyncAfter(TimeSpan.FromSeconds(_world.Config.Npc.RespawnSeconds), Respawn);
             return;
         }
@@ -128,11 +130,12 @@ public sealed class NpcActor : AsyncExecutable
         _npc.Y = _npc.SpawnY + (Random.Shared.NextSingle() - 0.5f) * 10f;
         _npc.X = Math.Clamp(_npc.X, 0, _world.Width);
         _npc.Y = Math.Clamp(_npc.Y, 0, _world.Height);
-        _world.Spatial.UpdatePosition(_npc, oldX, oldY);
+        Aoi.EntityMoved(_world.Spatial, _npc, oldX, oldY);
         _state = AiState.Idle;
         _targetId = -1;
         _lastTickMs = 0;
-        _world.NotifyRespawn(_npc.Id, _npc.X, _npc.Y, _npc.Hp);
+        Aoi.PublishAt(_world.Spatial, _npc.X, _npc.Y,
+            Packets.Respawn(_npc.Id, _npc.X, _npc.Y, _npc.Hp));
 
         // 사망 시 끊었던 tick 체인 재가동
         DoAsyncAfter(_tickInterval, Tick);
@@ -285,7 +288,7 @@ public sealed class NpcActor : AsyncExecutable
         float ox = _npc.X, oy = _npc.Y;
         _npc.X = nx;
         _npc.Y = ny;
-        _world.Spatial.UpdatePosition(_npc, ox, oy);
+        Aoi.EntityMoved(_world.Spatial, _npc, ox, oy);
     }
 
     private static long NowMs() => Environment.TickCount64;

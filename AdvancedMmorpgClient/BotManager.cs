@@ -6,16 +6,14 @@ namespace AdvancedMmorpgClient;
 public sealed class BotManager
 {
     private readonly ClientConfig _cfg;
-    private readonly WorldState _world;
     private readonly List<BotClient> _bots = [];
     private readonly CancellationTokenSource _cts = new();
 
     public IReadOnlyList<BotClient> Bots => _bots;
 
-    public BotManager(ClientConfig cfg, WorldState world)
+    public BotManager(ClientConfig cfg)
     {
         _cfg = cfg;
-        _world = world;
     }
 
     public async Task StartAsync()
@@ -23,7 +21,7 @@ public sealed class BotManager
         for (int i = 0; i < _cfg.Bots.Count; i++)
         {
             var name = $"{_cfg.Bots.NamePrefix}{i:D2}";
-            var bot = new BotClient(_world, _cfg, name, seed: i * 7919 + 13);
+            var bot = new BotClient(_cfg, name, seed: i * 7919 + 13);
             _bots.Add(bot);
 
             try

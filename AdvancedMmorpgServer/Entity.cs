@@ -72,6 +72,8 @@ public abstract class Entity
 public sealed class Player : Entity
 {
     public Action<string>? SendPacket { get; set; }
+    public int ViewCX = -1;
+    public int ViewCY = -1;
 
     public Player(int id, string name) : base(id, name, EntityKind.Player)
     {

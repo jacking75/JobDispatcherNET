@@ -8,6 +8,7 @@ public sealed class ClientConfig
     public ServerSection Server { get; set; } = new();
     public ScreenSection Screen { get; set; } = new();
     public BotSection Bots { get; set; } = new();
+    public int EntityTtlMs { get; set; } = 10000;
 
     public sealed class ServerSection
     {

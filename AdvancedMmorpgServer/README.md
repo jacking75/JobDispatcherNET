@@ -24,8 +24,7 @@ JobDispatcherNET을 멀티스레드 부하 환경에서 검증하기 위한 한 
                 ├─ NpcActor #2 ─ DoAsyncAfter(Tick) ─┤
 JobDispatcher ─┼─ ...                               ├─ 같은 Actor의 작업은 직렬,
  (워커 N개)     ├─ PlayerActor #1 ─ DoAsync(Move) ───┤  서로 다른 Actor는 병렬
-                ├─ PlayerActor #2 ─ DoAsync(Attack) ─┤
-                └─ BroadcastActor ─ DoAsyncAfter() ──┘
+                └─ PlayerActor #2 ─ DoAsync(Attack) ─┘
 
 ClientSession ── Channel<string> 송신 큐 ── SendLoopAsync (별도 Task)
               └─ ReadLine 수신 루프 ────── PacketHandler.Handle → World.HandleClient*
@@ -95,9 +94,9 @@ dotnet run
 |---|---|---|
 | `server.port` | 9100 | TCP 리스닝 포트 |
 | `server.workerThreads` | 8 | `JobDispatcher`가 생성할 워커 스레드 수 |
-| `server.broadcastIntervalMs` | 100 | 전체 STATE 스냅샷 브로드캐스트 주기 |
+| `server.aoiResyncIntervalMs` | 3000 | AOI 시야 SPAWN 재전송 주기. 0이면 끔 |
 | `world.width` / `world.height` | 1000 | 월드 크기 (단위 없음, 클라이언트에서 화면에 자동 맞춤) |
-| `world.spatialCellSize` | 50 | `SpatialIndex`의 격자 셀 크기 |
+| `world.spatialCellSize` | 64 | AOI 섹터 셀 크기. 클라이언트 교전 반경(60) 이상 |
 | `npc.totalCount` | 50 | 부팅 시 스폰할 NPC 수 |
 | `npc.tickIntervalMs` | 200 | NPC AI tick 간격 |
 | `npc.respawnSeconds` | 8 | 사망 후 부활 대기 시간 |
@@ -126,7 +125,7 @@ NPC 종류는 `weight` 비율로 무작위 스폰됩니다. 예: Slime 4 / Gobli
 WELCOME|playerId|x|y|worldW|worldH
 SPAWN|id|kind|name|x|y|hp|maxHp|color
 DESPAWN|id
-STATE|id,x,y,hp|id,x,y,hp|...
+STATE|id,x,y,hp
 ATTACK|attackerId|targetId|damage
 DEATH|id|killerId
 RESPAWN|id|x|y|hp
@@ -159,12 +158,14 @@ LEAVE
 AdvancedMmorpgServer/
   Program.cs            ── 진입점, 콘솔 입력 루프
   GameServer.cs         ── JobDispatcher, NetworkServer, GameWorld 조립
-  GameWorld.cs          ── 모든 Actor와 세션 보유, 브로드캐스트
+  GameWorld.cs          ── 모든 Actor와 세션 보유, AOI 라우팅 조립
   GameWorker.cs         ── IRunnable — 전용 OS 스레드의 메인 루프
   NpcActor.cs           ── NPC AI (Idle/Chase/Attack/Flee), 자가 스케줄링 tick
   PlayerActor.cs        ── 플레이어 입력 처리 + 데미지 수신
   Entity.cs             ── Player / Npc 데이터
-  SpatialIndex.cs       ── ConcurrentDictionary 기반 격자 공간 인덱스
+  Sector.cs             ── AOI 섹터 컨테이너
+  SectorGrid.cs         ── 고정 2D 섹터 그리드와 NPC 쿼리
+  Aoi.cs                ── push AOI 통지 오케스트레이션
   Packets.cs            ── 텍스트 패킷 인코딩/디코딩
   NetworkServer.cs      ── TCP Accept + ClientSession (Send/Recv 분리)
   ServerConfig.cs       ── config.json 로더
@@ -176,7 +177,7 @@ AdvancedMmorpgClient/
   Game1.cs              ── MonoGame Game 진입점
   Renderer.cs           ── 부감 시점 렌더러 (월드 → 화면 자동 스케일)
   PixelFont.cs          ── 5×7 비트맵 폰트 (Content Pipeline 미사용)
-  WorldState.cs         ── 모든 봇의 패킷을 받아 갱신되는 단일 월드 뷰
+  WorldState.cs         ── 봇별 AOI 월드 뷰
   EntityView.cs         ── 클라이언트 측 엔티티
   BotManager.cs         ── 봇 N개 스폰
   BotClient.cs          ── 봇 AI (Wander/Engage/Flee)
@@ -190,4 +191,4 @@ AdvancedMmorpgClient/
 
 - **클라이언트 창이 흰색으로 안 뜨고 검정만 보임** — 서버가 안 켜져 있거나 포트가 다른 경우. 서버 콘솔 로그에서 `[네트워크] 포트 N 리스닝 시작`을 먼저 확인.
 - **`The process cannot access the file ... AdvancedMmorpgServer.exe` 빌드 에러** — 이전 인스턴스가 종료되지 않은 상태. `taskkill /F /IM AdvancedMmorpgServer.exe` (Windows) 후 재빌드.
-- **로그에 `[세션 #N] 송신 큐 포화 — 200개 드롭, 연결 종료`** — 클라이언트가 STATE를 200ms 가까이 못 받아갈 만큼 느린 상황. 정상 보호 동작이며, 클라이언트 부하를 낮추거나 `server.broadcastIntervalMs`를 늘려 해결.
+- **로그에 `[세션 #N] 송신 큐 포화 — 200개 드롭, 연결 종료`** — 클라이언트가 push 패킷을 못 받아갈 만큼 느린 상황. 정상 보호 동작이며, 클라이언트 부하나 AOI 범위를 점검한다.

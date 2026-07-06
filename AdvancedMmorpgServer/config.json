@@ -2,13 +2,13 @@
   "server": {
     "port": 9100,
     "workerThreads": 8,
-    "broadcastIntervalMs": 100
+    "aoiResyncIntervalMs": 3000
   },
   "world": {
     "name": "AdvancedField",
     "width": 1000.0,
     "height": 1000.0,
-    "spatialCellSize": 50.0
+    "spatialCellSize": 64.0
   },
   "npc": {
     "totalCount": 50,

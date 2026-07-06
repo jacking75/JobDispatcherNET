@@ -20,5 +20,6 @@ public sealed class EntityView
     public float Y;
     public int Hp;
     public int MaxHp;
+    public long LastSeenMs;
     public bool IsAlive => Hp > 0;
 }

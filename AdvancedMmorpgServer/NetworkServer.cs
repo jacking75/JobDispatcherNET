@@ -147,6 +147,7 @@ public sealed class ClientSession
     private int _closed;
     private int _closeNotified;
     private int _droppedCount;
+    private long _sentCount;
 
     // disconnect sentinel — 일반 패킷에 등장할 수 없는 문자열.
     private const string DisconnectMarker = "\0__DISCONNECT__\0";
@@ -283,7 +284,10 @@ public sealed class ClientSession
         try
         {
             if (_outgoing.TryAdd(msg))
+            {
+                Interlocked.Increment(ref _sentCount);
                 return;
+            }
         }
         catch (InvalidOperationException)
         {
@@ -335,6 +339,7 @@ public sealed class ClientSession
         try { _packetSequencer.Enqueue(DisconnectMarker); } catch { }
 
         Close();
+        JobLog.Info($"[Session #{ConnectionId}] closed, sent={Interlocked.Read(ref _sentCount)}, dropped={Volatile.Read(ref _droppedCount)}");
         _onClosed(this);
     }
 }

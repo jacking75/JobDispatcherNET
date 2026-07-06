@@ -35,6 +35,7 @@ public sealed class WorldState
 
     public void HandlePacket(string packet)
     {
+        var now = Environment.TickCount64;
         var parts = packet.Split('|');
         if (parts.Length == 0) return;
 
@@ -58,7 +59,7 @@ public sealed class WorldState
                     Entities[sid] = new EntityView
                     {
                         Id = sid, Name = parts[3], Kind = kind, Color = color,
-                        X = sx, Y = sy, Hp = hp, MaxHp = maxHp
+                        X = sx, Y = sy, Hp = hp, MaxHp = maxHp, LastSeenMs = now
                     };
                 }
                 break;
@@ -83,6 +84,7 @@ public sealed class WorldState
                         ev.X = ex;
                         ev.Y = ey;
                         ev.Hp = ehp;
+                        ev.LastSeenMs = now;
                     }
                 }
                 break;
@@ -90,7 +92,10 @@ public sealed class WorldState
             case "DEATH":
                 if (parts.Length >= 2 && int.TryParse(parts[1], out var deadId)
                     && Entities.TryGetValue(deadId, out var dev))
+                {
                     dev.Hp = 0;
+                    dev.LastSeenMs = now;
+                }
                 break;
 
             case "RESPAWN":
@@ -99,7 +104,7 @@ public sealed class WorldState
                     && int.TryParse(parts[4], out var rhp)
                     && Entities.TryGetValue(rid, out var rev))
                 {
-                    rev.X = rx; rev.Y = ry; rev.Hp = rhp;
+                    rev.X = rx; rev.Y = ry; rev.Hp = rhp; rev.LastSeenMs = now;
                 }
                 break;
 
@@ -111,4 +116,16 @@ public sealed class WorldState
 
     private static bool TryFloat(string s, out float v) =>
         float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v);
+
+    public void EvictStale(long ttlMs)
+    {
+        if (ttlMs <= 0) return;
+        var now = Environment.TickCount64;
+        foreach (var kv in Entities)
+        {
+            if (IsMyBot(kv.Key)) continue;
+            if (now - kv.Value.LastSeenMs > ttlMs)
+                Entities.TryRemove(kv.Key, out _);
+        }
+    }
 }

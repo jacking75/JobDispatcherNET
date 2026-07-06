@@ -16,7 +16,7 @@ public sealed class ServerConfig
     {
         public int Port { get; set; } = 9100;
         public int WorkerThreads { get; set; } = 8;
-        public int BroadcastIntervalMs { get; set; } = 100;
+        public int AoiResyncIntervalMs { get; set; } = 3000;
     }
 
     public sealed class WorldSection
@@ -24,7 +24,8 @@ public sealed class ServerConfig
         public string Name { get; set; } = "AdvancedField";
         public float Width { get; set; } = 1000f;
         public float Height { get; set; } = 1000f;
-        public float SpatialCellSize { get; set; } = 50f;
+        /// <summary>Must be at least the client view/combat radius (60).</summary>
+        public float SpatialCellSize { get; set; } = 64f;
     }
 
     public sealed class NpcSection
