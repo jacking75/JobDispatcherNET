@@ -1,68 +1,138 @@
+using System.Diagnostics;
+
 namespace JobDispatcherNET;
 
 /// <summary>
-/// JobDispatcher 동작 옵션.
+/// Worker-pool options.
 /// </summary>
 public sealed record JobDispatcherOptions
 {
+    /// <summary>Default options.</summary>
     public static readonly JobDispatcherOptions Default = new();
 
-    /// <summary>워커가 unhandled 예외로 죽으면 자동 재기동. 기본 true.</summary>
+    /// <summary>Restart a worker that died from an unhandled exception. Default true.</summary>
     public bool RestartFailedWorkers { get; init; } = true;
 
-    /// <summary>한 워커당 누적 재기동 한도. 기본 5. 초과 시 그 슬롯은 영구 정지.</summary>
+    /// <summary>Restarts allowed per worker slot before it is left down. Default 5.</summary>
     public int MaxRestartsPerWorker { get; init; } = 5;
 
-    /// <summary>재기동 간 최소 간격 (지수 백오프 시작값). 기본 1초.</summary>
+    /// <summary>Base delay between restarts; doubles with each attempt. Default 1s.</summary>
     public TimeSpan RestartBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
-    /// <summary>한 tick 에 워커가 처리할 timer dispatch 수의 상한. 기본 256.</summary>
-    public int MaxTimerDrainPerTick { get; init; } = TimerDispatchQueue.MaxDrainPerTick;
+    /// <summary>
+    /// If a worker slot stays up this long after a restart, its restart budget is refilled.
+    /// Without this a server that hiccups five times over months is permanently down a worker.
+    /// Default 5 minutes; <see cref="TimeSpan.Zero"/> disables the refill.
+    /// </summary>
+    public TimeSpan RestartCountResetAfter { get; init; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>Ready-queue items a worker handles per iteration. Default 256.</summary>
+    public int MaxReadyDrainPerTick { get; init; } = 256;
+
+    /// <inheritdoc cref="MaxReadyDrainPerTick" />
+    [Obsolete("Renamed to MaxReadyDrainPerTick; timer dispatch now flows through the shared ready queue. Removed in v4.0.")]
+    public int MaxTimerDrainPerTick
+    {
+        get => MaxReadyDrainPerTick;
+        init => MaxReadyDrainPerTick = value;
+    }
+
+    /// <summary>How long an idle worker blocks before re-checking. Only used by the non-generic dispatcher.</summary>
+    public int IdleWaitMs { get; init; } = 20;
+
+    /// <summary>Priority for worker threads. Default <see cref="ThreadPriority.Normal"/>.</summary>
+    public ThreadPriority ThreadPriority { get; init; } = ThreadPriority.Normal;
+
+    /// <summary>Worker threads run as background threads (do not keep the process alive). Default true.</summary>
+    public bool BackgroundThreads { get; init; } = true;
+
+    /// <summary>Stack size in bytes for worker threads. 0 uses the platform default.</summary>
+    public int MaxStackSize { get; init; }
+
+    /// <summary>System the workers serve. <c>null</c> uses <see cref="JobSystem.Default"/>.</summary>
+    public JobSystem? System { get; init; }
 }
 
 /// <summary>
-/// 전용 OS 스레드 N 개에서 IRunnable 을 실행하는 워커 풀.
-///
-/// v2 변경점:
-///   - <see cref="JobDispatcherOptions"/> 로 supervisor / 백오프 / timer drain 제어.
-///   - 워커 사망 시 자동 재기동 (한도 초과 시 영구 정지).
-///   - 워커 Run() 직전에 <see cref="TimerDispatchQueue"/> 를 드레인 →
-///     timer fire 가 ThreadPool 이 아닌 워커 스레드에서 실행됨.
+/// Shared worker-thread lifecycle: start, supervise, restart, stop.
 /// </summary>
-public sealed class JobDispatcher<T> : IDisposable, IAsyncDisposable where T : IRunnable, new()
+public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
 {
-    private readonly int _workerCount;
     private readonly Thread[] _threads;
     private readonly int[] _restartCounts;
-    private readonly JobDispatcherOptions _options;
+    private readonly long[] _lastStartTimestamps;
     private readonly CancellationTokenSource _cts = new();
+
+    /// <summary>
+    /// Serialises starting a worker against stopping the pool. Without it a supervisor restart
+    /// could slip in after <see cref="TryStop"/> had already scanned <see cref="_threads"/>, so
+    /// shutdown reported success while a fresh worker was coming up — and then disposed the
+    /// cancellation source that worker was about to read.
+    /// </summary>
+    private readonly object _lifecycleLock = new();
     private TaskCompletionSource? _allWorkersDone;
     private int _completedWorkers;
     private int _disposed;
+    private int _started;
 
-    public JobDispatcher(int workerCount) : this(workerCount, JobDispatcherOptions.Default) { }
-
-    public JobDispatcher(int workerCount, JobDispatcherOptions options)
+    /// <summary>Create a dispatcher.</summary>
+    /// <param name="workerCount">Number of worker threads. Must be at least 1.</param>
+    /// <param name="options">Worker options. <c>null</c> uses <see cref="JobDispatcherOptions.Default"/>.</param>
+    protected JobDispatcherBase(int workerCount, JobDispatcherOptions? options)
     {
-        if (workerCount < 1) throw new ArgumentOutOfRangeException(nameof(workerCount), "must be >= 1");
-        ArgumentNullException.ThrowIfNull(options);
-        _workerCount = workerCount;
-        _options = options;
+        if (workerCount < 1)
+            throw new ArgumentOutOfRangeException(nameof(workerCount), "must be >= 1");
+
+        Options = options ?? JobDispatcherOptions.Default;
+        System = Options.System ?? JobSystem.Default;
+        WorkerCount = workerCount;
         _threads = new Thread[workerCount];
         _restartCounts = new int[workerCount];
+        _lastStartTimestamps = new long[workerCount];
+        System.AttachDispatcher(this);
+    }
+
+    /// <summary>Options this dispatcher was created with.</summary>
+    public JobDispatcherOptions Options { get; }
+
+    /// <summary>The system these workers serve.</summary>
+    public JobSystem System { get; }
+
+    /// <summary>Configured number of worker threads.</summary>
+    public int WorkerCount { get; }
+
+    /// <summary>Cancellation token signalled when the dispatcher stops.</summary>
+    protected CancellationToken StoppingToken => _cts.Token;
+
+    /// <summary>Worker threads currently alive.</summary>
+    public int LiveWorkerCount
+    {
+        get
+        {
+            var alive = 0;
+            foreach (var t in _threads)
+                if (t is { IsAlive: true }) alive++;
+            return alive;
+        }
     }
 
     /// <summary>
-    /// 워커 스레드 N 개 시작. 모든 워커가 종료되면 완료되는 Task 반환.
+    /// Start the worker threads. The returned task completes when every worker has stopped.
+    /// Calling this more than once throws.
     /// </summary>
     public Task RunWorkerThreadsAsync()
     {
+        if (Interlocked.Exchange(ref _started, 1) != 0)
+            throw new InvalidOperationException("RunWorkerThreadsAsync has already been called on this dispatcher.");
+
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
         _allWorkersDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        for (int i = 0; i < _workerCount; i++)
+        lock (_lifecycleLock)
         {
-            int slot = i;
-            StartWorkerOnSlot(slot, isRestart: false);
+            for (var slot = 0; slot < WorkerCount; slot++)
+                StartWorkerOnSlot(slot, isRestart: false);
         }
 
         return _allWorkersDone.Task;
@@ -70,50 +140,34 @@ public sealed class JobDispatcher<T> : IDisposable, IAsyncDisposable where T : I
 
     private void StartWorkerOnSlot(int slot, bool isRestart)
     {
-        var thread = new Thread(() => RunWorker(slot))
-        {
-            IsBackground = true,
-            Name = isRestart ? $"JobWorker-{slot}-r{_restartCounts[slot]}" : $"JobWorker-{slot}",
-        };
+        var name = isRestart
+            ? $"JobWorker-{System.Name}-{slot}-r{_restartCounts[slot]}"
+            : $"JobWorker-{System.Name}-{slot}";
+
+        var thread = Options.MaxStackSize > 0
+            ? new Thread(() => RunWorker(slot), Options.MaxStackSize)
+            : new Thread(() => RunWorker(slot));
+
+        thread.IsBackground = Options.BackgroundThreads;
+        thread.Name = name;
+        thread.Priority = Options.ThreadPriority;
+
         _threads[slot] = thread;
+        Interlocked.Exchange(ref _lastStartTimestamps[slot], Stopwatch.GetTimestamp());
         thread.Start();
     }
 
     private void RunWorker(int slot)
     {
-        IRunnable? runner = null;
-        bool exitedNormally = false;
+        var exitedNormally = false;
+
+        ThreadContext.IsWorkerThread = true;
+        ThreadContext.CurrentSystem = System;
+        System.RegisterWorker();
 
         try
         {
-            runner = new T();
-
-            while (!_cts.Token.IsCancellationRequested)
-            {
-                ThreadContext.TickCount = ThreadContext.Timer.GetCurrentTick();
-
-                // ★ Timer dispatch 펌프: 비-워커 스레드(ThreadPool)에서 fire 된 timer 를
-                // 워커 스레드로 끌어와 owner.DoTask 를 자기 스레드에서 실행한다.
-                int drained = 0;
-                int maxDrain = _options.MaxTimerDrainPerTick;
-                while (drained < maxDrain && TimerDispatchQueue.TryDequeue(out var item))
-                {
-                    try
-                    {
-                        item.Owner.DoTask(item.Job);
-                    }
-                    catch (Exception ex)
-                    {
-                        JobLog.Error("Timer-dispatched job failed", ex);
-                        AsyncExecutable.OnError?.Invoke(ex);
-                    }
-                    drained++;
-                }
-
-                if (!runner.Run(_cts.Token))
-                    break;
-            }
-
+            WorkerLoop(slot, _cts.Token);
             exitedNormally = true;
         }
         catch (OperationCanceledException)
@@ -122,79 +176,203 @@ public sealed class JobDispatcher<T> : IDisposable, IAsyncDisposable where T : I
         }
         catch (Exception ex)
         {
-            JobLog.Error($"Worker slot #{slot} crashed", ex);
-            AsyncExecutable.OnError?.Invoke(ex);
+            var running = ThreadContext.CurrentExecuter;
+            var where = running is null ? string.Empty : $" while running actor '{running.Name}'";
+            System.Logger.Error($"Worker slot #{slot} crashed{where}", ex);
+            AsyncExecutable.RaiseGlobalError(ex);
+        }
+        finally
+        {
+            ThreadContext.CurrentExecuter = null;
+            ThreadContext.IsWorkerThread = false;
+            ThreadContext.CurrentSystem = null;
+            System.UnregisterWorker();
         }
 
-        // 정리 (finally 가 아닌 일반 흐름 — 아래에서 return 으로 빠져나가야 하므로)
-        try { runner?.Dispose(); } catch { }
-        try { ThreadContext.Timer.Dispose(); } catch { }
-
-        // supervisor 처리: 비정상 종료 + 재시작 정책 활성 + dispatcher 살아있음 → 재기동
         if (!exitedNormally
-            && _options.RestartFailedWorkers
+            && Options.RestartFailedWorkers
             && Volatile.Read(ref _disposed) == 0
             && !_cts.IsCancellationRequested)
         {
-            int attempts = Interlocked.Increment(ref _restartCounts[slot]);
-            if (attempts <= _options.MaxRestartsPerWorker)
-            {
-                JobMetrics.IncrementWorkerRestarts();
-                var backoff = TimeSpan.FromMilliseconds(
-                    _options.RestartBackoff.TotalMilliseconds * Math.Pow(2, attempts - 1));
-                JobLog.Warn($"Restarting worker slot #{slot} (attempt {attempts}/{_options.MaxRestartsPerWorker}) after {backoff.TotalMilliseconds:F0}ms");
-
-                Thread.Sleep(backoff);
-
-                if (Volatile.Read(ref _disposed) == 0 && !_cts.IsCancellationRequested)
-                {
-                    StartWorkerOnSlot(slot, isRestart: true);
-                    return; // 재기동했으니 본 스레드는 종료, 완료 카운트는 증가시키지 않음
-                }
-            }
-            else
-            {
-                JobLog.Error($"Worker slot #{slot} exceeded max restarts ({_options.MaxRestartsPerWorker}) — permanently down");
-            }
+            if (TryRestart(slot))
+                return;
         }
 
-        // 정상/한도초과/dispatcher 종료 — 워커 슬롯 1개 완료로 카운트
-        if (Interlocked.Increment(ref _completedWorkers) == _workerCount)
+        if (Interlocked.Increment(ref _completedWorkers) == WorkerCount)
             _allWorkersDone?.TrySetResult();
     }
 
-    /// <summary>현재 살아있는 워커 스레드 수 (메트릭).</summary>
-    public int LiveWorkerCount
+    private bool TryRestart(int slot)
     {
-        get
+        // A slot that has been healthy for a while gets its budget back.
+        if (Options.RestartCountResetAfter > TimeSpan.Zero
+            && Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastStartTimestamps[slot])) >= Options.RestartCountResetAfter)
         {
-            int alive = 0;
-            foreach (var t in _threads)
-                if (t is { IsAlive: true }) alive++;
-            return alive;
+            Interlocked.Exchange(ref _restartCounts[slot], 0);
+        }
+
+        var attempts = Interlocked.Increment(ref _restartCounts[slot]);
+        if (attempts > Options.MaxRestartsPerWorker)
+        {
+            System.Logger.Error(
+                $"Worker slot #{slot} exceeded max restarts ({Options.MaxRestartsPerWorker}) — permanently down");
+            return false;
+        }
+
+        System.Metrics.OnWorkerRestart();
+        var backoff = TimeSpan.FromMilliseconds(
+            Options.RestartBackoff.TotalMilliseconds * Math.Pow(2, attempts - 1));
+        System.Logger.Warn(
+            $"Restarting worker slot #{slot} (attempt {attempts}/{Options.MaxRestartsPerWorker}) after {backoff.TotalMilliseconds:F0}ms");
+
+        Thread.Sleep(backoff);
+
+        // Re-check and start under the lifecycle lock so the decision cannot be overtaken by a
+        // TryStop that has already passed its own scan of the thread array.
+        lock (_lifecycleLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _cts.IsCancellationRequested)
+                return false;
+
+            StartWorkerOnSlot(slot, isRestart: true);
+            return true;
         }
     }
 
-    public void Dispose()
+    /// <summary>The body of one worker thread. Runs until the token is cancelled.</summary>
+    protected abstract void WorkerLoop(int slot, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Do one pass over the system ready queue. Returns the number of items handled.
+    /// Worker loops should call this before their own work so timers and scheduled actors
+    /// are not starved.
+    /// </summary>
+    protected int PumpReadyQueue()
+    {
+        ThreadContext.TickCount = System.CurrentTick;
+        return System.DrainReady(Options.MaxReadyDrainPerTick);
+    }
+
+    /// <summary>
+    /// Stop the workers and wait for them to exit.
+    /// </summary>
+    /// <param name="joinTimeout">How long to wait for each worker thread.</param>
+    /// <returns><c>true</c> if every worker exited within the timeout.</returns>
+    public bool TryStop(TimeSpan joinTimeout)
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            return;
+            return true;
 
-        // 신규 입력 차단은 사용자 책임 (process-wide static 이므로 자동 토글하지 않음).
-        // 셧다운 시퀀스: AsyncExecutable.AcceptingWork = false → 잔여 작업 drain → dispatcher.Dispose.
+        System.DetachDispatcher(this);
 
-        _cts.Cancel();
-        foreach (var thread in _threads)
+        Thread[] snapshot;
+        lock (_lifecycleLock)
         {
-            if (thread is { IsAlive: true })
-                thread.Join(TimeSpan.FromSeconds(5));
+            // Cancelling inside the lock means any restart still deciding either lands before this
+            // (and is therefore in the snapshot) or sees the cancellation and gives up.
+            _cts.Cancel();
+            snapshot = (Thread[])_threads.Clone();
         }
-        _cts.Dispose();
+
+        System.SignalWork();
+
+        var allStopped = true;
+        foreach (var thread in snapshot)
+        {
+            if (thread is not { IsAlive: true })
+                continue;
+
+            System.SignalWork();
+            if (thread.Join(joinTimeout))
+                continue;
+
+            allStopped = false;
+            System.Logger.Error(
+                $"Worker thread '{thread.Name}' did not stop within {joinTimeout.TotalMilliseconds:F0}ms. " +
+                "A job is probably blocking (a lock, a synchronous wait, or an infinite loop).");
+        }
+
+        // Only safe to dispose once every worker has genuinely left; a straggler still reads the
+        // token, and an ObjectDisposedException there surfaces as a bogus "worker crashed" log.
+        if (allStopped)
+            _cts.Dispose();
+
+        return allStopped;
     }
 
+    /// <inheritdoc />
+    public void Dispose() => TryStop(TimeSpan.FromSeconds(5));
+
+    /// <inheritdoc />
     public ValueTask DisposeAsync()
     {
         Dispose();
         return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Worker pool with no user loop: every worker blocks until the job system has work, runs it, and
+/// blocks again. No polling, no <c>Thread.Sleep(1)</c>, and idle workers cost nothing.
+///
+/// This is the right dispatcher for a server whose work all arrives as actor jobs, timer firings
+/// and <see cref="JobSystem.Post(Action)"/> calls. Use <see cref="JobDispatcher{T}"/> instead when
+/// workers need their own per-iteration loop.
+/// </summary>
+public sealed class JobDispatcher : JobDispatcherBase
+{
+    /// <summary>Create a pool of <paramref name="workerCount"/> workers on <see cref="JobSystem.Default"/>.</summary>
+    public JobDispatcher(int workerCount) : this(workerCount, null) { }
+
+    /// <summary>Create a pool with explicit options.</summary>
+    public JobDispatcher(int workerCount, JobDispatcherOptions? options) : base(workerCount, options) { }
+
+    /// <inheritdoc />
+    protected override void WorkerLoop(int slot, CancellationToken cancellationToken)
+    {
+        var idleWait = Math.Max(1, Options.IdleWaitMs);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (PumpReadyQueue() == 0)
+                System.WaitForWork(idleWait);
+        }
+    }
+}
+
+/// <summary>
+/// Worker pool that runs a user-supplied <see cref="IRunnable"/> loop on each dedicated OS thread,
+/// draining the job system's ready queue before every iteration.
+///
+/// Threads are real OS threads, not thread-pool threads, so per-thread state and long-running loops
+/// are safe.
+/// </summary>
+public sealed class JobDispatcher<T> : JobDispatcherBase where T : IRunnable, new()
+{
+    /// <summary>Create a pool of <paramref name="workerCount"/> workers on <see cref="JobSystem.Default"/>.</summary>
+    public JobDispatcher(int workerCount) : this(workerCount, null) { }
+
+    /// <summary>Create a pool with explicit options.</summary>
+    public JobDispatcher(int workerCount, JobDispatcherOptions? options) : base(workerCount, options) { }
+
+    /// <inheritdoc />
+    protected override void WorkerLoop(int slot, CancellationToken cancellationToken)
+    {
+        var runner = new T();
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                PumpReadyQueue();
+
+                if (!runner.Run(cancellationToken))
+                    break;
+            }
+        }
+        finally
+        {
+            try { runner.Dispose(); }
+            catch (Exception ex) { System.Logger.Error($"Worker slot #{slot} runner disposal failed", ex); }
+        }
     }
 }

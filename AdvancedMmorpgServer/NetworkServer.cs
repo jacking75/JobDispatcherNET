@@ -14,10 +14,10 @@ namespace AdvancedMmorpgServer;
 ///   - 세션마다 RecvIO / SendIO 전용 OS 스레드 1개씩
 ///   - 송신 큐는 BlockingCollection&lt;string&gt; (BoundedCapacity) — slow client drop
 ///
-/// 라이브러리 활용 포인트:
-///   IO 스레드는 절대 PacketHandler/World 를 직접 호출하지 않는다.
-///   세션별 <see cref="Sequencer{T}"/> 로 패킷을 enqueue 만 하고,
-///   워커 스레드가 dequeue 하여 처리한다 → actor 의 leader 가 항상 워커.
+/// How the library is used here:
+///   an IO thread never calls PacketHandler or the world directly. It only pushes lines into the
+///   session's <see cref="Sequencer{T}"/>, which hands the drain to the job system's worker pool.
+///   Actor code therefore always runs on a worker, never on a socket thread.
 /// </summary>
 public sealed class NetworkServer
 {
@@ -103,10 +103,10 @@ public sealed class NetworkServer
     }
 
     /// <summary>
-    /// 세션이 닫힐 때 dict 에서만 제거. RemovePlayer 호출은 세션의 패킷 sequencer 가
-    /// DisconnectMarker 를 워커 스레드에서 처리할 때 일어난다 (잔여 패킷 처리 순서 보장).
-    /// 서버 셧다운 시 sequencer 가 stop 되어 marker 가 처리되지 않으면
-    /// GameWorld.Stop 이 모든 플레이어를 일괄 despawn 하므로 누수 없음.
+    /// Only removes the session from the map. RemovePlayer happens when the sequencer reaches the
+    /// disconnect marker on a worker, after every packet that arrived before it — and Stop() now
+    /// guarantees that marker is still drained, so a disconnect can no longer leave a ghost player
+    /// behind.
     /// </summary>
     private void OnSessionClosed(ClientSession s)
     {
@@ -117,11 +117,11 @@ public sealed class NetworkServer
 /// <summary>
 /// 단일 클라이언트 세션. RecvIO / SendIO 가 별도의 OS 스레드에서 동기 IO 로 동작.
 ///
-/// 패킷 처리 위임:
-///   RecvIO → <see cref="Sequencer{T}.Enqueue"/> 로 패킷 라인 push 만.
-///   Sequencer 의 scheduleDrain 콜백은 <see cref="GameWorker.InboundCommands"/> 에 Drain 명령 push.
-///   워커 스레드가 dequeue → DrainPackets 호출 → PacketHandler.Handle 을 워커 스레드에서 실행.
-///   같은 세션은 한 시점에 한 워커만 drain → 같은 클라이언트 패킷 순서 보장.
+/// Packet handling:
+///   RecvIO only calls <see cref="Sequencer{T}.Enqueue"/>. The sequencer schedules its drain onto
+///   the job system (<see cref="JobSystem.Post(Action)"/>), a worker picks it up, and
+///   PacketHandler.Handle runs there. One session is drained by one worker at a time, so a
+///   client's packets keep their arrival order.
 /// </summary>
 public sealed class ClientSession
 {
@@ -160,10 +160,12 @@ public sealed class ClientSession
         _onClosed = onClosed;
         _stream = tcp.GetStream();
 
+        // The system-aware constructor schedules drains straight onto the worker pool — the
+        // hand-rolled inbound command queue this sample used to need is gone.
         _packetSequencer = new Sequencer<string>(
+            server.System,
             handler: HandleOnePacket,
-            scheduleDrain: drainAction => GameWorker.InboundCommands.Enqueue(drainAction),
-            onError: ex => JobLog.Error($"[세션 #{connId}] 패킷 처리 오류", ex));
+            onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex));
     }
 
     public void OnLoggedIn(int playerId)
@@ -306,7 +308,8 @@ public sealed class ClientSession
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) return;
 
-        // sequencer 중지 (큐에 남은 것은 워커가 drain 마저 함)
+        // Refuse new packets; whatever was already accepted (including the disconnect marker)
+        // is still drained in order.
         _packetSequencer.Stop();
 
         // 송신 큐 종료 → SendLoop 자연 종료
@@ -335,8 +338,12 @@ public sealed class ClientSession
             return;
         }
 
-        // disconnect 도 패킷 큐의 마지막에 넣어 순서 보장 (Stop 전에 한 번 더 enqueue)
-        try { _packetSequencer.Enqueue(DisconnectMarker); } catch { }
+        // The disconnect goes through the same queue so it runs after every pending packet.
+        if (!_packetSequencer.Enqueue(DisconnectMarker) && PlayerId != 0)
+        {
+            // The sequencer was already stopped (server shutdown): remove the player directly.
+            _server.World.RemovePlayer(PlayerId);
+        }
 
         Close();
         JobLog.Info($"[Session #{ConnectionId}] closed, sent={Interlocked.Read(ref _sentCount)}, dropped={Volatile.Read(ref _droppedCount)}");

@@ -10,6 +10,9 @@ public sealed class PlayerActor : AsyncExecutable
     private readonly GameWorld _world;
     private volatile bool _despawned;
 
+    private ITimerHandle? _resyncTimer;
+    private ITimerHandle? _respawnTimer;
+
     public Player Player => _player;
     public int Id => _player.Id;
     public bool Despawned => _despawned;
@@ -17,13 +20,12 @@ public sealed class PlayerActor : AsyncExecutable
     public PlayerActor(Player p, GameWorld world)
         : base(new JobOptions
         {
+            Name = $"Player#{p.Id}",
+            System = world.System,
             MaxQueueSize = PlayerQueueCapacity,
             DropPolicy = DropPolicy.Reject,
-            OnDropped = (actor, _) =>
-            {
-                if (actor is PlayerActor pa)
-                    JobLog.Warn($"[Player #{pa.Id}] queue full, rejected job");
-            },
+            OnDropped = static (actor, reason) =>
+                JobLog.Warn($"[{actor.Name}] job refused ({reason})"),
         })
     {
         _player = p;
@@ -56,8 +58,10 @@ public sealed class PlayerActor : AsyncExecutable
         if (_despawned) return;
         Aoi.EnterWorld(_world.Spatial, _player);
 
+        // A repeating timer instead of a job that re-schedules itself: one handle to cancel at
+        // despawn, and one missed tick no longer breaks the chain for good.
         if (_world.AoiResyncInterval > TimeSpan.Zero)
-            DoAsyncAfter(_world.AoiResyncInterval, ResyncTick);
+            _resyncTimer = DoAsyncEvery(_world.AoiResyncInterval, ResyncTick);
     }
 
     private void ResyncTick()
@@ -73,8 +77,6 @@ public sealed class PlayerActor : AsyncExecutable
             foreach (var e in g[gx, gy].Entities.Values)
                 _player.SendPacket?.Invoke(Packets.Spawn(e));
         }
-
-        DoAsyncAfter(_world.AoiResyncInterval, ResyncTick);
     }
 
     private void ProcessMove(float newX, float newY)
@@ -124,7 +126,7 @@ public sealed class PlayerActor : AsyncExecutable
         if (!_player.IsAlive)
         {
             Aoi.Publish(s, Packets.Death(_player.Id, atk.AttackerId));
-            DoAsyncAfter(TimeSpan.FromSeconds(5), TryRespawn);
+            _respawnTimer = DoAsyncAfter(TimeSpan.FromSeconds(5), static a => a.TryRespawn(), this);
         }
     }
 
@@ -150,6 +152,11 @@ public sealed class PlayerActor : AsyncExecutable
     {
         if (_despawned) return;
         _despawned = true;
+
+        // Cancelling releases the timers so shutdown can actually reach quiescence.
+        _resyncTimer?.Cancel();
+        _respawnTimer?.Cancel();
+
         Aoi.LeaveWorld(_world.Spatial, _player);
     }
 }

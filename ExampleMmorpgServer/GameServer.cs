@@ -34,7 +34,7 @@ public class GameServer
     {
         Console.WriteLine("========================================");
         Console.WriteLine($"  MMORPG 서버 시작");
-        Console.WriteLine($"  존: {_zone.Name} | 워커 스레드: {_workerCount}개");
+        Console.WriteLine($"  존: {_zone.DisplayName} | 워커 스레드: {_workerCount}개");
         Console.WriteLine($"  구조: GameZone(actor) + 플레이어별 PlayerActor(actor)");
         Console.WriteLine("========================================\n");
 
@@ -56,11 +56,9 @@ public class GameServer
         // ValueTask 를 Task 로 바꿔 한 번만 차단
         _zone.DisposeAsync().AsTask().Wait();
 
-        // 워커 스레드 정지 + Join (동기)
-        _dispatcher?.Dispose();
-
-        // 비-워커 스레드(IO/메인/시뮬레이션 스레드)에서 만들어졌을 수 있는 TimerQueue 정리
-        TimerRegistry.DisposeAll();
+        // v2.1: 남은 작업 drain → 타이머 스레드 정지 → 워커 정지까지 한 번에.
+        // 타이머는 JobSystem 이 소유하므로 TimerRegistry 정리가 더 이상 필요 없다.
+        _zone.System.StopAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
 
         Console.WriteLine("서버가 종료되었습니다.");
     }

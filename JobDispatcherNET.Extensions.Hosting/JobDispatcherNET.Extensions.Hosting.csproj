@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>JobDispatcherNET.Extensions.Hosting</PackageId>
+    <Title>JobDispatcherNET.Extensions.Hosting</Title>
+    <Description>Generic Host integration for JobDispatcherNET. One AddJobDispatcher call registers the JobSystem and its worker pool, routes library logging into ILogger, starts the workers as an IHostedService, drains in-flight jobs on shutdown and exposes a worker health check.</Description>
+    <PackageTags>actor;game-server;hosting;dependency-injection;ihostedservice;healthcheck;dispatcher;concurrency</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>See https://github.com/jacking75/JobDispatcherNET/blob/main/CHANGELOG.md</PackageReleaseNotes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\JobDispatcherNET\JobDispatcherNET.csproj" />
+    <ProjectReference Include="..\JobDispatcherNET.Extensions.Logging\JobDispatcherNET.Extensions.Logging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Microsoft.Extensions.DependencyInjection.Abstractions arrives transitively through
+         Hosting.Abstractions and Options; it is not referenced directly on purpose. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="8.0.11" />
+    <!-- IHealthChecksBuilder (the registration seam AddJobDispatcher hangs off) ships in the
+         non-abstractions package; the Abstractions package only carries IHealthCheck and friends. -->
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="8.0.11" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>

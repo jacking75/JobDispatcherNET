@@ -1,7 +1,7 @@
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 9100
+    "port": 25100
   },
   "screen": {
     "width": 2560,

@@ -22,7 +22,8 @@
 
 ## 2.2 큐(Queue)가 직렬 실행을 만드는 원리
 
-JobDispatcherNET에서 모든 Actor는 **Channel(채널)**이라는 큐를 가집니다. 외부에서 작업을 넣으면(DoAsync), Actor는 큐에서 하나씩 꺼내 처리합니다.
+JobDispatcherNET에서 모든 Actor는 자기만의 **작업 큐**(`ConcurrentQueue<JobEntry>`)를 가집니다.
+외부에서 작업을 넣으면(DoAsync), Actor는 큐에서 하나씩 꺼내 처리합니다.
 
 ```
                    외부 스레드들
@@ -31,7 +32,7 @@ JobDispatcherNET에서 모든 Actor는 **Channel(채널)**이라는 큐를 가�
             │ DoAsync()  │ DoAsync() │ DoAsync()
             ▼            ▼           ▼
          ┌────────────────────────────────┐
-         │       Channel<JobEntry>        │
+         │   ConcurrentQueue<JobEntry>    │
          │  ┌────────┐┌────────┐┌──────┐ │
          │  │ 작업 1 ││ 작업 2 ││작업3 │ │
          │  └───┬────┘└───┬────┘└──┬───┘ │
@@ -46,7 +47,9 @@ JobDispatcherNET에서 모든 Actor는 **Channel(채널)**이라는 큐를 가�
          └──────────────────────────┘
 ```
 
-여러 스레드가 동시에 DoAsync를 호출해도, Channel 안에서 순서가 정해지고 하나씩 실행됩니다.
+여러 스레드가 동시에 DoAsync를 호출해도, 큐 안에서 순서가 정해지고 하나씩 실행됩니다.
+"동시에 실행하는 스레드는 최대 하나"라는 보장은 큐 자체가 아니라 **입장 카운터의 CAS** 가
+만듭니다 (3.3에서 자세히).
 
 ---
 
@@ -243,19 +246,13 @@ Actor 모델이 완벽한 것은 아닙니다. 다음 상황에서는 여전히 
 private static readonly ConcurrentDictionary<int, Entity> _index = new();
 
 // 예외 상황 2: Actor 외부에서 읽어야 하는 경우
-// GetSnapshot() 패턴을 사용합니다
+// 읽기도 큐를 통과시킨다 — Ask(async 호출자) / AskSync(동기 호출자)
+public Task<SomeSnapshot> GetSnapshotAsync()
+    => Ask(() => new SomeSnapshot(/* 현재 상태 복사 */));
+
 public SomeSnapshot GetSnapshot()
-{
-    var ev = new ManualResetEventSlim(false);
-    SomeSnapshot? result = null;
-    DoAsync(() =>
-    {
-        result = new SomeSnapshot(/* 현재 상태 복사 */);
-        ev.Set();
-    });
-    ev.Wait();    // ← 큐가 처리할 때까지 대기
-    return result!;
-}
+    => AskSync(() => new SomeSnapshot(/* 현재 상태 복사 */), TimeSpan.FromSeconds(2));
+    // ★ AskSync 는 actor 작업 안에서 호출하면 예외를 던진다 (데드락 방지)
 ```
 
 이 패턴들은 Chapter 10에서 채팅 서버 예제로 자세히 다룹니다.
@@ -268,7 +265,7 @@ public SomeSnapshot GetSnapshot()
 이번 장에서 배운 것
 ──────────────────────────────────────────────
 ✓ 직렬 실행 = 한 번에 하나씩 순서대로 처리
-✓ Channel(큐)이 직렬 실행을 자동으로 보장
+✓ actor 마다의 큐 + 입장 CAS 가 직렬 실행을 보장
 ✓ Actor = AsyncExecutable을 상속한 클래스
 ✓ Handle*(외부 진입) / Process*(실제 처리) 패턴
 ✓ Actor 간 통신 = DoAsync를 통한 메시지 패싱

@@ -1,64 +1,123 @@
 namespace JobDispatcherNET;
 
+/// <summary>Severity of a library log line.</summary>
 public enum JobLogLevel
 {
+    /// <summary>Verbose detail, off in production.</summary>
     Debug,
+
+    /// <summary>Lifecycle events: workers starting, systems stopping.</summary>
     Info,
+
+    /// <summary>Something recoverable that an operator should see: drops, restarts, slow jobs.</summary>
     Warn,
+
+    /// <summary>A job or worker failed.</summary>
     Error,
 }
 
 /// <summary>
-/// 라이브러리 내부 로깅 추상화. 기본 구현은 <see cref="ConsoleJobLogger"/>.
-/// 상용 환경에서는 Serilog/Microsoft.Extensions.Logging 어댑터로 교체.
+/// Logging seam. The library never writes to the console directly through anything else, so
+/// swapping this out is enough to route everything into Serilog, NLog or
+/// <c>Microsoft.Extensions.Logging</c> — see the <c>JobDispatcherNET.Extensions.Logging</c> package.
 /// </summary>
 public interface IJobLogger
 {
+    /// <summary>Cheap check callers use before building a message string.</summary>
     bool IsEnabled(JobLogLevel level);
+
+    /// <summary>Write one line.</summary>
     void Log(JobLogLevel level, string message, Exception? exception = null);
 }
 
+/// <summary>Level helpers so callers do not repeat the <see cref="IJobLogger.IsEnabled"/> dance.</summary>
+public static class JobLoggerExtensions
+{
+    /// <summary>Log at <see cref="JobLogLevel.Debug"/>.</summary>
+    public static void Debug(this IJobLogger logger, string message)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        if (logger.IsEnabled(JobLogLevel.Debug)) logger.Log(JobLogLevel.Debug, message);
+    }
+
+    /// <summary>Log at <see cref="JobLogLevel.Info"/>.</summary>
+    public static void Info(this IJobLogger logger, string message)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        if (logger.IsEnabled(JobLogLevel.Info)) logger.Log(JobLogLevel.Info, message);
+    }
+
+    /// <summary>Log at <see cref="JobLogLevel.Warn"/>.</summary>
+    public static void Warn(this IJobLogger logger, string message)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        if (logger.IsEnabled(JobLogLevel.Warn)) logger.Log(JobLogLevel.Warn, message);
+    }
+
+    /// <summary>Log at <see cref="JobLogLevel.Error"/>.</summary>
+    public static void Error(this IJobLogger logger, string message, Exception? exception = null)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        if (logger.IsEnabled(JobLogLevel.Error)) logger.Log(JobLogLevel.Error, message, exception);
+    }
+}
+
 /// <summary>
-/// 라이브러리 전역 로거. 사용자가 Set 하지 않으면 <see cref="ConsoleJobLogger"/> 사용.
+/// Process-wide default logger, used by any <see cref="JobSystem"/> that was not given its own
+/// through <see cref="JobSystemOptions.Logger"/>.
 /// </summary>
 public static class JobLog
 {
     private static IJobLogger _instance = new ConsoleJobLogger();
 
+    /// <summary>The current default logger. Never null.</summary>
     public static IJobLogger Current
     {
         get => _instance;
         set => _instance = value ?? throw new ArgumentNullException(nameof(value));
     }
 
-    public static void Debug(string message) { if (_instance.IsEnabled(JobLogLevel.Debug)) _instance.Log(JobLogLevel.Debug, message); }
-    public static void Info(string message)  { if (_instance.IsEnabled(JobLogLevel.Info))  _instance.Log(JobLogLevel.Info,  message); }
-    public static void Warn(string message)  { if (_instance.IsEnabled(JobLogLevel.Warn))  _instance.Log(JobLogLevel.Warn,  message); }
-    public static void Error(string message, Exception? ex = null)
-    {
-        if (_instance.IsEnabled(JobLogLevel.Error)) _instance.Log(JobLogLevel.Error, message, ex);
-    }
+    /// <summary>Log at <see cref="JobLogLevel.Debug"/>.</summary>
+    public static void Debug(string message) => _instance.Debug(message);
+
+    /// <summary>Log at <see cref="JobLogLevel.Info"/>.</summary>
+    public static void Info(string message) => _instance.Info(message);
+
+    /// <summary>Log at <see cref="JobLogLevel.Warn"/>.</summary>
+    public static void Warn(string message) => _instance.Warn(message);
+
+    /// <summary>Log at <see cref="JobLogLevel.Error"/>.</summary>
+    public static void Error(string message, Exception? exception = null) => _instance.Error(message, exception);
 }
 
 /// <summary>
-/// 콘솔 출력 기본 로거. Warn/Error 만 출력하여 hot path Console.WriteLine 폭주를 막는다.
+/// Console logger. Defaults to <see cref="JobLogLevel.Warn"/> so a hot path cannot flood stdout.
 /// </summary>
 public sealed class ConsoleJobLogger : IJobLogger
 {
+    /// <summary>Lowest level that is written. Default <see cref="JobLogLevel.Warn"/>.</summary>
     public JobLogLevel MinLevel { get; init; } = JobLogLevel.Warn;
 
+    /// <inheritdoc />
     public bool IsEnabled(JobLogLevel level) => level >= MinLevel;
 
+    /// <inheritdoc />
     public void Log(JobLogLevel level, string message, Exception? exception = null)
     {
         var writer = level >= JobLogLevel.Warn ? Console.Error : Console.Out;
-        writer.WriteLine($"[JobDispatcherNET][{level}] {message}{(exception is null ? string.Empty : $"\n{exception}")}");
+        writer.WriteLine($"[JobDispatcherNET][{level}] {message}{(exception is null ? string.Empty : $"{Environment.NewLine}{exception}")}");
     }
 }
 
-/// <summary>로그를 완전히 끄고 싶을 때.</summary>
+/// <summary>Discards everything. Use in benchmarks and tests.</summary>
 public sealed class NullJobLogger : IJobLogger
 {
+    /// <summary>A shared instance.</summary>
+    public static readonly NullJobLogger Instance = new();
+
+    /// <inheritdoc />
     public bool IsEnabled(JobLogLevel level) => false;
+
+    /// <inheritdoc />
     public void Log(JobLogLevel level, string message, Exception? exception = null) { }
 }

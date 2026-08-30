@@ -13,7 +13,7 @@ public sealed class ClientConfig
     public sealed class ServerSection
     {
         public string Host { get; set; } = "127.0.0.1";
-        public int Port { get; set; } = 9100;
+        public int Port { get; set; } = 25100;
     }
 
     public sealed class ScreenSection

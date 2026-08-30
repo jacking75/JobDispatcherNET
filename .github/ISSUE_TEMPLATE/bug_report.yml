@@ -1,0 +1,119 @@
+name: Bug report
+description: Something behaves differently from what the documentation promises.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most reports against a concurrency library come down to a timing window, so the
+        details below are what make a report actionable. A hang, a job that runs twice,
+        or a job that never runs is almost always reproducible once we know the worker
+        count and whether the queue is bounded — please do not skip those fields.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: One or two sentences. Save the detail for the fields below.
+      placeholder: Jobs stop being executed on one actor after roughly an hour under load.
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Name and version. Say if it is a container, a VM, or a CI runner.
+      placeholder: Windows Server 2022 21H2 / Ubuntu 24.04 in a Docker container
+    validations:
+      required: true
+
+  - type: input
+    id: dotnet-version
+    attributes:
+      label: .NET version
+      description: Output of `dotnet --info` (the runtime line is enough), and the target framework you build against.
+      placeholder: SDK 10.0.301, running on net8.0
+    validations:
+      required: true
+
+  - type: input
+    id: package-version
+    attributes:
+      label: JobDispatcherNET version
+      description: NuGet package version, or the commit SHA if you build from source.
+      placeholder: 2.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: worker-count
+    attributes:
+      label: Worker count
+      description: The `workerCount` passed to `JobDispatcher` / `JobDispatcher<T>`. Enter 0 if you run without a dispatcher.
+      placeholder: "8"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: max-queue-size
+    attributes:
+      label: Is JobOptions.MaxQueueSize set?
+      description: Bounded and unbounded queues take different admission paths, so this changes where we look first.
+      options:
+        - "No — unbounded (the default)"
+        - "Yes — bounded, and drops are handled via OnDropped"
+        - "Yes — bounded, and the return value of DoAsync is ignored"
+    validations:
+      required: true
+
+  - type: input
+    id: max-queue-size-value
+    attributes:
+      label: MaxQueueSize value
+      description: Leave blank if the queue is unbounded.
+      placeholder: "1024"
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >
+        A self-contained program we can compile and run. Trim it to the smallest thing
+        that still shows the problem — remove your domain types, your network layer and
+        your logging. If it only reproduces under load, say how much load and how long.
+      render: csharp
+      placeholder: |
+        using JobDispatcherNET;
+
+        using var system = new JobSystem(new JobSystemOptions { Name = "repro" });
+        using var dispatcher = new JobDispatcher(workerCount: 4, new JobDispatcherOptions { System = system });
+        await dispatcher.RunWorkerThreadsAsync();
+        // ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behaviour
+      description: What actually happens. Include exception text with the full stack trace, and metric values (`system.Metrics.Snapshot()`) if you have them.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected instead, and what made you expect it (README section, XML doc, Book chapter).
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Optional. How often it reproduces (1 in 10 runs? only in Release? only on Linux?),
+        whether it started after an upgrade, a stack dump of the hung threads, and so on.

@@ -1,0 +1,13 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or design discussion
+    url: https://github.com/jacking75/JobDispatcherNET/discussions
+    about: >
+      "How do I ...", "is this the right pattern", threading-model questions and
+      show-and-tell belong in Discussions rather than the issue tracker.
+
+  - name: Security vulnerability
+    url: https://github.com/jacking75/JobDispatcherNET/security/advisories/new
+    about: >
+      Report privately. Thread-safety defects that can corrupt state count as
+      security-relevant here — see SECURITY.md.

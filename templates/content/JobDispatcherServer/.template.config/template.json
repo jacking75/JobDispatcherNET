@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "jacking75",
+  "classifications": [ "Console", "Game", "Server", "Actor", "Concurrency" ],
+  "identity": "JobDispatcherNET.Server.CSharp",
+  "name": "JobDispatcherNET actor server",
+  "shortName": "jobdispatcher-server",
+  "description": "A minimal but production-shaped actor server: a dedicated worker pool, bounded actor queues with a drop callback, a repeating timer, metrics and a one-call graceful shutdown.",
+  "tags": {
+    "language": "C#",
+    "type": "project"
+  },
+  "sourceName": "JobDispatcherServer",
+  "preferNameDirectory": true,
+  "symbols": {
+    "Framework": {
+      "type": "parameter",
+      "description": "The target framework for the project.",
+      "datatype": "choice",
+      "choices": [
+        { "choice": "net10.0", "description": "Target .NET 10" },
+        { "choice": "net8.0", "description": "Target .NET 8" }
+      ],
+      "defaultValue": "net10.0",
+      "replaces": "net10.0"
+    },
+    "Workers": {
+      "type": "parameter",
+      "description": "Number of dedicated worker threads.",
+      "datatype": "integer",
+      "defaultValue": "4",
+      "replaces": "WORKER_COUNT"
+    },
+    "Port": {
+      "type": "parameter",
+      "description": "TCP port the server listens on.",
+      "datatype": "integer",
+      "defaultValue": "25150",
+      "replaces": "LISTEN_PORT"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "server": {
-    "port": 9100,
+    "port": 25100,
     "workerThreads": 8,
     "aoiResyncIntervalMs": 3000
   },

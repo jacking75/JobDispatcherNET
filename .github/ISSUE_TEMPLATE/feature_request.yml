@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose an API or a behaviour the library does not have yet.
+title: "[feat] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The core library has zero external dependencies and is deliberately small, so the
+        bar for new surface area is "several users cannot do this without it". Proposals
+        that fit an existing extension package, a sample, or documentation usually land faster.
+
+        Check [ROADMAP.md](https://github.com/jacking75/JobDispatcherNET/blob/main/ROADMAP.md)
+        first — the thing you want may already be planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what makes it awkward today? Describe the situation, not the API you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behaviour
+      description: Sketch the signatures or the behaviour change. Say whether it is source-compatible with 2.x.
+      render: csharp
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: The workaround you currently use, and why it is not good enough.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Where does this belong?
+      options:
+        - Core library (JobDispatcherNET)
+        - Extensions.Hosting
+        - Extensions.Logging
+        - A sample or benchmark
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Prior art in other actor libraries, performance expectations, whether you would be willing to open the PR.

@@ -1,33 +1,112 @@
 namespace JobDispatcherNET;
 
-/// <summary>
-/// 큐가 가득 찼을 때 정책.
-/// </summary>
+/// <summary>Policy applied when an actor queue is full.</summary>
 public enum DropPolicy
 {
-    /// <summary>새 작업을 즉시 거부하고 OnDropped 콜백 호출. 호출자가 backpressure 인지.</summary>
+    /// <summary>Reject the job and invoke <see cref="JobOptions.OnDropped"/> so the caller sees back-pressure.</summary>
     Reject,
 
-    /// <summary>새 작업을 거부하되 OnDropped는 호출하지 않음(가장 조용함).</summary>
+    /// <summary>Reject the job without invoking <see cref="JobOptions.OnDropped"/>.</summary>
     Silent,
 }
 
+/// <summary>Why a job was refused.</summary>
+public enum DropReason
+{
+    /// <summary>The actor queue was at <see cref="JobOptions.MaxQueueSize"/>.</summary>
+    QueueFull,
+
+    /// <summary>The owning <see cref="JobSystem"/> is no longer accepting work.</summary>
+    ShuttingDown,
+
+    /// <summary>The actor has been disposed.</summary>
+    Disposed,
+
+    /// <summary>The actor tripped <see cref="JobOptions.MaxConsecutiveFailures"/> and is faulted.</summary>
+    Faulted,
+}
+
+/// <summary>Where an actor's jobs run when the first job arrives on an idle actor.</summary>
+public enum ExecutionMode
+{
+    /// <summary>
+    /// The producer that finds the actor idle flushes it inline, on its own thread.
+    /// Lowest latency, and the right choice for actor-to-actor calls inside a worker.
+    /// The caveat: a non-worker producer (socket IO thread, ThreadPool continuation,
+    /// an ASP.NET request thread) then runs actor code on that thread.
+    /// </summary>
+    LeaderFlush,
+
+    /// <summary>
+    /// A producer on a non-worker thread only hands the actor to the job system's ready queue
+    /// and returns; a worker thread flushes it. Producers on worker threads still flush inline.
+    /// Use this for actors reached directly from network / ThreadPool threads.
+    /// </summary>
+    Scheduled,
+}
+
+/// <summary>How an actor behaves while one of its jobs is awaiting.</summary>
+public enum AsyncReentrancy
+{
+    /// <summary>
+    /// Other queued jobs run while an async job awaits. Highest throughput; the actor's
+    /// invariants must tolerate a job observing state changed by jobs that ran during the await.
+    /// </summary>
+    Interleaved,
+
+    /// <summary>
+    /// The actor processes nothing else until the async job completes. Simplest to reason about,
+    /// but one slow await stalls the whole actor.
+    /// </summary>
+    Exclusive,
+}
+
 /// <summary>
-/// AsyncExecutable 인스턴스의 동작을 제어하는 옵션.
-/// 게임 서버처럼 long-running 환경에서는 unbounded 큐가 OOM 벡터가 되므로
-/// MaxQueueSize 를 명시하는 것을 권장한다.
+/// Per-actor options. In a long-running server an unbounded queue is an OOM vector,
+/// so setting <see cref="MaxQueueSize"/> is strongly recommended.
 /// </summary>
 public sealed record JobOptions
 {
-    /// <summary>기본값: 큐 무제한(예전 동작 그대로). 신규 코드는 명시적으로 한도를 설정할 것.</summary>
+    /// <summary>Defaults: unbounded queue, inline leader flush, interleaved async.</summary>
     public static readonly JobOptions Default = new();
 
-    /// <summary>actor 큐의 최대 작업 수. null = 무제한.</summary>
+    /// <summary>Optional name used in logs, metric tags and <c>ToString()</c>.</summary>
+    public string? Name { get; init; }
+
+    /// <summary>Maximum number of jobs (queued + in flight). <c>null</c> means unbounded.</summary>
     public int? MaxQueueSize { get; init; }
 
-    /// <summary>큐가 가득 찼을 때 정책. MaxQueueSize 가 null 이면 무시됨.</summary>
+    /// <summary>What to do when the queue is full. Ignored when <see cref="MaxQueueSize"/> is <c>null</c>.</summary>
     public DropPolicy DropPolicy { get; init; } = DropPolicy.Reject;
 
-    /// <summary>큐 만원으로 작업이 거부됐을 때 호출되는 콜백(actor, dropped job). DropPolicy.Reject 일 때만.</summary>
-    public Action<AsyncExecutable, JobEntry>? OnDropped { get; init; }
+    /// <summary>
+    /// Invoked when a job is refused, with the reason. Only called for <see cref="DropPolicy.Reject"/>.
+    /// The rejected job itself is not handed out — it is recycled by the library.
+    /// </summary>
+    public Action<AsyncExecutable, DropReason>? OnDropped { get; init; }
+
+    /// <summary>Which thread runs this actor's jobs. See <see cref="ExecutionMode"/>.</summary>
+    public ExecutionMode Mode { get; init; } = ExecutionMode.LeaderFlush;
+
+    /// <summary>
+    /// Fairness cap: after this many jobs the flushing thread yields the actor back to the
+    /// system ready queue instead of draining to empty. Prevents one hot actor from
+    /// monopolising a worker. Requires a running dispatcher; ignored when there are no workers.
+    /// Default <see cref="int.MaxValue"/> (drain to empty, the historical behaviour).
+    /// </summary>
+    public int MaxJobsPerFlush { get; init; } = int.MaxValue;
+
+    /// <summary>
+    /// After this many consecutive job failures the actor moves to a faulted state and refuses
+    /// further work until <see cref="AsyncExecutable.ClearFault"/> is called. 0 disables the check.
+    /// </summary>
+    public int MaxConsecutiveFailures { get; init; }
+
+    /// <summary>Behaviour while an async job awaits. See <see cref="AsyncReentrancy"/>.</summary>
+    public AsyncReentrancy AsyncReentrancy { get; init; } = AsyncReentrancy.Interleaved;
+
+    /// <summary>
+    /// The job system this actor belongs to. <c>null</c> uses <see cref="JobSystem.Default"/>.
+    /// </summary>
+    public JobSystem? System { get; init; }
 }

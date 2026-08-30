@@ -25,8 +25,13 @@ class Program
         await AdvancedExampleAsync();
 
         Console.WriteLine("\nAll examples completed");
-        Console.WriteLine("Press any key to exit...");
-        Console.ReadKey();
+        // Only wait for a keypress when a real console is attached. Under CI, or when stdin is
+        // redirected (dotnet run < /dev/null), ReadKey throws and takes the process down.
+        if (!Console.IsInputRedirected)
+        {
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey();
+        }
     }
 
 
@@ -106,10 +111,13 @@ class Program
     /// - DoAsync 첫 호출은 호출자 스레드(여기선 Main)에서 즉시 Flush 를 돌려 큐를 비운다.
     ///   같은 인스턴스에 들어온 후속 DoAsync 는 그 Flush 루프 안에서 함께 처리되므로,
     ///   결과적으로 한 인스턴스의 작업들은 "한 번에 하나씩" 직렬로 실행된다 (객체별 직렬 실행 보장).
-    /// - DoAsyncAfter 는 ThreadLocal TimerQueue 가 가진 자체 백그라운드 PeriodicTimer 로 발화하므로,
-    ///   호출 스레드가 워커가 아니어도 (Main 스레드여도) 지연 실행이 정상 트리거된다.
+    /// - DoAsyncAfter 는 JobSystem 이 소유한 전용 타이머 스레드가 발화시킨다. 워커가 하나도 없으면
+    ///   그 타이머 스레드에서 콜백을 직접 실행하고 경고를 한 번 남긴다 — 그래서 디스패처 없이도
+    ///   지연 실행이 동작한다. (v2.0 에서는 이 폴백이 없어 조용히 실행되지 않았고, 아래 Test count
+    ///   가 41 이 아니라 26 으로 나왔다.)
     /// 학습 포인트: 락 없이도 객체 상태를 안전하게 갱신할 수 있는 actor 스타일 모델의 핵심 API,
     ///            그리고 별도 디스패처 스레드 없이도 단독으로 쓸 수 있다는 점.
+    /// 기대 출력: Test count = 1 + 5 + (10 + 10) + 15 = 41
     /// </summary>
     static async Task BasicExampleAsync()
     {

@@ -32,13 +32,21 @@ public sealed class GameWorld : AsyncExecutable
     private int _nextEntityId;
     private readonly TimeSpan _tickInterval;
 
-    public GameWorld(ServerConfig cfg)
+    public GameWorld(ServerConfig cfg, JobSystem system)
         : base(new JobOptions
         {
+            Name = "World",
+            System = system,
             MaxQueueSize = WorldQueueCapacity,
             DropPolicy = DropPolicy.Reject,
-            OnDropped = (actor, _) => JobLog.Warn(
-                $"[World] queue full, rejected job (queue={actor.RemainingTaskCount})"),
+
+            // The world is also poked from the console thread (status/metrics). Scheduled mode
+            // keeps those callers from becoming the world's leader and running game logic on a
+            // non-worker thread.
+            Mode = ExecutionMode.Scheduled,
+
+            OnDropped = static (actor, reason) => JobLog.Warn(
+                $"[World] job refused ({reason}), queue={actor.RemainingTaskCount}"),
         })
     {
         Config = cfg;
@@ -51,7 +59,9 @@ public sealed class GameWorld : AsyncExecutable
     public void SpawnInitialNpcs() => DoAsync(ProcessSpawnInitialNpcs);
 
     public void AddPlayer(string name, ClientSession session)
-        => DoAsync(() => ProcessAddPlayer(name, session));
+        => DoAsync<(GameWorld W, string Name, ClientSession S)>(
+            static t => t.W.ProcessAddPlayer(t.Name, t.S),
+            (this, name, session));
 
     public void RemovePlayer(int playerId)
         => DoAsync<(GameWorld W, int Id)>(
@@ -168,65 +178,66 @@ public sealed class GameWorld : AsyncExecutable
             na.ReceiveDamage(atk, meleeRange);
     }
 
+    /// <summary>
+    /// Consistent read of world state, computed on the world's own queue.
+    /// <see cref="AsyncExecutable.AskSync"/> refuses to run inside another job, so this can never
+    /// become the "block a worker waiting for an actor" deadlock.
+    /// </summary>
     public WorldSnapshot GetSnapshot()
     {
-        using var ev = new ManualResetEventSlim(false);
-        WorldSnapshot? result = null;
-
-        DoAsync(() =>
+        try
         {
-            var alivePlayers = 0;
-            foreach (var pa in _players.Values)
-            {
-                if (!pa.Despawned) alivePlayers++;
-            }
-
-            var aliveNpcs = 0;
-            foreach (var na in _npcs.Values)
-            {
-                if (!na.Despawned && na.Npc.IsAlive) aliveNpcs++;
-            }
-
-            result = new WorldSnapshot(
-                SessionCount: _sessions.Count,
-                LivePlayerCount: alivePlayers,
-                TotalPlayerCount: _players.Count,
-                LiveNpcCount: aliveNpcs,
-                TotalNpcCount: _npcs.Count,
-                WorldQueueDepth: RemainingTaskCount);
-            ev.Set();
-        });
-
-        ev.Wait(TimeSpan.FromSeconds(2));
-        return result ?? new WorldSnapshot(0, 0, 0, 0, 0, RemainingTaskCount);
+            return AskSync(BuildSnapshot, TimeSpan.FromSeconds(2));
+        }
+        catch (TimeoutException)
+        {
+            JobLog.Warn("[World] snapshot timed out");
+            return new WorldSnapshot(0, 0, 0, 0, 0, RemainingTaskCount);
+        }
     }
 
+    private WorldSnapshot BuildSnapshot()
+    {
+        var alivePlayers = 0;
+        foreach (var pa in _players.Values)
+        {
+            if (!pa.Despawned) alivePlayers++;
+        }
+
+        var aliveNpcs = 0;
+        foreach (var na in _npcs.Values)
+        {
+            if (!na.Despawned && na.Npc.IsAlive) aliveNpcs++;
+        }
+
+        return new WorldSnapshot(
+            SessionCount: _sessions.Count,
+            LivePlayerCount: alivePlayers,
+            TotalPlayerCount: _players.Count,
+            LiveNpcCount: aliveNpcs,
+            TotalNpcCount: _npcs.Count,
+            WorldQueueDepth: RemainingTaskCount);
+    }
+
+    /// <summary>
+    /// Despawn everything and cancel the timer chains. Afterwards the system has no self-sustaining
+    /// work left, so <see cref="JobSystem.StopAsync"/> can reach a real quiescent state instead of
+    /// the fixed sleep this sample used to rely on.
+    /// </summary>
     public void Stop()
     {
         _isStopping = true;
 
-        var captured = new TaskCompletionSource<(PlayerActor[] P, NpcActor[] N)>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-
-        DoAsync(() =>
+        DoAsync(static w =>
         {
-            foreach (var s in _sessions.Values) s.Close();
-            _sessions.Clear();
-            foreach (var na in _npcs.Values) na.Despawn();
-            foreach (var pa in _players.Values) pa.Despawn();
-            captured.TrySetResult((_players.Values.ToArray(), _npcs.Values.ToArray()));
-        });
+            foreach (var s in w._sessions.Values) s.Close();
+            w._sessions.Clear();
+            foreach (var na in w._npcs.Values) na.Despawn();
+            foreach (var pa in w._players.Values) pa.Despawn();
+        }, this);
 
-        captured.Task.Wait(TimeSpan.FromSeconds(2));
-        var (playersSnap, npcsSnap) = captured.Task.IsCompletedSuccessfully
-            ? captured.Task.Result
-            : ([], []);
-
-        Thread.Sleep(200);
-
-        foreach (var na in npcsSnap) na.DisposeAsync().AsTask().Wait();
-        foreach (var pa in playersSnap) pa.DisposeAsync().AsTask().Wait();
-
-        DisposeAsync().AsTask().Wait();
+        // Wait for the despawns (and everything they cascade into) to finish.
+        if (!System.DrainAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult())
+            JobLog.Warn("[World] world did not fully quiesce before shutdown");
     }
 }

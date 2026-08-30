@@ -20,3 +20,13 @@ packages/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Benchmark output
+BenchmarkDotNet.Artifacts/
+
+# Packaging output
+artifacts/
+nupkg/
+
+# Template test scratch
+**/TestResults/

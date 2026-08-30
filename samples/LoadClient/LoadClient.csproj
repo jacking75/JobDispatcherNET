@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>JobDispatcherNET.Samples.Pipelines.LoadClient</RootNamespace>
+    <AssemblyName>LoadClient</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn)</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The wire format is the contract, so it is shared as source rather than duplicated.
+         The client deliberately does NOT reference JobDispatcherNET: it must stay a plain
+         headless console app that CI can run anywhere. -->
+    <Compile Include="..\PipelinesServer\Protocol.cs" Link="Protocol.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MessagePack" Version="3.1.8" />
+  </ItemGroup>
+
+</Project>

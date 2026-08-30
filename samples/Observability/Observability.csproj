@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>JobDispatcherNET.Samples.Observability</RootNamespace>
+    <AssemblyName>Observability</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\JobDispatcherNET\JobDispatcherNET.csproj" />
+    <ProjectReference Include="..\..\JobDispatcherNET.Extensions.Hosting\JobDispatcherNET.Extensions.Hosting.csproj" />
+    <ProjectReference Include="..\..\JobDispatcherNET.Extensions.Logging\JobDispatcherNET.Extensions.Logging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.18.0" />
+  </ItemGroup>
+
+</Project>

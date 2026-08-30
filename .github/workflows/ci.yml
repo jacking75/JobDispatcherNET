@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore All.sln
+
+      - name: Build
+        run: dotnet build All.sln -c Release --no-restore
+
+      # The stress traits are excluded here so a timing wobble on a shared runner
+      # cannot mask a real correctness failure. They run in the next step.
+      - name: Test
+        run: >
+          dotnet test JobDispatcherNET.Tests/JobDispatcherNET.Tests.csproj
+          -c Release
+          --no-build
+          --filter "Category!=Stress"
+          --logger trx
+          --results-directory TestResults
+
+      # Stress tests measure throughput and drain latency, both of which depend on
+      # how much of the runner we actually get. Report, but do not gate the build.
+      - name: Stress tests (non-blocking)
+        continue-on-error: true
+        run: >
+          dotnet test JobDispatcherNET.Tests/JobDispatcherNET.Tests.csproj
+          -c Release
+          --no-build
+          --filter "Category=Stress"
+          --logger trx
+          --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: TestResults/
+          if-no-files-found: warn
+          retention-days: 14
+
+  pack:
+    name: pack
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore All.sln
+
+      - name: Pack core
+        run: dotnet pack JobDispatcherNET/JobDispatcherNET.csproj -c Release -o artifacts
+
+      # The extension packages are added incrementally; skip whichever is not in the
+      # tree yet rather than failing the job.
+      - name: Pack extensions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for proj in \
+            "JobDispatcherNET.Extensions.Logging/JobDispatcherNET.Extensions.Logging.csproj" \
+            "JobDispatcherNET.Extensions.Hosting/JobDispatcherNET.Extensions.Hosting.csproj"
+          do
+            if [ -f "$proj" ]; then
+              echo "::group::pack $proj"
+              dotnet pack "$proj" -c Release -o artifacts
+              echo "::endgroup::"
+            else
+              echo "skipping $proj (not in the tree yet)"
+            fi
+          done
+
+      - name: List packages
+        shell: bash
+        run: ls -l artifacts
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
+          retention-days: 30

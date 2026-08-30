@@ -14,7 +14,7 @@ public sealed class ServerConfig
 
     public sealed class ServerSection
     {
-        public int Port { get; set; } = 9100;
+        public int Port { get; set; } = 25100;
         public int WorkerThreads { get; set; } = 8;
         public int AoiResyncIntervalMs { get; set; } = 3000;
     }

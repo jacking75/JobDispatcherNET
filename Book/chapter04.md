@@ -44,11 +44,18 @@ JobEntry (abstract)         ← 모든 작업의 기반
 ```csharp
 public abstract class JobEntry
 {
+    /// <summary>작업을 실행한다. 구현체는 실행 후 스스로 풀에 반납한다.</summary>
     public abstract void Execute();
+
+    /// <summary>실행하지 않고 반납한다 — 거부된 작업, 취소된 타이머용.</summary>
+    internal abstract void Discard();
 }
 ```
 
-딱 하나의 메서드만 있습니다. "실행해라"입니다. 단순함이 핵심입니다.
+메서드는 둘뿐입니다. "실행해라"와 "실행하지 말고 반납해라"입니다. 단순함이 핵심입니다.
+
+`Discard()`는 4.9에서 다시 보겠습니다. 큐가 만원이라 거부된 작업이나, 발화 전에 취소된 타이머의
+작업이 **GC로 가지 않고 풀로 되돌아오게** 하는 통로입니다.
 
 ---
 
@@ -93,20 +100,29 @@ public sealed class Job : JobEntry
     // ───────────────────────────────────────────────
     public override void Execute()
     {
+        var action = _action;
         try
         {
-            _action?.Invoke();
+            action?.Invoke();
         }
         finally
         {
-            _action = null;  // 람다 참조 해제 (메모리 누수 방지)
+            Recycle();
+        }
+    }
 
-            // 풀 크기가 한도 미만이면 반납, 초과면 GC에 맡김
-            if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
-            {
-                Interlocked.Increment(ref _poolSize);
-                Pool.Add(this);  // 풀에 반납!
-            }
+    // 실행하지 않고 반납 (거부된 작업 / 취소된 타이머)
+    internal override void Discard() => Recycle();
+
+    private void Recycle()
+    {
+        _action = null;  // 람다 참조 해제 (메모리 누수 방지)
+
+        // 풀 크기가 한도 미만이면 반납, 초과면 GC에 맡김
+        if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
+        {
+            Interlocked.Increment(ref _poolSize);
+            Pool.Add(this);  // 풀에 반납!
         }
     }
 }
@@ -161,25 +177,44 @@ public sealed class Job<TState> : JobEntry
 
     public override void Execute()
     {
+        var action = _action;
+        var state = _state;
         try
         {
-            if (_action is { } a && _state is { } s)
-                a(s);
-            else
-                _action?.Invoke(default!);
+            // state 가 참조형이고 null 이어도 그대로 넘긴다.
+            action?.Invoke(state!);
         }
         finally
         {
-            _action = null;
-            _state = default;  // state 참조도 해제!
-            if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
-            {
-                Interlocked.Increment(ref _poolSize);
-                Pool.Add(this);
-            }
+            Recycle();
+        }
+    }
+
+    internal override void Discard() => Recycle();
+
+    private void Recycle()
+    {
+        _action = null;
+        _state = default;  // state 참조도 해제!
+        if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
+        {
+            Interlocked.Increment(ref _poolSize);
+            Pool.Add(this);
         }
     }
 }
+```
+
+### null state 에 대한 주의 (v2.0 에서 고친 것)
+
+예전 구현은 `_state is { } s` 로 검사해서, **state 가 null 이면 `default!` 를 넘겼습니다.**
+값 형식에는 차이가 없지만 참조형에서는 의미가 꼬입니다 — "null 을 의도적으로 넘긴 경우"와
+"넘길 게 없는 경우"를 구분할 수 없었습니다.
+
+```csharp
+// TState 자체가 참조형이고 값이 null 인 경우 — 이제 핸들러가 그 null 을 그대로 받는다
+string? nothing = null;
+actor.DoAsync<string?>(static s => Handle(s), nothing);   // Handle(null) 이 호출된다
 ```
 
 ---
@@ -265,7 +300,42 @@ Console.WriteLine($"Job 풀 현재 크기: {Job.PoolSize}");
 
 ---
 
-## 4.9 실전 예시 — AdvancedMmorpgServer의 활용
+## 4.9 Discard — 거부된 작업도 풀로 돌아온다
+
+작업이 항상 실행되는 것은 아닙니다. 큐가 만원이면 거부되고, 예약된 타이머는 발화 전에
+취소될 수 있습니다. 이때 `Execute()`는 호출되지 않으므로, 그냥 두면 그 `Job` 인스턴스는
+풀로 돌아오지 못하고 GC 대상이 됩니다.
+
+```csharp
+// AsyncExecutable.Admit — 큐 한도 초과 판정
+if (_maxQueueSize != 0 && current >= _maxQueueSize)
+{
+    task.Discard();                       // ← 실행하지 않고 풀에 반납
+    return Refuse(DropReason.QueueFull);
+}
+```
+
+```csharp
+// TimerService.TimerEntry — 취소되었을 때
+public void DiscardJob() => Interlocked.Exchange(ref _job, null)?.Discard();
+```
+
+```
+거부가 초당 수천 건 발생하는 상황 (악성 클라이언트, 패킷 폭주):
+
+Discard 가 없다면:   거부된 Job 수천 개/초가 그대로 GC 대상 → 풀링의 의미 상실
+Discard 가 있으면:   거부돼도 풀 크기가 유지됨 → 정상 경로의 할당도 계속 0
+```
+
+> **v2.0 에서 바뀐 점**
+> 예전에는 `OnDropped` 콜백이 거부된 `JobEntry`를 사용자에게 그대로 넘겼습니다. 사용자가 그
+> 참조를 붙들고 있으면 라이브러리가 이미 재사용 중인 인스턴스를 건드리게 됩니다. 지금은
+> 콜백 시그니처가 `Action<AsyncExecutable, DropReason>`으로 바뀌어 **작업 자체는 밖으로
+> 나가지 않고**, 라이브러리가 `Discard()`로 회수합니다.
+
+---
+
+## 4.10 실전 예시 — AdvancedMmorpgServer의 활용
 
 `AdvancedMmorpgServer`의 `NpcActor`에서 실제 사용 예를 봅시다:
 
@@ -288,19 +358,20 @@ public sealed class NpcActor : AsyncExecutable
 
 ---
 
-## 4.10 정리
+## 4.11 정리
 
 ```
 이번 장에서 배운 것
 ──────────────────────────────────────────────
-✓ JobEntry = 작업 항목의 추상 기반 클래스
+✓ JobEntry = 작업 항목의 추상 기반 클래스 (Execute / Discard)
 ✓ Job = 람다 기반, ConcurrentBag 풀링
-✓ Job<TState> = state 전달, 클로저 없음
+✓ Job<TState> = state 전달, 클로저 없음 (null state 도 그대로 전달)
 ✓ Rent() → 풀에서 대여 / Execute() → 실행 후 반납
+✓ Discard() → 실행하지 않고 반납 (거부·취소 경로에서도 풀 유지)
 ✓ 풀 크기 한도로 메모리 무한 증가 방지
 ✓ hot path는 DoAsync<TState>로 GC 압박 최소화
 ```
 
 ---
 
-*[← Chapter 03](./chapter03.md) | [→ Chapter 05: ThreadContext와 TimerQueue](./chapter05.md)*
+*[← Chapter 03](./chapter03.md) | [→ Chapter 05: 타이머 서비스와 ThreadContext](./chapter05.md)*

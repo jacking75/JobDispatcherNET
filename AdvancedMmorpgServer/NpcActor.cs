@@ -3,13 +3,14 @@ using JobDispatcherNET;
 namespace AdvancedMmorpgServer;
 
 /// <summary>
-/// NPC Actor. 자신의 AI tick 을 <see cref="AsyncExecutable.DoAsyncAfter"/> 로 자기 큐에 예약하므로
-/// 전체 NPC 가 워커 풀에서 병렬 처리된다.
+/// NPC actor. Its AI tick is a repeating timer on its own queue, so every NPC ticks in parallel
+/// across the worker pool while each NPC's own work stays serial.
 ///
-/// v2 라이브러리 활용:
-///   - hot path 진입점 (ReceiveDamage) 은 <c>DoAsync&lt;TState&gt;</c> 로 closure 회피
-///   - Tick / Respawn / Despawn / Start 는 method group 으로 closure 회피
-///   - <see cref="JobOptions"/> 로 큐 한도 명시 — 다수 공격자에게 동시 피격당해도 큐 폭주 방지
+/// Library features on show:
+///   - hot path entry point (ReceiveDamage) uses <c>DoAsync&lt;TState&gt;</c>, so no closure is allocated
+///   - the AI tick is a cancellable <see cref="AsyncExecutable.DoAsyncEvery"/> handle rather than a
+///     job that re-schedules itself — one failed tick no longer ends the chain, and despawn just cancels
+///   - <see cref="JobOptions.MaxQueueSize"/> caps the queue so a mobbed NPC cannot balloon
 /// </summary>
 public sealed class NpcActor : AsyncExecutable
 {
@@ -38,6 +39,8 @@ public sealed class NpcActor : AsyncExecutable
     private const float WanderRadius = 12f;
 
     private volatile bool _despawned;
+    private ITimerHandle? _tickTimer;
+    private ITimerHandle? _respawnTimer;
 
     public Npc Npc => _npc;
     public int Id => _npc.Id;
@@ -46,6 +49,8 @@ public sealed class NpcActor : AsyncExecutable
     public NpcActor(Npc npc, GameWorld world, TimeSpan tickInterval)
         : base(new JobOptions
         {
+            Name = $"Npc#{npc.Id}",
+            System = world.System,
             MaxQueueSize = NpcQueueCapacity,
             DropPolicy = DropPolicy.Reject,
         })
@@ -55,18 +60,18 @@ public sealed class NpcActor : AsyncExecutable
         _tickInterval = tickInterval;
     }
 
-    /// <summary>
-    /// 첫 Tick 을 예약. 부트스트랩 시점에 호출 — 이후 자가 스케줄링 루프 진입.
-    /// </summary>
+    /// <summary>Arm the AI tick. Called once at spawn.</summary>
     public void Start()
         => DoAsync<NpcActor>(static a => a.ProcessStart(), this);
 
     private void ProcessStart()
     {
         if (_despawned) return;
-        // 분산을 위해 첫 Tick 은 0~tick 사이 무작위 지연
-        var initial = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)_tickInterval.TotalMilliseconds));
-        DoAsyncAfter(initial, Tick);
+
+        // Spread the first tick across the interval so 50 NPCs do not all fire on the same
+        // millisecond and stampede the workers.
+        var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, Math.Max(1, (int)_tickInterval.TotalMilliseconds)));
+        _tickTimer = DoAsyncEvery(_tickInterval, Tick, jitter);
     }
 
     public void Despawn()
@@ -76,6 +81,11 @@ public sealed class NpcActor : AsyncExecutable
     {
         if (_despawned) return;
         _despawned = true;
+
+        // Cancelling releases the timers so shutdown can actually reach quiescence.
+        _tickTimer?.Cancel();
+        _respawnTimer?.Cancel();
+
         Aoi.LeaveWorldNpc(_world.Spatial, _npc);
     }
 
@@ -102,7 +112,9 @@ public sealed class NpcActor : AsyncExecutable
             _state = AiState.Idle;
             _targetId = -1;
             Aoi.Publish(s, Packets.Death(_npc.Id, atk.AttackerId));
-            DoAsyncAfter(TimeSpan.FromSeconds(_world.Config.Npc.RespawnSeconds), Respawn);
+            _respawnTimer = DoAsyncAfter(
+                TimeSpan.FromSeconds(_world.Config.Npc.RespawnSeconds),
+                static a => a.Respawn(), this);
             return;
         }
 
@@ -137,21 +149,18 @@ public sealed class NpcActor : AsyncExecutable
         Aoi.PublishAt(_world.Spatial, _npc.X, _npc.Y,
             Packets.Respawn(_npc.Id, _npc.X, _npc.Y, _npc.Hp));
 
-        // 사망 시 끊었던 tick 체인 재가동
-        DoAsyncAfter(_tickInterval, Tick);
+        // No need to re-arm anything: the repeating tick kept running and simply did nothing
+        // while the NPC was dead.
     }
 
-    /// <summary>AI 메인 tick. 자기 자신을 다음 tick 에 다시 예약.</summary>
+    /// <summary>AI tick, driven by the repeating timer armed in ProcessStart.</summary>
     private void Tick()
     {
         if (_despawned) return;
-        if (_world.IsStopping) return;  // 자가복제 종료
+        if (_world.IsStopping) return;
 
-        if (!_npc.IsAlive)
-        {
-            // 사망 상태: tick 체인을 끊고 Respawn 에서 재시작
-            return;
-        }
+        // Dead NPCs tick idly until the respawn timer brings them back.
+        if (!_npc.IsAlive) return;
 
         long now = NowMs();
         float dt = _lastTickMs == 0 ? (float)_tickInterval.TotalSeconds : (now - _lastTickMs) / 1000f;
@@ -165,8 +174,6 @@ public sealed class NpcActor : AsyncExecutable
             case AiState.Attack:  TickAttack(now, dt); break;
             case AiState.Flee:    TickFlee(now, dt); break;
         }
-
-        DoAsyncAfter(_tickInterval, Tick);
     }
 
     private void TickIdle(long now, float dt)

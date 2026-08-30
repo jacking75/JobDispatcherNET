@@ -2,12 +2,12 @@ using AdvancedMmorpgServer;
 using JobDispatcherNET;
 
 // ─────────────────────────────────────────────────────────────
-// AdvancedMmorpgServer 메인 — 동기 (async/await 미사용)
+// AdvancedMmorpgServer entry point.
 //
-// 라이브러리 v2 활용:
-//   - JobLog 로 통합 로깅 (Console.WriteLine 직접 호출 지양)
-//   - JobMetrics.Snapshot() 으로 큐 깊이 / 처리량 / 드롭 / 재기동 통계 노출
-//   - World.GetSnapshot() 으로 일관된 read 스냅샷
+// Library features used here:
+//   - JobLog for unified logging instead of scattered Console.WriteLine
+//   - system.Metrics.Snapshot() for queue depth / throughput / drops / restarts
+//   - World.GetSnapshot() for a consistent read, computed on the world's own queue
 // ─────────────────────────────────────────────────────────────
 
 // 라이브러리 로거 — Info 부터 출력 (기본은 Warn 부터)
@@ -53,7 +53,7 @@ var inputThread = new Thread(() =>
         }
         else if (trimmed.Equals("metrics", StringComparison.OrdinalIgnoreCase))
         {
-            PrintMetrics();
+            PrintMetrics(server);
         }
     }
 })
@@ -73,11 +73,11 @@ static void PrintStatus(GameServer s)
     Console.WriteLine($"[상태] 세션 {snap.SessionCount} / 플레이어 {snap.LivePlayerCount}/{snap.TotalPlayerCount} / NPC {snap.LiveNpcCount}/{snap.TotalNpcCount} / WorldQueue {snap.WorldQueueDepth}");
 }
 
-static void PrintMetrics()
+static void PrintMetrics(GameServer s)
 {
-    var m = JobMetrics.Snapshot();
+    var m = s.System.Metrics.Snapshot();
     Console.WriteLine(
-        $"[메트릭] 실행={m.TotalJobsExecuted} 드롭={m.TotalJobsDropped} 실패={m.TotalJobsFailed} " +
-        $"대기timer={m.PendingTimerJobs} timerDispatch={m.PendingTimerDispatch} " +
-        $"JobPool={m.ActiveJobPoolSize} 워커재기동={m.WorkerRestarts}");
+        $"[metrics] executed={m.TotalJobsExecuted} dropped={m.TotalJobsDropped} failed={m.TotalJobsFailed} " +
+        $"inFlight={m.InFlightJobs} pendingTimers={m.PendingTimerJobs} ready={m.ReadyQueueDepth} " +
+        $"jobPool={m.ActiveJobPoolSize} workers={m.LiveWorkers} restarts={m.WorkerRestarts}");
 }

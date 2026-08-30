@@ -120,23 +120,27 @@ JobDispatcherNET은 .NET에서 Actor 모델을 쉽게 구현하기 위한 라이
 │                  JobDispatcherNET                        │
 │                                                          │
 │  ┌─────────────────┐    ┌──────────────────────────┐    │
-│  │  AsyncExecutable │    │   JobDispatcher<T>       │    │
+│  │  AsyncExecutable │    │   JobDispatcher          │    │
 │  │                  │    │                          │    │
 │  │  • 각 객체에게   │    │  • N개의 전용 OS 스레드  │    │
-│  │    자기만의 큐를  │    │  • IRunnable을 반복 실행 │    │
+│  │    자기만의 큐를  │    │  • 유휴 시 시그널 대기   │    │
 │  │    부여          │    │  • 워커 자동 재기동      │    │
-│  │  • lock 없는     │    │                          │    │
+│  │  • lock 없는     │    │  • <T> 로 자체 루프도    │    │
 │  │    직렬 처리     │    └──────────────────────────┘    │
 │  └─────────────────┘                                     │
 │                                                          │
 │  ┌─────────────────┐    ┌──────────────────────────┐    │
-│  │  TimerQueue      │    │   Sequencer<T>           │    │
+│  │  TimerService    │    │   Sequencer<T>           │    │
 │  │                  │    │                          │    │
-│  │  • 고정밀 지연   │    │  • 패킷 순서 보장        │    │
-│  │    실행          │    │  • IO 스레드와 워커       │    │
-│  │  • 워커 스레드   │    │    스레드 분리            │    │
-│  │    친화적 설계   │    │                          │    │
+│  │  • 지연·주기 실행│    │  • 패킷 순서 보장        │    │
+│  │  • 취소 가능한   │    │  • IO 스레드와 워커       │    │
+│  │    핸들 반환     │    │    스레드 분리            │    │
+│  │  • 시스템당 1스레드│  │                          │    │
 │  └─────────────────┘    └──────────────────────────┘    │
+│                                                          │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  JobSystem — 위 셋과 메트릭·셧다운 게이트의 소유자│  │
+│  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -188,15 +192,18 @@ graph LR
 JobDispatcherNET/
 ├── JobDispatcherNET/          ← 핵심 라이브러리 (여기서 시작!)
 │   ├── AsyncExecutable.cs     ← Actor의 기반 클래스
-│   ├── JobDispatcher.cs       ← 워커 스레드 풀
+│   ├── JobSystem.cs           ← 워커·타이머·메트릭·셧다운의 소유자
+│   ├── JobDispatcher.cs       ← 워커 스레드 풀 (비제네릭 / 제네릭)
 │   ├── JobEntry.cs            ← 작업 항목 + 풀링
+│   ├── TimerService.cs        ← 지연·주기 실행 (시스템당 스레드 1개)
 │   ├── ThreadContext.cs       ← 스레드 전용 저장소
-│   ├── TimerQueue.cs          ← 지연 실행 타이머
-│   ├── TimerDispatchQueue.cs  ← 타이머→워커 브릿지
 │   ├── Sequencer.cs           ← 패킷 순서 보장
-│   ├── JobOptions.cs          ← 옵션 설정
+│   ├── JobOptions.cs          ← actor 옵션 + ExecutionMode/DropReason
 │   ├── JobMetrics.cs          ← 메트릭 수집
-│   └── IJobLogger.cs          ← 로깅 인터페이스
+│   ├── JobDiagnostics.cs      ← 데드락 가드
+│   ├── IJobLogger.cs          ← 로깅 인터페이스
+│   ├── IRunnable.cs           ← 워커 자체 루프 인터페이스
+│   └── Legacy.cs              ← [Obsolete] 호환 표면 (TimerRegistry)
 │
 ├── ExampleConsoleApp/         ← 예제 1: 기본기 (Chapter 09)
 ├── ExampleChatServer/         ← 예제 2: 채팅 서버 (Chapter 10)

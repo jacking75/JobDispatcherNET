@@ -74,10 +74,9 @@ public sealed class ChatServer : AsyncExecutable
         // 자기 큐 drain 대기 (라이브러리의 ValueTask 를 Task 로 바꿔 한 번만 차단)
         DisposeAsync().AsTask().Wait();
 
-        // 워커 스레드 정지 + Join (동기)
-        _dispatcher?.Dispose();
-
-        TimerRegistry.DisposeAll();
+        // v2.1: 남은 작업 drain → 타이머 스레드 정지 → 워커 정지까지 한 번에.
+        // 예전의 AcceptingWork/Dispose/TimerRegistry.DisposeAll 3단계는 더 이상 필요 없다.
+        System.StopAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
         Console.WriteLine("[Server] 종료 완료");
     }
 

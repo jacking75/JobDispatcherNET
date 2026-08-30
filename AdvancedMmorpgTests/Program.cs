@@ -123,7 +123,7 @@ void LeavePacketDespawnsPlayer()
     {
         Server = new ServerConfig.ServerSection
         {
-            Port = 9301,
+            Port = 25101,
             WorkerThreads = 2,
             AoiResyncIntervalMs = 0,
         },
@@ -189,7 +189,7 @@ void GameServerDisposeDoesNotDropShutdownJobs()
     {
         Server = new ServerConfig.ServerSection
         {
-            Port = 9302,
+            Port = 25102,
             WorkerThreads = 1,
             AoiResyncIntervalMs = 0,
         },
@@ -215,7 +215,7 @@ void GameServerDisposeDoesNotDropShutdownJobs()
         server.Start();
     }
 
-    EqualValue(0, JobMetrics.Snapshot().TotalJobsDropped);
+    EqualValue(0, JobMetrics.GetSnapshot().TotalJobsDropped);
 }
 
 ServerConfig.NpcTypeConfig NpcCfg() => new()

@@ -70,11 +70,23 @@ public class GameZone : AsyncExecutable
     private void ProcessLeaveZone(string playerId)
     {
         if (!_actors.Remove(playerId, out var actor)) return;
-        actor.Despawn();  // ← PlayerActor에게 Despawn 메시지 전달
-        actor.DisposeAsync().AsTask().Wait();  // 큐 drain
+
+        // spatial 제거는 actor 자기 큐에서 — 잔여 Move/Damage 작업과 직렬화된다.
+        actor.Despawn();  // ← PlayerActor에게 Despawn 메시지 전달 (즉시 반환)
     }
 }
 ```
+
+> **여기서 `actor.DisposeAsync().Wait()` 을 부르면 안 됩니다.**
+> `ProcessLeaveZone` 은 GameZone 의 큐 안에서 실행됩니다. 그 안에서 `PlayerActor.Despawn()`
+> 을 부르면, 이 스레드가 이미 GameZone 을 flush 중이므로 `PlayerActor` 는
+> `ThreadContext.ExecuterQueue` 에 실려 **이 flush 가 끝난 뒤에** 처리됩니다.
+> 그 상태에서 `DisposeAsync().Wait()` 로 드레인을 기다리면, 그 큐를 비워 줄 스레드가
+> 바로 지금 멈춰 있는 이 스레드이므로 영구 대기입니다.
+>
+> 큐 드레인을 기다려야 한다면 **actor 큐 밖에서** 하세요. 실제 `GameZone.DisposeAsync` 는
+> 외부 스레드에서 `Despawn` 을 일괄 전송한 뒤 각 `PlayerActor` 를 드레인합니다.
+> 더 간단한 방법은 12장처럼 `system.StopAsync()` / `system.DrainAsync()` 에 맡기는 것입니다.
 
 ---
 
@@ -285,18 +297,40 @@ private void RegenTick()
 }
 ```
 
+> **v2.1 스타일로 바꾼다면:**
+> ```csharp
+> private ITimerHandle? _regen;
+>
+> public void StartRegen()
+>     => DoAsync(() => _regen = DoAsyncEvery(RegenInterval, RegenTick));
+>
+> private void RegenTick()      // 재예약 코드가 사라진다
+> {
+>     if (_player.IsAlive && _player.Hp < _player.MaxHp) { ... }
+> }
+>
+> private void ProcessDespawn()
+> {
+>     _despawned = true;
+>     _regen?.Cancel();          // _despawned 플래그로 "발화는 하되 무시" 하지 않는다
+> }
+> ```
+> 12장의 `AdvancedMmorpgServer` 가 정확히 이 형태로 이관되어 있습니다.
+
 ---
 
 ## 11.8 사망과 부활 처리
 
 ```csharp
 // ReceiveMeleeDamage 안에서 호출됨 (자기 큐 안)
+private ITimerHandle? _respawnTimer;
+
 private void HandleDeath(string killerName)
 {
     _player.SendPacket?.Invoke($"DEATH|{killerName}");
 
-    // 5초 후 자동 부활 예약!
-    DoAsyncAfter(RespawnDelay, ProcessRespawn);
+    // 5초 후 자동 부활 예약! 반환된 핸들을 보관해 두면 Despawn 시 취소할 수 있다.
+    _respawnTimer = DoAsyncAfter(RespawnDelay, ProcessRespawn);
 }
 
 private void ProcessRespawn()
@@ -371,9 +405,21 @@ GameZone 큐:      QueryRange(centerX, centerY, ...)
 
 ## 11.10 PrintStatus — GetSnapshot 패턴
 
+`GameZone.GetSnapshot()` 은 10.8 과 같은 `ManualResetEventSlim` 패턴으로 구현되어 있습니다.
+새로 쓴다면 `AskSync` 한 줄입니다:
+
+```csharp
+public ZoneSnapshot GetSnapshot()
+    => AskSync(() => new ZoneSnapshot(_name, _actors.Values.Select(a => a.Snapshot()).ToList()),
+               TimeSpan.FromSeconds(2));
+```
+
+`AskSync` 는 타임아웃이 필수이고, actor 큐 안에서 호출하면 데드락 대신 예외를 던집니다 (10.8).
+
 ```csharp
 public void PrintStatus()
 {
+    // ★ 메인/콘솔 스레드에서 호출할 것. actor 작업 안에서는 금지.
     var snap = _zone.GetSnapshot();
 
     Console.WriteLine("========== 서버 상태 ==========");
@@ -397,9 +443,10 @@ MmorpgServer 예제에서:
 ✓ 공격 라우팅: 공격자 Actor → GameZone → 대상 Actor
 ✓ AttackerSnapshot = 불변 데이터로 안전한 스레드 간 전달
 ✓ 공간 인덱스: ConcurrentDictionary로 다중 Actor 접근 허용
-✓ 자기복제: StartRegen, HandleDeath+DoAsyncAfter(부활)
+✓ 주기/지연: 예제는 자기복제, 새 코드는 DoAsyncEvery + ITimerHandle.Cancel()
 ✓ 서버사이드 검증: 거리, 이동 속도 등
-✓ Despawn 시 자기복제 체인 자동 종료 (_despawned 체크)
+✓ actor 큐 안에서 다른 actor 의 드레인을 기다리면 데드락
+  → Despawn 은 메시지로 보내고, 드레인은 큐 밖(또는 system.StopAsync)에서
 ```
 
 ---

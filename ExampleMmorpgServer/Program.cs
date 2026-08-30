@@ -25,7 +25,7 @@ using JobDispatcherNET;
 //
 // 실행 모드:
 //   인자 없이  → 시뮬레이션 모드 (자동 시나리오)
-//   --network → TCP 서버 모드 (포트 9000)
+//   --network → TCP 서버 모드 (포트 25110)
 // ─────────────────────────────────────────────────────────────
 
 // Actor 큐 안에서 발생한 미처리 예외를 한 곳에서 잡는다 (라이브러리 기능)
@@ -48,11 +48,11 @@ gameServer.Stop();
 // ─────────────────────────────────────────────
 static void RunNetworkMode(GameServer gameServer)
 {
-    var networkServer = new NetworkServer(gameServer, port: 9000);
+    var networkServer = new NetworkServer(gameServer, port: 25110);
     networkServer.Start();
 
     Console.WriteLine("TCP 서버 모드. 'q' 입력 시 종료.");
-    Console.WriteLine("텔넷 접속: telnet localhost 9000");
+    Console.WriteLine("텔넷 접속: telnet localhost 25110");
     Console.WriteLine("패킷 예시: EnterZone|field|50|50 / Move|60|70 / MeleeAttack|player_2 / AreaAttack|55|55|10\n");
 
     while (Console.ReadLine() != "q") { }

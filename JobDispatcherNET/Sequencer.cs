@@ -3,26 +3,19 @@ using System.Collections.Concurrent;
 namespace JobDispatcherNET;
 
 /// <summary>
-/// 같은 source 의 항목들을 도착 순서대로 한 번에 한 워커만 처리하도록 보장하는 헬퍼.
+/// Keeps items from one source in arrival order and guarantees only one thread handles them at a
+/// time.
 ///
-/// 왜 필요한가:
-///   AsyncExecutable.DoTask 의 Increment+TryWrite 가 비원자적이라
-///   여러 producer 가 같은 actor 에 동시에 push 하면 채널 안에서 순서가 뒤집힐 수 있다.
-///   예: 네트워크 IO 가 EnterZone 패킷을 push, 곧이어 Move 를 push 했는데
-///       두 워커가 각자 dequeue 해서 _zone.DoAsync 를 거의 동시에 호출하면
-///       채널 안에서 Move 가 EnterZone 보다 먼저 들어갈 수 있음.
+/// <para><b>Why this exists.</b> An actor serialises its own jobs, but it does not fix the order in
+/// which two producers reach it. If a socket thread pushes <c>EnterZone</c> and then <c>Move</c>,
+/// and two workers pick them up, nothing stops <c>Move</c> from being queued first. Funnel a
+/// session's packets through one sequencer and the order is the order they arrived.</para>
 ///
-/// 사용 패턴 (세션):
-///   1) 네트워크 RecvIO 스레드: <see cref="Enqueue"/> 로 패킷을 push.
-///   2) 이 클래스가 CAS 로 단일 drainer 권한을 얻은 호출자만 scheduleDrain 콜백을 1회 호출.
-///   3) scheduleDrain 콜백은 워커 큐(예: ConcurrentQueue&lt;Action&gt;)에 drain 명령 enqueue.
-///   4) 워커가 dequeue → <see cref="Drain"/> 실행 → 항목들을 handler 로 순서대로 처리.
-///   5) Drain 완료 후 큐에 남은 항목이 있으면 다시 scheduleDrain.
-///
-/// 보장:
-///   - 같은 Sequencer 인스턴스의 항목은 한 시점에 한 스레드만 처리.
-///   - 처리 순서는 Enqueue 순서.
-///   - 처리 중 새 Enqueue 가 들어와도 race 없음 (CAS 해제 후 재스케줄).
+/// <para><b>Use it like this.</b> The IO thread only calls <see cref="Enqueue"/>. The first caller
+/// to find no drain scheduled wins a CAS and invokes the <c>scheduleDrain</c> callback once; that
+/// callback hands a drain action to a worker (<see cref="JobSystem.Post(Action)"/> does this for
+/// you if you use the <see cref="Sequencer{T}(JobSystem, Action{T}, Action{Exception})"/>
+/// constructor). The worker runs the handler for each queued item in order.</para>
 /// </summary>
 public sealed class Sequencer<T>
 {
@@ -32,10 +25,11 @@ public sealed class Sequencer<T>
     private readonly Action<Exception>? _onError;
     private int _drainScheduled;
     private int _stopped;
+    private int _aborted;
 
-    /// <param name="handler">각 항목을 처리하는 핸들러. 워커 스레드에서 직렬로 호출됨.</param>
-    /// <param name="scheduleDrain">drain 작업을 워커 큐(예: GameWorker.InboundCommands)에 enqueue 하는 콜백.</param>
-    /// <param name="onError">handler 가 던진 예외 처리 콜백. null 이면 <see cref="JobLog"/> 로 출력.</param>
+    /// <param name="handler">Handles one item. Called serially, on whichever thread runs the drain.</param>
+    /// <param name="scheduleDrain">Hands the drain action to a worker thread.</param>
+    /// <param name="onError">Called when <paramref name="handler"/> throws. Defaults to logging.</param>
     public Sequencer(Action<T> handler, Action<Action> scheduleDrain, Action<Exception>? onError = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
@@ -45,17 +39,39 @@ public sealed class Sequencer<T>
         _onError = onError;
     }
 
-    /// <summary>현재 큐에 있는 항목 수 (메트릭용).</summary>
+    /// <summary>
+    /// Convenience overload that schedules drains onto <paramref name="system"/>'s worker pool,
+    /// so callers no longer need their own inbound command queue.
+    /// </summary>
+    public Sequencer(JobSystem system, Action<T> handler, Action<Exception>? onError = null)
+        : this(handler, ScheduleOn(system), onError)
+    {
+    }
+
+    private static Action<Action> ScheduleOn(JobSystem system)
+    {
+        ArgumentNullException.ThrowIfNull(system);
+        return system.Post;
+    }
+
+    /// <summary>Items waiting to be handled.</summary>
     public int PendingCount => _queue.Count;
 
+    /// <summary>True once <see cref="Stop"/> or <see cref="Abort"/> has been called.</summary>
+    public bool IsStopped => Volatile.Read(ref _stopped) != 0;
+
     /// <summary>
-    /// 항목을 enqueue. 호출 스레드는 producer (예: IO 스레드). 즉시 반환.
+    /// Add an item. Returns <c>false</c> if the sequencer is stopped, so the caller can tell the
+    /// difference between "queued" and "thrown away".
     /// </summary>
-    public void Enqueue(T item)
+    public bool Enqueue(T item)
     {
-        if (Volatile.Read(ref _stopped) != 0) return;
+        if (Volatile.Read(ref _stopped) != 0)
+            return false;
+
         _queue.Enqueue(item);
         TryScheduleDrain();
+        return true;
     }
 
     private void TryScheduleDrain()
@@ -69,8 +85,9 @@ public sealed class Sequencer<T>
         }
         catch
         {
-            // schedule 실패 시 락 해제해서 다음 Enqueue 가 재시도 가능하게 한다.
-            Volatile.Write(ref _drainScheduled, 0);
+            // Release the claim so a later Enqueue can try again. Interlocked for the same
+            // ordering reason as the release in Drain.
+            Interlocked.Exchange(ref _drainScheduled, 0);
             throw;
         }
     }
@@ -79,7 +96,7 @@ public sealed class Sequencer<T>
     {
         try
         {
-            while (_queue.TryDequeue(out var item))
+            while (Volatile.Read(ref _aborted) == 0 && _queue.TryDequeue(out var item))
             {
                 try
                 {
@@ -94,20 +111,49 @@ public sealed class Sequencer<T>
         }
         finally
         {
-            Volatile.Write(ref _drainScheduled, 0);
+            // Interlocked, not Volatile.Write: this is one half of a Dekker handshake with
+            // Enqueue, and a release store does not order against the load of _queue that follows.
+            // Without the full fence the store can still be sitting in this core's store buffer
+            // while a producer's CAS reads the stale 1 and skips scheduling — leaving an item
+            // queued with no drain pending, which for a closing session is its disconnect marker.
+            Interlocked.Exchange(ref _drainScheduled, 0);
 
-            // 락 해제와 producer 의 Enqueue 사이 race 처리.
-            if (!_queue.IsEmpty && Volatile.Read(ref _stopped) == 0)
+            // Anything that arrived between the last dequeue and the release above still has to
+            // run. Stopped is deliberately NOT part of this condition: Stop() means "no new items",
+            // not "throw away the ones already accepted". Checking it here is what used to lose a
+            // session's final disconnect marker.
+            if (!_queue.IsEmpty && Volatile.Read(ref _aborted) == 0)
                 TryScheduleDrain();
         }
     }
 
     /// <summary>
-    /// 더 이상 새 항목을 받지 않도록 표시. 현재 진행 중인 drain 은 완료까지 실행되며,
-    /// 큐에 남은 항목도 모두 처리된다. 셧다운 시 호출.
+    /// Refuse new items. Everything already accepted is still handled, in order.
+    /// Use this for an orderly session close.
     /// </summary>
     public void Stop()
     {
+        if (Interlocked.Exchange(ref _stopped, 1) != 0)
+            return;
+
+        // A producer may have enqueued while we were flipping the flag; make sure it still drains.
+        if (!_queue.IsEmpty && Volatile.Read(ref _aborted) == 0)
+            TryScheduleDrain();
+    }
+
+    /// <summary>
+    /// Refuse new items and discard everything still queued. Use only when the remaining items
+    /// genuinely must not run — a hard shutdown, or a session whose socket is already gone.
+    /// </summary>
+    /// <returns>The number of items discarded.</returns>
+    public int Abort()
+    {
         Volatile.Write(ref _stopped, 1);
+        Volatile.Write(ref _aborted, 1);
+
+        var discarded = 0;
+        while (_queue.TryDequeue(out _))
+            discarded++;
+        return discarded;
     }
 }

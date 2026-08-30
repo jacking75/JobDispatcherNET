@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageType>Template</PackageType>
+    <PackageId>JobDispatcherNET.Templates</PackageId>
+    <Title>JobDispatcherNET project templates</Title>
+    <Description>dotnet new templates for JobDispatcherNET. Includes 'jobdispatcher-server', a minimal but production-shaped actor server: worker pool, bounded actor queues, timers, metrics and a graceful shutdown.</Description>
+    <PackageTags>dotnet-new;templates;actor;game-server;jobdispatcher</PackageTags>
+    <TargetFramework>net8.0</TargetFramework>
+    <IncludeContentInPack>true</IncludeContentInPack>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <!-- Directory.Build.props turns symbol packages on; a template package has no build output,
+         so the symbols nuspec would be empty and pack fails with NU5017. -->
+    <IncludeSymbols>false</IncludeSymbols>
+    <ContentTargetFolders>content</ContentTargetFolders>
+    <!-- .template.config starts with a dot; without this NuGet drops it from the package. -->
+    <NoDefaultExcludes>true</NoDefaultExcludes>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="content\**\*" Exclude="content\**\bin\**;content\**\obj\**" Pack="true" PackagePath="content" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <Compile Remove="**\*.cs" />
+  </ItemGroup>
+
+</Project>

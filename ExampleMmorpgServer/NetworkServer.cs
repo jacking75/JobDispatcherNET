@@ -30,7 +30,7 @@ public class NetworkServer
     private readonly ConcurrentDictionary<string, ClientSession> _sessions = [];
     private int _disposed;
 
-    public NetworkServer(GameServer gameServer, int port = 9000)
+    public NetworkServer(GameServer gameServer, int port = 25110)
     {
         _gameServer = gameServer;
         _port = port;

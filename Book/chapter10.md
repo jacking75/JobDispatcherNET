@@ -95,16 +95,44 @@ public void Start()
 
 public void Stop()
 {
+    Console.WriteLine("[Server] 종료 시작");
     _stopped = true;
+
     DoAsync(ForceCleanupAllRooms);
 
-    // 큐가 빌 때까지 대기 후 종료
+    // 자기 큐 drain 대기 (ValueTask 를 Task 로 바꿔 한 번만 차단)
     DisposeAsync().AsTask().Wait();
 
-    _dispatcher?.Dispose();
-    TimerRegistry.DisposeAll();
+    // v2.1: 남은 작업 drain → 타이머 스레드 정지 → 워커 정지까지 한 번에.
+    System.StopAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    Console.WriteLine("[Server] 종료 완료");
 }
 ```
+
+> **셧다운이 한 줄로 줄어든 이유.**
+> v2.0 까지 이 자리에는 세 줄이 있었습니다.
+>
+> ```csharp
+> _dispatcher?.Dispose();          // 워커 정지
+> TimerRegistry.DisposeAll();      // 비-워커 스레드가 만든 TimerQueue 정리
+> // (+ 상황에 따라 AsyncExecutable.AcceptingWork = false)
+> ```
+>
+> 지금은 타이머를 `JobSystem` 이 소유하므로 정리할 `TimerQueue` 가 애초에 없고
+> (`TimerRegistry` 는 `[Obsolete]` no-op 으로만 남아 있습니다 — 5.9 참고),
+> `StopAsync` 하나가 **드레인 → 타이머 스레드 정지 → 이 시스템에 붙은 디스패처 정지**를
+> 순서대로 처리합니다.
+>
+> `AsyncExecutable` 을 상속한 클래스는 `System` 프로퍼티로 자기가 속한 `JobSystem` 에
+> 바로 접근할 수 있습니다. 반환값이 `false` 면 타임아웃 안에 다 비우지 못했다는 뜻이니
+> 로그를 남겨 두는 편이 좋습니다.
+>
+> ```csharp
+> if (!await System.StopAsync(TimeSpan.FromSeconds(10)))
+>     JobLog.Warn("일부 작업이 남은 채로 종료되었습니다");
+> ```
+>
+> 12장의 `AdvancedMmorpgServer` 도 같은 형태입니다.
 
 ---
 
@@ -133,6 +161,29 @@ private void IdleScanHeartbeat()
     DoAsyncAfter(_idleScanPeriod, IdleScanHeartbeat);
 }
 ```
+
+> **지금은 `DoAsyncEvery` 로 쓰는 편이 낫습니다.**
+> ```csharp
+> private ITimerHandle? _stats;
+> private ITimerHandle? _idleScan;
+>
+> public void StartHeartbeats()
+>     => DoAsync(() =>
+>     {
+>         _stats    = DoAsyncEvery(_statsPeriod,    PrintStats);
+>         _idleScan = DoAsyncEvery(_idleScanPeriod, ScanIdleUsers);
+>     });
+>
+> public void StopHeartbeats()   // _stopped 플래그 대신 진짜 취소
+> {
+>     _stats?.Cancel();
+>     _idleScan?.Cancel();
+> }
+> ```
+> 위의 자기복제 패턴에는 두 가지 문제가 있습니다. ① `PrintStats` 가 예외를 던지면
+> 마지막 줄에 도달하지 못해 heartbeat 가 **영원히** 멈춥니다. ② `_stopped` 플래그는
+> "발화는 하되 아무것도 안 함"이므로, 셧다운 시 타이머가 계속 새 작업을 만들어
+> 드레인이 끝나지 않습니다. `DoAsyncEvery` + `Cancel()` 은 둘 다 해결합니다 (5.5).
 
 ---
 
@@ -278,21 +329,49 @@ public RoomSnapshot GetSnapshot()
       └─ return result!
 ```
 
-주의: `GetSnapshot()`을 다른 Actor의 큐 안에서 호출하면 안 됩니다!
+### 지금은 AskSync 를 쓰세요
+
+같은 일을 라이브러리가 해 줍니다. 그리고 **훨씬 중요한 차이가 하나 있습니다.**
+
+```csharp
+// Room.cs 를 v2.1 스타일로
+public RoomSnapshot GetSnapshot()
+    => AskSync(() => new RoomSnapshot(_roomId, _name, _users.Keys.ToList()),
+               TimeSpan.FromSeconds(2));
+```
+
+```
+직접 만든 ManualResetEventSlim 버전   vs   AskSync
+
+  ev.Wait() 는 무한 대기                    timeout 필수 → 영구 정지 없음
+  큐에 못 들어가도 그냥 멈춘다              거부되면 JobRejectedException
+  actor 안에서 부르면 조용히 데드락 ★       actor 안에서 부르면 즉시 예외 ★
+```
+
+★ 이 줄이 핵심입니다. `AskSync` 는 첫 줄에서 `JobDiagnostics.GuardBlockingWait` 를 부릅니다.
 
 ```
 ❌ 잘못된 사용:
 void ProcessSomething()  // ChatServer 큐 안에서 실행 중
 {
-    var snap = room.GetSnapshot();  // ← 데드락 위험!
-    // ChatServer 큐가 멈춤(ev.Wait)
-    // Room.DoAsync가 ChatServer 큐에서 처리되길 기다리면 데드락!
+    var snap = room.GetSnapshot();
+    // 예전: ChatServer 큐가 ev.Wait 에서 멈춤 → Room 의 작업을 처리해 줄 스레드가
+    //       바로 지금 멈춰 있는 이 스레드 → 조용한 데드락, 원인 파악 매우 어려움
+    // 지금: InvalidOperationException — "actor 'ChatServer' 안에서 AskSync 를 불렀다"
 }
 
 ✅ 올바른 사용:
-// 외부 스레드(메인, 통계 수집 등)에서 호출
+// 외부 스레드(메인, 콘솔 명령, 통계 수집 등)에서 호출
 var snapshot = server.GetSnapshot();
+
+✅ actor 안에서 다른 actor 의 데이터가 필요하다면 — 메시지 패싱
+private void ProcessSomething()
+{
+    room.RequestSnapshot(this);   // room 이 결과를 이쪽 큐로 DoAsync 해 준다
+}
 ```
+
+이 가드는 `JobSystemOptions.DetectBlockingWaitOnWorker` 로 켜고 끕니다 (DEBUG 기본 on).
 
 ---
 
@@ -344,6 +423,26 @@ public class ChatWorker : IRunnable
     }
 }
 ```
+
+> **이 워커는 v2.1 에서는 필요 없습니다.**
+> `InboundCommands` + `TryDequeue` + `Thread.Sleep(1)` 조합은 라이브러리에 ready 큐와
+> 시그널 대기가 없던 시절의 우회책입니다. 지금은:
+>
+> ```csharp
+> // 워커: 사용자 루프 없음. 유휴 시 CPU 0%, 유입 지연은 마이크로초.
+> _dispatcher = new JobDispatcher(_workerCount, new JobDispatcherOptions { System = _system });
+> _ = _dispatcher.RunWorkerThreadsAsync();
+>
+> // 외부(IO/시뮬레이션) 스레드: 중계 큐 대신
+> _system.Post(() => server.HandleRoomChat(userId, roomId, content));
+>
+> // 세션별 순서 보장이 필요하면 Sequencer 가 알아서 Post 한다 (7장)
+> new Sequencer<string>(_system, handler: HandleOnePacket);
+> ```
+>
+> `Thread.Sleep(1)` 폴링은 워커 8개면 초당 8,000회 깨어나고, Windows 타이머 해상도
+> 때문에 1~15ms 의 유입 지연을 만듭니다. `ExampleChatServer` 는 옛 방식의 참고용으로
+> 남아 있고, 이관된 형태는 12장의 `AdvancedMmorpgServer` 에서 볼 수 있습니다.
 
 ---
 
@@ -416,11 +515,14 @@ Actor 방법:
 ChatServer 예제에서:
 ✓ 세 Actor(ChatServer, Room, User) 협업 구조
 ✓ Handle*/Process* 코딩 컨벤션
-✓ 자기복제 Heartbeat (StatsHeartbeat, IdleScanHeartbeat)
-✓ GetSnapshot 패턴 — ManualResetEventSlim 신호 대기
-✓ Actor → Actor 메시지 패싱 (user.HandleUserDisconnect)
+✓ 주기 작업 — 예제는 자기복제, 새 코드는 DoAsyncEvery + ITimerHandle
+✓ 외부 읽기 — 예제는 ManualResetEventSlim, 새 코드는 AskSync
+✓ Actor → Actor 메시지 패싱 (server.HandleUserDisconnect)
 ✓ 워커 스레드에서 ThreadContext.TickCount로 주기 로그
-✓ GetSnapshot 호출 시 데드락 주의!
+✓ actor 큐 안에서의 동기 대기는 데드락 — 이제 AskSync 가 예외로 잡아 준다
+✓ 셧다운은 System.StopAsync 한 번 (TimerRegistry.DisposeAll 은 이제 no-op)
+✓ 이 예제의 InboundCommands 중계 큐는 v2.0 스타일이다
+  (이관된 형태는 12장)
 ```
 
 ---

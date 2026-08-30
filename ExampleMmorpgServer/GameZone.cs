@@ -32,10 +32,13 @@ public class GameZone : AsyncExecutable
     private const float MeleeRange = 3.0f;
     private const float MaxCastRange = 15.0f;
 
-    public string Name => _name;
+    /// <summary>사람이 읽는 존 이름. actor 이름은 <see cref="AsyncExecutable.Name"/>.</summary>
+    public string DisplayName => _name;
     public SpatialIndex Spatial => _spatialIndex;
 
     public GameZone(string name, float width, float height, float cellSize = 50f)
+        // JobOptions.Name 을 주면 라이브러리 로그와 메트릭에도 이 이름이 찍힌다.
+        : base(new JobOptions { Name = $"Zone:{name}" })
     {
         _name = name;
         _width = width;

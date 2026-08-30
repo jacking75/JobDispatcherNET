@@ -67,6 +67,11 @@ public class TestObject : AsyncExecutable
 }
 ```
 
+> `TestFuncForTimer` 는 "자기 자신을 다시 예약"하는 옛 패턴을 일부러 남겨 둔 예제입니다.
+> 실제 주기 작업에는 `DoAsyncEvery` 를 쓰세요 (5.5) — 예외에 강하고 취소가 쉽습니다.
+> `DoAsyncAfter` 는 이제 `ITimerHandle` 을 반환하므로, 위처럼 반환값을 버리면 나중에
+> 취소할 방법이 없다는 점도 기억해 두세요.
+
 잠깐! `_testCount`에 `Interlocked.Add`를 쓰고 있습니다. Actor 내부에서 실행되는데 왜 Interlocked을 쓸까요?
 
 ```
@@ -97,12 +102,12 @@ static async Task BasicExampleAsync()
 
     await using var testObject = new TestObject();
 
-    // ① 즉시 실행 — 큐에 넣고 이 스레드에서 바로 Flush!
+    // ① 즉시 실행 — 큐에 넣고 이 스레드(Main)에서 바로 Flush!
     testObject.DoAsync(() => testObject.TestFunc0());
     testObject.DoAsync(() => testObject.TestFunc1(5));
     testObject.DoAsync(() => testObject.TestFunc2(25, 10));
 
-    // ② 500ms 후 실행 — TimerQueue에 예약
+    // ② 500ms 후 실행 — 시스템의 타이머 스레드에 예약
     testObject.DoAsyncAfter(TimeSpan.FromMilliseconds(500),
         () => testObject.TestFunc1(15));
 
@@ -117,38 +122,57 @@ static async Task BasicExampleAsync()
 
 ```
 DoAsync(TestFunc0)
-    → Increment(count=1)  — 내가 첫 번째!
+    → CAS 0→1  — 내가 첫 번째, 즉 leader!
     → 큐에 넣기
-    → Flush 시작
-        TestFunc0 실행  (_testCount += 1)
-        Decrement(count=0)  — 큐 비었음 → break
+    → Flush 시작 (Main 스레드에서)
+        TestFunc0 실행  (_testCount += 1)          ← +1
+        Decrement(count=0)  — 큐 비었음 → return
 
 DoAsync(TestFunc1(5))
-    → Increment(count=1)  — 또 첫 번째!
-    → 큐에 넣기
+    → CAS 0→1  — 또 첫 번째!
     → Flush 시작
-        TestFunc1(5) 실행  (_testCount += 5)
-        Decrement(count=0)  — break
+        TestFunc1(5) 실행  (_testCount += 5)       ← +5
+        Decrement(count=0)  — return
 
 DoAsync(TestFunc2(25, 10))
-    → Increment(count=1)
-    → 큐에 넣기
+    → CAS 0→1
     → Flush 시작
         TestFunc2(25, 10) 실행
-            Interlocked.Add(10)
+            Interlocked.Add(10)                    ← +10
             a(25) < 50.0 → DoAsync(TestFunc1(10))
-                → Increment(count=2)  ← 아직 Flush 중이므로 큐에만 넣기
+                → CAS 1→2  ← 이미 leader 가 있으므로 큐에만 넣기
         Decrement(count=1)  — 아직 작업 있음
-        TestFunc1(10) 실행  (_testCount += 10)
-        Decrement(count=0)  — break
+        TestFunc1(10) 실행  (_testCount += 10)     ← +10
+        Decrement(count=0)  — return
 
 DoAsyncAfter(500ms, TestFunc1(15))
-    → TimerQueue에 예약
-    → 500ms 후 TimerDispatchQueue에 추가
-    → 워커 스레드(없음) 또는 메인 스레드의 다음 Flush에서 처리
+    → 타이머 스레드(JobTimer-default)의 PriorityQueue 에 예약
+    → 500ms 후 만료 → testObject 의 큐로 투입
+    → 이 프로세스에는 워커가 없다 → 타이머 스레드가 그 자리에서 Flush
+       (Warn 로그 1회: "JobSystem 'default' has no worker threads ...")
+        TestFunc1(15) 실행  (_testCount += 15)     ← +15
 
 최종: _testCount = 1 + 5 + 10 + 10 + 15 = 41
+출력:  Test count: 41
 ```
+
+### ⚠️ v2.0 에서는 여기서 26 이 나왔습니다
+
+이 예제는 P0-3 결함의 재현 코드이기도 합니다.
+
+```
+v2.0 출력:  Test count: 26      ( = 1 + 5 + 10 + 10 )
+v2.1 출력:  Test count: 41      ( = 26 + 15 )
+```
+
+만료된 타이머 작업이 워커만 드레인하는 큐로 들어갔는데, 이 예제에는 `JobDispatcher` 가
+없습니다. 그래서 `TestFunc1(15)` 이 **영원히 실행되지 않았고**, 경고도 없었습니다.
+"디스패처 없이도 지연 실행이 정상 트리거된다"는 예전 설명은 v1 시절의 동작이었고,
+v2.0 에서는 사실이 아니었습니다.
+
+지금은 워커가 없으면 타이머 스레드가 직접 flush 합니다. 다시 "디스패처 없이도 동작"하지만,
+**그 경우 콜백이 워커가 아니라 타이머 스레드에서 실행된다**는 조건이 붙습니다. 그래서 첫
+발화 때 경고를 한 번 남깁니다. 실제 서버라면 `JobDispatcher` 를 띄우세요.
 
 ---
 
@@ -263,8 +287,9 @@ JobWorker-2 (OS Thread C): ...
 JobWorker-3 (OS Thread D): ...
 
 ★ 같은 TestObject에 여러 워커가 DoAsync를 보낼 수 있음
-  → Channel이 직렬화 보장!
-  → 어떤 워커가 Flush하든 순서 보장
+  → 입장 CAS 가 leader 를 단 하나로 정한다 → 동시 실행 없음
+  → 어떤 워커가 Flush하든 "한 번에 하나씩"이 보장된다
+    (단, 서로 다른 producer 중 누가 먼저 넣는지는 보장되지 않는다 — 7장 Sequencer)
 ```
 
 ---
@@ -314,6 +339,15 @@ public class DataProcessor : AsyncExecutable
     }
 }
 ```
+
+> **지금은 `Ask` 한 줄이면 됩니다.**
+> ```csharp
+> public Task<Dictionary<string, int>> GetProcessingStatsAsync()
+>     => Ask(() => new Dictionary<string, int>(_processedItems));
+> ```
+> `Ask` 는 위와 똑같이 큐를 통과시키면서, 핸들러가 예외를 던지면 Task 를 실패시키고,
+> 큐에 들어가지 못하면 `JobRejectedException` 으로 실패시킵니다. 손으로 만든
+> `TaskCompletionSource` 는 거부됐을 때 영원히 완료되지 않는다는 함정이 있습니다.
 
 왜 GetProcessingStatsAsync에서 큐를 사용하나요?
 
@@ -421,18 +455,21 @@ sequenceDiagram
 
 ```
 BasicExample에서:
-✓ DoAsync는 즉시 Flush를 돌려 같은 스레드에서 처리
-✓ DoAsyncAfter는 TimerQueue에 예약
+✓ DoAsync는 즉시 Flush를 돌려 같은 스레드(Main)에서 처리
+✓ DoAsyncAfter는 시스템의 타이머 스레드에 예약된다
+✓ 워커가 없으면 타이머 콜백이 타이머 스레드에서 실행된다 (경고 1회)
 ✓ Actor 내부에서 DoAsync 호출 시 기존 Flush에 합류
+✓ 기대 출력은 41 — 26 이 나온다면 v2.0 이하다 (P0-3)
 
 WorkerThreadExample에서:
-✓ IRunnable + JobDispatcher = 전용 OS 스레드
-✓ 여러 워커가 같은 Actor에 DoAsync → Channel이 직렬화
+✓ IRunnable + JobDispatcher<T> = 전용 OS 스레드
+✓ 여러 워커가 같은 Actor에 DoAsync → 입장 CAS 가 직렬 실행을 보장
 ✓ Run()이 false 반환 → 해당 워커만 종료 (다른 워커 유지)
+✓ 자체 루프가 필요 없다면 비제네릭 JobDispatcher 가 더 낫다 (6.2)
 
 AdvancedExample에서:
-✓ 읽기도 DoAsync를 통과 → 일관된 스냅샷
-✓ TaskCompletionSource로 비동기 결과 회수
+✓ 읽기도 큐를 통과 → 일관된 스냅샷
+✓ 결과 회수는 손수 만든 TaskCompletionSource 대신 Ask 로
 ✓ 자기 자신에게 후속 작업 예약 가능
 ```
 
