@@ -50,9 +50,19 @@ dotnet test JobDispatcherNET.Tests/JobDispatcherNET.Tests.csproj -f net8.0
 Stress tests are marked `[Trait("Category", "Stress")]` (see
 `JobDispatcherNET.Tests/MetricsAndStressTests.cs`). They run for tens of seconds, push
 millions of jobs, and assert on throughput and drain latency, so they are unreliable on a
-shared CI runner — CI runs them in a `continue-on-error` step. Run them locally on an
-otherwise idle machine before any change to the admission path, the flush loop, the timer
-thread or the ready queue.
+loaded machine. Run them on an otherwise idle one before any change to the admission path,
+the flush loop, the timer thread or the ready queue.
+
+There is no automated pipeline in this repository, so **running the full suite locally is
+part of submitting a change**, not something a bot will do for you. At minimum, before
+opening a pull request:
+
+```bash
+dotnet build All.sln -c Release          # must be 0 errors, 0 warnings
+dotnet test JobDispatcherNET.Tests/JobDispatcherNET.Tests.csproj -c Release
+```
+
+The test project multi-targets, so that command exercises both `net8.0` and `net10.0`.
 
 Give a new stress test the trait too. Anything that takes more than a couple of seconds
 or asserts on wall-clock timing belongs there, not in the default suite.

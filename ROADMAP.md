@@ -12,7 +12,8 @@
 |---|---|
 | P0 안정성 버그 4건 + 소형 항목 | ✅ 수정 + 회귀 테스트 (§1) |
 | P1 아키텍처 8개 항목 | ✅ 구현 (§2) |
-| OSS 인프라 (LICENSE / NuGet / CI / 테스트 / 벤치마크) | ✅ 구축 (§3) |
+| OSS 인프라 (LICENSE / NuGet 패키징 / 테스트 / 벤치마크) | ✅ 구축 (§3) |
+| CI 파이프라인 | ❌ 저장소 소유자 요청으로 제거 — §3.1 참고 |
 | P2 성능 | ⚠️ 측정 근거가 있는 것만 반영, 나머지는 벤치 대기 (§4) |
 | P2 생태계 (Hosting / Logging / 네트워크 샘플 / 템플릿) | ✅ 구현 (§5) |
 | 문서 (영어 README / docs / Book 정정) | ✅ 작성 (§6) |
@@ -172,13 +173,17 @@ Windows 전용 opt-in `RaiseSystemTimerResolution` · 타이머 lag 히스토그
 
 ## 3. P1 — 오픈소스 인프라 (완료)
 
-### 3.1 라이선스·패키징·CI ✅
+### 3.1 라이선스·패키징 ✅ (CI 는 제외)
 `LICENSE`(MIT) · `Directory.Build.props` 로 버전 중앙화 · `net8.0;net10.0` 멀티타겟 ·
 NuGet 메타/SourceLink/snupkg/XML 문서 · `TreatWarningsAsErrors` + `IsAotCompatible` ·
-GitHub Actions `ci.yml`(Windows+Linux 매트릭스, stress 는 `continue-on-error`) / `release.yml`(태그
-푸시 시 NuGet publish + GitHub Release) / `dependabot.yml` ·
-`CHANGELOG.md` / `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` / `SECURITY.md` / `.editorconfig` /
-이슈·PR 템플릿.
+`dependabot.yml` · `CHANGELOG.md` / `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` / `SECURITY.md` /
+`.editorconfig` / 이슈·PR 템플릿.
+
+> **GitHub Actions 워크플로는 저장소 소유자 요청으로 제거했다.** 한 번 만들었던
+> `ci.yml`(Windows+Linux 매트릭스) 과 `release.yml`(태그 푸시 시 NuGet publish) 은 삭제된
+> 상태다. 따라서 **빌드·테스트 검증은 로컬에서 수동으로 해야 한다** —
+> `CONTRIBUTING.md` 에 PR 전 실행할 명령을 적어 두었다. 나중에 파이프라인이 필요해지면
+> 이 커밋 이전 이력에서 두 워크플로를 되살릴 수 있다.
 
 ### 3.2 테스트 ✅ — **66개, 0 실패**
 `JobDispatcherNET.Tests` (xUnit, net8.0+net10.0). 직렬화 보장 / P0 회귀 7건 / bounded 큐 /
@@ -275,7 +280,7 @@ TODO 로 남김. 스모크 런 실측: ping-pong 3.875µs(inline) / 4.365µs(sch
 | 우선순위 | 항목 |
 |---|---|
 | **높음** | C++ 원본 저장소 링크와 원저자 표기를 `README.md`·`LICENSE` 에 채우기 (법적/예의 문제) |
-| **높음** | `v2.1.0` 태그를 밀어 릴리스 워크플로 실행 → NuGet 첫 배포. `NUGET_API_KEY` 시크릿 등록 필요 |
+| **높음** | NuGet 첫 배포 — 자동 릴리스 워크플로가 없으므로 **수동**으로: `dotnet pack -c Release` 후 `dotnet nuget push`. 패키징 메타데이터는 이미 갖춰져 있다 |
 | 중간 | 벤치마크 정식 실행 후 `docs/benchmarks.md`·README 표에 실측치 반영 (§4.1/§4.2 판단 근거) |
 | 중간 | 타이머 정확도를 베어 Windows Server 에서 실측 (§4.4) |
 | 중간 | GitHub Discussions 개설, 저장소 About/토픽 설정 |

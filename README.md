@@ -1,6 +1,5 @@
 # JobDispatcherNET
 
-[![CI](https://github.com/jacking75/JobDispatcherNET/actions/workflows/ci.yml/badge.svg)](https://github.com/jacking75/JobDispatcherNET/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/JobDispatcherNET.svg)](https://www.nuget.org/packages/JobDispatcherNET/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![net8.0 | net10.0](https://img.shields.io/badge/target-net8.0%20%7C%20net10.0-512BD4.svg)](#)

@@ -76,7 +76,7 @@ everything replaced rather than removed is marked `[Obsolete]` and still compile
   command queue.
 - **`net8.0` target.** The library now multi-targets `net8.0;net10.0`.
 - **NuGet packaging**: package metadata, README in the package, XML documentation,
-  SourceLink, deterministic CI builds, symbol packages (`.snupkg`), `IsAotCompatible` and
+  SourceLink, deterministic builds, symbol packages (`.snupkg`), `IsAotCompatible` and
   `IsTrimmable`.
 - Actor identity and introspection for logs and metric tags: `JobOptions.Name`,
   `AsyncExecutable.Name`, `MaxObservedQueueDepth`, `IsFaulted`, and a `ToString()` that
