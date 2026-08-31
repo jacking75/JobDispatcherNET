@@ -1,6 +1,6 @@
 # JobDispatcherNET 로드맵
 
-> **최초 작성** 2026-08-30 · **실행 완료** 2026-08-30 (v2.1.0) · **환경** .NET SDK 10.0.301 / Windows 11
+> **최초 작성** 2026-08-30 · **실행 완료** 2026-08-30 (v2.1 코드 세대 → 패키지 0.10.0) · **환경** .NET SDK 10.0.301 / Windows 11
 > 이 문서는 원래 "무엇을 할지" 계획서였다. 아래 §1~§6 의 항목은 **대부분 구현되었고**, 각 절에
 > 실제 결과와 검증 방법을 함께 적었다. 남은 일은 §9 에 모아 두었다.
 
@@ -264,11 +264,12 @@ TODO 로 남김. 스모크 런 실측: ping-pong 3.875µs(inline) / 4.365µs(sch
 
 문서에 적힌 기본값대로 진행했다. 되돌리려면 아래를 바꾸면 된다.
 
-1. 라이선스 **MIT** (`LICENSE`) — ⚠️ C++ 원본 저장소 링크는 저장소에 정보가 없어 비워 두었다.
-   `README.md` 하단 TODO 주석 참조. **원저자 표기는 확인 후 채워야 한다.**
+1. 라이선스 **MIT** (`LICENSE`) — 설계의 출처는 C++ [JobDispatcher](https://github.com/ujentus/JobDispatcher)(GPL-2.0)이지만,
+   이 저장소는 그 **설계만 보고 독립적으로 구현**한 것이므로 MIT 를 유지한다.
+   출처는 `README.md`·`README.ko.md` 의 감사의 말 절과 ADR-0001 에 명시했다.
 2. P0-3 처리 **A(폴백 디스패치)**
 3. 타깃 **`net8.0;net10.0`**
-4. 전역 static: **v2.1 에서 `[Obsolete]`, v4.0 제거 예고**
+4. 전역 static: **v2.1 코드 세대에서 `[Obsolete]`, 패키지 1.0.0 에서 제거 예고**
 5. README **영어 기본** + `README.ko.md`
 6. 실행 모드 기본 **`LeaderFlush`** (호환), 문서에서 `Scheduled` 권장
 7. 패키지 **분리** (코어 무의존 유지)
@@ -279,8 +280,9 @@ TODO 로 남김. 스모크 런 실측: ping-pong 3.875µs(inline) / 4.365µs(sch
 
 | 우선순위 | 항목 |
 |---|---|
-| **높음** | C++ 원본 저장소 링크와 원저자 표기를 `README.md`·`LICENSE` 에 채우기 (법적/예의 문제) |
-| **높음** | NuGet 첫 배포 — 자동 릴리스 워크플로가 없으므로 **수동**으로: `dotnet pack -c Release` 후 `dotnet nuget push`. 패키징 메타데이터는 이미 갖춰져 있다 |
+| ✅ 완료 | ~~C++ 원본 출처·원저자 표기~~ — `README.md`·`README.ko.md` 감사의 말 절, ADR-0001 (2026-08-31) |
+| **높음** | NuGet 첫 배포 **0.10.0** — 워크플로가 없으므로 **수동**으로: `dotnet pack -c Release` 후 `dotnet nuget push`. 패키지 4개(코어·Logging·Hosting·Templates), ID 네 개 모두 nuget.org 에 비어 있음을 확인했다 |
+| **높음** | 배포 직후 `v0.10.0` 태그 + GitHub Release 생성 (CHANGELOG 하단 링크가 이 태그를 가리킨다) |
 | 중간 | 벤치마크 정식 실행 후 `docs/benchmarks.md`·README 표에 실측치 반영 (§4.1/§4.2 판단 근거) |
 | 중간 | 타이머 정확도를 베어 Windows Server 에서 실측 (§4.4) |
 | 중간 | GitHub Discussions 개설, 저장소 About/토픽 설정 |

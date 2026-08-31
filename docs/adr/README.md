@@ -8,7 +8,7 @@ changes it gets a new record that supersedes the old one.
 
 | # | Decision | Status |
 |---|---|---|
-| [0001](0001-leader-flush.md) | Producers flush actors; actors have no thread of their own | Accepted (inherited from the C++ original, recorded retroactively) |
+| [0001](0001-leader-flush.md) | Producers flush actors; actors have no thread of their own | Accepted (follows the C++ [JobDispatcher](https://github.com/ujentus/JobDispatcher), recorded retroactively) |
 | [0002](0002-dedicated-threads.md) | Workers are dedicated OS threads, not thread-pool threads | Accepted (recorded retroactively) |
 | [0003](0003-timer-service.md) | One timer thread per `JobSystem`, replacing per-thread timer queues | Accepted in v2.1 — fixes P0-2 and P0-3 |
 | [0004](0004-admission-cas.md) | Queue admission is a CAS on the counter, not a bounded-channel write | Accepted in v2.1 — fixes P0-1 |

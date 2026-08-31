@@ -229,6 +229,13 @@ dotnet run  -c Release --project JobDispatcherNET.Benchmarks -- --filter *
 [CONTRIBUTING.md](CONTRIBUTING.md) 를 참고하세요. 동시성 관련 변경은 수정 전에 실패하는 회귀
 테스트가 필요합니다 — [`RegressionTests.cs`](JobDispatcherNET.Tests/RegressionTests.cs) 가 본보기입니다.
 
+## 감사의 말
+
+액터가 자기 job 큐를 소유하고 producer 가 flush 리더를 선출하는 실행 모델은
+C++ [JobDispatcher](https://github.com/ujentus/JobDispatcher) ([ujentus](https://github.com/ujentus)) 의 설계를
+따릅니다. 이 저장소의 .NET 코드는 그 설계를 보고 독립적으로 구현한 것이며,
+원본 소스를 옮기거나 복사하지 않았습니다.
+
 ## 라이선스
 
-[MIT](LICENSE). 게임 서버 개발에서 쓰이던 C++ job dispatcher 설계를 .NET 으로 포팅한 것입니다.
+[MIT](LICENSE).

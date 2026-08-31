@@ -825,7 +825,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// Prefer <c>system.AcceptingWork</c> or <see cref="JobSystem.StopAsync"/> when the process
     /// hosts more than one system.
     /// </summary>
-    [Obsolete("Use JobSystem.Default.AcceptingWork, or system.AcceptingWork for a specific system. Removed in v4.0.")]
+    [Obsolete("Use JobSystem.Default.AcceptingWork, or system.AcceptingWork for a specific system. Removed in v1.0.")]
     public static bool AcceptingWork
     {
         get => JobSystem.Default.AcceptingWork;

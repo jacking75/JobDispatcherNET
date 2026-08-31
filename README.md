@@ -232,8 +232,13 @@ The library targets **net8.0** and **net10.0** and has no runtime dependencies.
 See [CONTRIBUTING.md](CONTRIBUTING.md). Concurrency changes need a regression test that fails
 without the fix — [`RegressionTests.cs`](JobDispatcherNET.Tests/RegressionTests.cs) is the model.
 
+## Acknowledgements
+
+The execution model — an actor that owns its job queue, with producers electing a flush
+leader — follows the design of the C++ [JobDispatcher](https://github.com/ujentus/JobDispatcher)
+by [ujentus](https://github.com/ujentus). The .NET code in this repository is an independent
+implementation written from that design; no source was translated or copied from it.
+
 ## License
 
-[MIT](LICENSE). Ported to .NET from a C++ job-dispatcher design used in game-server development.
-
-<!-- TODO(maintainer): add the link to the original C++ repository here for attribution. -->
+[MIT](LICENSE).

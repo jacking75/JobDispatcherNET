@@ -1,7 +1,7 @@
 # ADR 0001 — Producers flush actors ("leader flush")
 
-- **Status**: Accepted. Inherited from the C++ original this library is a port of; recorded
-  retroactively.
+- **Status**: Accepted. Follows the design of the C++ [JobDispatcher](https://github.com/ujentus/JobDispatcher);
+  recorded retroactively.
 - **Affects**: `AsyncExecutable.Admit`, `AsyncExecutable.Flush`, `ThreadContext.ExecuterQueue`
 
 ## Context

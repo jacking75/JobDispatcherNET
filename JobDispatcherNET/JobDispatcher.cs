@@ -30,7 +30,7 @@ public sealed record JobDispatcherOptions
     public int MaxReadyDrainPerTick { get; init; } = 256;
 
     /// <inheritdoc cref="MaxReadyDrainPerTick" />
-    [Obsolete("Renamed to MaxReadyDrainPerTick; timer dispatch now flows through the shared ready queue. Removed in v4.0.")]
+    [Obsolete("Renamed to MaxReadyDrainPerTick; timer dispatch now flows through the shared ready queue. Removed in v1.0.")]
     public int MaxTimerDrainPerTick
     {
         get => MaxReadyDrainPerTick;

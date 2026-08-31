@@ -7,7 +7,7 @@ namespace JobDispatcherNET;
 /// ones created on threads that were about to disappear. A <see cref="JobSystem"/> now owns a
 /// single timer thread, disposed with the system, so there is nothing left to clean up here.
 /// </summary>
-[Obsolete("Timers are owned by the JobSystem and disposed with it. Call JobSystem.StopAsync or Dispose instead. Removed in v4.0.")]
+[Obsolete("Timers are owned by the JobSystem and disposed with it. Call JobSystem.StopAsync or Dispose instead. Removed in v1.0.")]
 public static class TimerRegistry
 {
     /// <summary>No-op. Present only for source compatibility.</summary>

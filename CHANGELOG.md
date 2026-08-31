@@ -5,19 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **On version numbers.** `0.10.0` is the first version ever published to NuGet — nothing before
+> it was released as a package. The `v2.0` / `v2.1` labels in `docs/`, `Book/` and in the notes
+> below refer to *in-repository API generations*, not to package versions. The package stays on
+> `0.x` until the API has been through enough real use to freeze; `1.0.0` is where the `[Obsolete]`
+> members listed here are removed.
+
 ## [Unreleased]
 
 Nothing yet.
 
-## [2.1.0] - 2026-08-30
+## [0.10.0] - 2026-08-31
 
 The first release published to NuGet, and the first with a library test suite. It closes
 the four P0 stability defects that made the previous code unsafe for a long-running
 server, and adds the execution model, timer and observability work that a production game
 server needs.
 
-Upgrading from 2.0 is source-compatible except for the four items under **Changed**;
-everything replaced rather than removed is marked `[Obsolete]` and still compiles.
+Upgrading from the previous in-repository code (v2.0) is source-compatible except for the
+four items under **Changed**; everything replaced rather than removed is marked
+`[Obsolete]` and still compiles.
 
 ### Added
 
@@ -198,12 +205,12 @@ release. They are listed first because they were introduced by the v2.1 work rat
 
 - `AsyncExecutable.AcceptingWork` — the process-wide shutdown gate. Use
   `JobSystem.Default.AcceptingWork`, or `system.AcceptingWork` for a specific system.
-  Removed in 4.0.
+  Removed in 1.0.
 - `TimerRegistry` — timers are owned by the `JobSystem` and disposed with it, so there is
   nothing left for this to clean up. Its members are now no-ops kept for source
-  compatibility. Removed in 4.0.
+  compatibility. Removed in 1.0.
 - `JobDispatcherOptions.MaxTimerDrainPerTick` — renamed to `MaxReadyDrainPerTick`.
-  Removed in 4.0.
+  Removed in 1.0.
 
 ### Removed
 
@@ -213,5 +220,5 @@ release. They are listed first because they were introduced by the v2.1 work rat
 - `ThreadContext.Timer`. Timers are no longer thread-affine, so there is nothing per-thread
   to expose.
 
-[Unreleased]: https://github.com/jacking75/JobDispatcherNET/compare/v2.1.0...HEAD
-[2.1.0]: https://github.com/jacking75/JobDispatcherNET/releases/tag/v2.1.0
+[Unreleased]: https://github.com/jacking75/JobDispatcherNET/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jacking75/JobDispatcherNET/releases/tag/v0.10.0
