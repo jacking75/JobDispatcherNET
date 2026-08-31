@@ -3,7 +3,7 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 2 — "1,000 actors, 8 producers: throughput".
+/// 1,000 actors, 8 producers: throughput.
 ///
 /// Eight producer threads spray a fixed batch of <see cref="TotalJobs"/> messages round-robin over
 /// <see cref="ActorCount"/> actors while <see cref="Workers"/> worker threads drain them. One

@@ -15,11 +15,10 @@ changes it gets a new record that supersedes the old one.
 
 ## Sample-specific design notes
 
-These two are **not** core-library ADRs. They are the design notes for the AoE/AOI system in the
-`AdvancedMmorpgServer` sample, moved here from `AdvancedMmorpgServer/Docs/` so they are findable;
-they describe that sample's game logic, not the dispatcher. Both are written in Korean.
+This is **not** a core-library ADR. It is the design note for the AoE/AOI system in the
+`AdvancedMmorpgServer` sample, moved here from `AdvancedMmorpgServer/Docs/` so it is findable;
+it describes that sample's game logic, not the dispatcher. Written in Korean.
 
 | Document | What it covers |
 |---|---|
 | [aoe-aoi-design.md](aoe-aoi-design.md) | Concurrency design for area-of-effect attacks (how to avoid a job explosion when one attack hits many targets, and how to return the result to the attacker) and for area-of-interest queries (why the sector grid needs no lock). |
-| [aoi-push-implementation-plan.md](aoi-push-implementation-plan.md) | The implementation plan that turned that design into the sample's push-model AOI: 3×3 sector visibility, per-player state deltas, and the periodic resync safety net. |

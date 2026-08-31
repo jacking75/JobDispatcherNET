@@ -1,7 +1,7 @@
 # JobDispatcherNET.Benchmarks
 
-[BenchmarkDotNet](https://benchmarkdotnet.org/) harness for the scenarios in **ROADMAP §3.3**.
-It exists so that §4 ("P2 — 성능 개선") can be decided by measurement instead of intuition:
+[BenchmarkDotNet](https://benchmarkdotnet.org/) harness for the library's core dispatch paths.
+It exists so that performance changes are decided by measurement instead of intuition:
 **측정 없이 바꾸지 말 것.**
 
 ## Running
@@ -30,20 +30,19 @@ Without arguments the switcher prints an interactive menu of the available bench
 
 ## What is measured
 
-| Class | ROADMAP §3.3 row | What it answers |
+| Class | Scenario | What it answers |
 |---|---|---|
 | `SingleActorThroughput` | single actor, single producer | ops/s and alloc/op for `DoAsync(Action)` (capturing closure) vs `DoAsync<TState>` (static lambda), in both `LeaderFlush` and `Scheduled` mode |
 | `ManyActorsThroughput` | 1,000 actors × 8 producers | end-to-end cost per message at 1 / 100 / 1000 actors and 4 / 8 workers |
 | `PingPongLatency` | actor→actor ping-pong | round-trip cost inline, on a worker, and one-at-a-time from an external thread |
 | `TimerScheduling` | 10,000 timers at once | schedule + fire lag, and schedule + cancel cost on its own |
 | `RejectionCost` | bounded rejection path | what a refused `DoAsync` costs, next to an accepted one as baseline |
-| `PoolEffect` | pool on/off | Gen0 collections with `Job.MaxPoolSize` at its default vs 0 — the evidence ROADMAP §4.1 asks for |
+| `PoolEffect` | pool on/off | Gen0 collections with `Job.MaxPoolSize` at its default vs 0 — the evidence needed before touching the pool |
 | `AlternativesComparison` | comparison targets | the identical workload on JobDispatcherNET, raw `Channel<T>` + a ThreadPool drain loop, and TPL Dataflow `ActionBlock(MaxDegreeOfParallelism = 1)` |
 
-Akka.NET and Proto.Actor are named in ROADMAP §3.3 and are **not** here yet — they pull in a large
-dependency graph and need their own tuning pass (dispatcher and mailbox configuration) before a
-comparison against them would be fair rather than a strawman. See the TODO in
-`AlternativesComparison.cs`.
+Akka.NET and Proto.Actor are **not** here yet — they pull in a large dependency graph and need
+their own tuning pass (dispatcher and mailbox configuration) before a comparison against them
+would be fair rather than a strawman. See the TODO in `AlternativesComparison.cs`.
 
 ## Where results go
 
@@ -60,12 +59,12 @@ are dominated by things that differ across environments:
 
 - **Timer resolution.** `TimerScheduling` measures firing lag, and on Windows the default
   `TimerPrecision.Coarse` floor is the system timer resolution (~15.6 ms unless another process has
-  raised it). Linux behaves differently, and a VM differs from bare metal. This is exactly the
-  measurement ROADMAP §4.4 asks for, so it must be taken on the target OS.
+  raised it). Linux behaves differently, and a VM differs from bare metal, so this must be taken on
+  the target OS.
 - **Thread scheduling and core count.** `ManyActorsThroughput` and `AlternativesComparison` run 8
   producer threads plus a worker pool; results move with physical core count, SMT, and CPU
   affinity/power settings.
 - **GC configuration.** `PoolEffect` reads Gen0 counts, which shift with server vs workstation GC.
 
-So: publish Windows **and** Linux tables (ROADMAP §3.3 asks for both), regenerate after any change
-to the dispatch path, and re-run the whole family rather than a single row when comparing.
+So: publish Windows **and** Linux tables, regenerate after any change to the dispatch path, and
+re-run the whole family rather than a single row when comparing.

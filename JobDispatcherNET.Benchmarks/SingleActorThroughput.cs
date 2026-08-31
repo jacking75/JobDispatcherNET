@@ -3,8 +3,7 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 1 — "single actor, single producer <c>DoAsync</c>: ops/s, alloc/op
-/// (<c>Action</c> vs <c>TState</c>)".
+/// Single actor, single producer <c>DoAsync</c>: ops/s, alloc/op (<c>Action</c> vs <c>TState</c>).
 ///
 /// Both benchmarks push the same fixed batch at one actor from one producer thread and wait for the
 /// actor to drain. The only difference is how the job body is handed over:

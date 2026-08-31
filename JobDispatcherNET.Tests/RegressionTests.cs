@@ -3,7 +3,8 @@ using Xunit;
 namespace JobDispatcherNET.Tests;
 
 /// <summary>
-/// One test per P0 defect listed in ROADMAP.md. Each fails against the v2.0 implementation.
+/// One test per P0 defect fixed in the v2.1 rework (see docs/adr). Each fails against the v2.0
+/// implementation.
 /// </summary>
 public sealed class RegressionTests
 {

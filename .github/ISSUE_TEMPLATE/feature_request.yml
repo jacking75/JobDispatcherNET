@@ -10,9 +10,6 @@ body:
         bar for new surface area is "several users cannot do this without it". Proposals
         that fit an existing extension package, a sample, or documentation usually land faster.
 
-        Check [ROADMAP.md](https://github.com/jacking75/JobDispatcherNET/blob/main/ROADMAP.md)
-        first — the thing you want may already be planned.
-
   - type: textarea
     id: problem
     attributes:

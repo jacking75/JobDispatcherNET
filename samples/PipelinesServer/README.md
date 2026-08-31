@@ -1,7 +1,7 @@
 # PipelinesServer + LoadClient
 
 A binary-protocol game server built on `System.IO.Pipelines` and JobDispatcherNET, plus a headless
-console load generator. This is the sample called for by **ROADMAP §5.3**.
+console load generator.
 
 ## What it demonstrates
 

@@ -3,7 +3,7 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 5 — "bounded rejection path: cost of a refusal".
+/// Bounded rejection path: cost of a refusal.
 ///
 /// Back-pressure only helps if saying "no" is cheap: when a queue is full the caller is, by
 /// definition, already in trouble. Both rejecting actors are bounded at one job and hold a parked

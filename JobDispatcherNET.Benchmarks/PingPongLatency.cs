@@ -3,7 +3,7 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 3 — "actor to actor ping-pong: round-trip latency".
+/// Actor to actor ping-pong: round-trip latency.
 ///
 /// Two actors bounce one message back and forth. Three shapes are measured:
 /// <list type="bullet">

@@ -3,8 +3,8 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 6 — "pool on/off: gen0 collection count", and the evidence ROADMAP §4.1 asks
-/// for before touching <c>JobEntry</c>'s <c>ConcurrentBag</c> pool.
+/// Pool on/off: gen0 collection count — the evidence needed before touching <c>JobEntry</c>'s
+/// <c>ConcurrentBag</c> pool.
 ///
 /// <see cref="MaxPoolSize"/> = 16384 is the shipping default; 0 disables recycling entirely, so
 /// every job is a fresh gen0 object left to the collector. Read the <c>Gen0</c> column: if the

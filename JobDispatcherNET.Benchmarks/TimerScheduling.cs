@@ -3,13 +3,13 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, row 4 — "10,000 timers scheduled at once: firing lag".
+/// 10,000 timers scheduled at once: firing lag.
 ///
 /// <see cref="ScheduleAndFire"/> arms 10,000 one-shot timers and waits until every one of them has
 /// executed on its actor, so the per-operation number is schedule + timer-thread wakeup + dispatch +
 /// execute. On Windows the default <see cref="TimerPrecision.Coarse"/> mode means the floor is the
-/// OS timer resolution (~15.6 ms unless something else on the box has raised it), which is exactly
-/// what ROADMAP §4.4 asks to measure — so read this row as a lag measurement, not as pure CPU cost.
+/// OS timer resolution (~15.6 ms unless something else on the box has raised it) — so read this row
+/// as a lag measurement, not as pure CPU cost.
 ///
 /// <see cref="ScheduleAndCancel"/> isolates the bookkeeping: arm 10,000 timers far enough out that
 /// none of them can fire, then cancel them all.

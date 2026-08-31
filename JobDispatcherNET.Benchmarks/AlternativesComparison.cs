@@ -5,8 +5,8 @@ using BenchmarkDotNet.Attributes;
 namespace JobDispatcherNET.Benchmarks;
 
 /// <summary>
-/// ROADMAP §3.3, comparison row — the same workload written three ways, so the numbers are about
-/// the dispatch mechanism and nothing else.
+/// The same workload written three ways, so the numbers are about the dispatch mechanism and
+/// nothing else.
 ///
 /// The workload is fixed: <see cref="ActorCount"/> mailboxes, <see cref="Producers"/> producer
 /// threads, <see cref="TotalMessages"/> messages sprayed round-robin, every mailbox serializing its
@@ -24,8 +24,8 @@ namespace JobDispatcherNET.Benchmarks;
 /// <c>MaxDegreeOfParallelism = 1</c>, the in-box way to get per-mailbox serialization.</item>
 /// </list>
 ///
-/// TODO: Akka.NET and Proto.Actor belong in this table too (ROADMAP §3.3 names both). They are
-/// deliberately left out for now so the benchmark project stays dependency-light — adding them
+/// TODO: Akka.NET and Proto.Actor belong in this table too. They are deliberately left out for
+/// now so the benchmark project stays dependency-light — adding them
 /// pulls in a large transitive graph and their own configuration surface (dispatchers, mailbox
 /// types, actor-system startup) which needs its own tuning pass to be a fair comparison rather
 /// than a strawman.
