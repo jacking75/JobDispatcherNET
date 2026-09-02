@@ -189,18 +189,18 @@ services.AddJobDispatcher(o => o.WorkerCount = 8);
 
 | Project | What it shows |
 |---|---|
-| `ExampleConsoleApp` | The basics: `DoAsync`, `DoAsyncAfter`, worker threads |
-| `ExampleChatServer` | Multi-room chat — one actor per room |
-| `ExampleMmorpgServer` | Single-zone MMORPG — player actors, spatial index |
-| `ExampleSectorServer` | Sector-partitioned world with hand-off at boundaries |
-| `AdvancedMmorpgServer` | **The reference server.** Queue caps, `Sequencer`, metrics, supervisor, push AOI, one-call shutdown |
-| `AdvancedMmorpgClient` | MonoGame bot/viewer client that drives the server |
+| `samples/ExampleConsoleApp` | The basics: `DoAsync`, `DoAsyncAfter`, worker threads |
+| `samples/ExampleChatServer` | Multi-room chat — one actor per room |
+| `samples/ExampleMmorpgServer` | Single-zone MMORPG — player actors, spatial index |
+| `samples/ExampleSectorServer` | Sector-partitioned world with hand-off at boundaries |
+| `samples/AdvancedMmorpgServer` | **The reference server.** Queue caps, `Sequencer`, metrics, supervisor, push AOI, one-call shutdown |
+| `samples/AdvancedMmorpgClient` | MonoGame bot/viewer client that drives the server |
 | `samples/PipelinesServer` | **Binary protocol server** — `System.IO.Pipelines`, length-prefixed MessagePack frames, no thread per session |
 | `samples/LoadClient` | Headless load generator for the above; reports latency percentiles and exits non-zero on failure |
 | `samples/Observability` | Generic Host + OpenTelemetry metrics |
 
 ```bash
-dotnet run --project AdvancedMmorpgServer      # listens on 25100
+dotnet run --project samples/AdvancedMmorpgServer      # listens on 25100
 # console: status | metrics | q
 
 # Binary-protocol server plus a 200-client load run:

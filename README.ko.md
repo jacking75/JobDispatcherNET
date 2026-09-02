@@ -186,18 +186,18 @@ services.AddJobDispatcher(o => o.WorkerCount = 8);
 
 | 프로젝트 | 설명 |
 |---|---|
-| `ExampleConsoleApp` | 기본기 — `DoAsync`, `DoAsyncAfter`, 워커 스레드 |
-| `ExampleChatServer` | 멀티 채팅방 서버 — Room 하나당 actor 하나 |
-| `ExampleMmorpgServer` | 단일 존 MMORPG — 플레이어 actor, 공간 인덱스 |
-| `ExampleSectorServer` | 섹터 분할 월드와 경계 통과 핸드오프 |
-| `AdvancedMmorpgServer` | **레퍼런스 서버.** 큐 한도 / `Sequencer` / 메트릭 / supervisor / push AOI / 한 번의 셧다운 |
-| `AdvancedMmorpgClient` | 서버를 구동시키는 MonoGame 봇·뷰어 클라이언트 |
+| `samples/ExampleConsoleApp` | 기본기 — `DoAsync`, `DoAsyncAfter`, 워커 스레드 |
+| `samples/ExampleChatServer` | 멀티 채팅방 서버 — Room 하나당 actor 하나 |
+| `samples/ExampleMmorpgServer` | 단일 존 MMORPG — 플레이어 actor, 공간 인덱스 |
+| `samples/ExampleSectorServer` | 섹터 분할 월드와 경계 통과 핸드오프 |
+| `samples/AdvancedMmorpgServer` | **레퍼런스 서버.** 큐 한도 / `Sequencer` / 메트릭 / supervisor / push AOI / 한 번의 셧다운 |
+| `samples/AdvancedMmorpgClient` | 서버를 구동시키는 MonoGame 봇·뷰어 클라이언트 |
 | `samples/PipelinesServer` | **바이너리 프로토콜 서버** — `System.IO.Pipelines`, 길이 프리픽스 MessagePack 프레이밍, 세션당 스레드 없음 |
 | `samples/LoadClient` | 위 서버용 헤드리스 부하 도구. 지연 백분위 리포트, 실패 시 non-zero 종료 |
 | `samples/Observability` | Generic Host + OpenTelemetry 메트릭 |
 
 ```bash
-dotnet run --project AdvancedMmorpgServer      # 25100 포트 리스닝
+dotnet run --project samples/AdvancedMmorpgServer      # 25100 포트 리스닝
 # 콘솔 명령: status | metrics | q
 
 # 바이너리 프로토콜 서버 + 200 클라이언트 부하:

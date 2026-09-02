@@ -9,7 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\JobDispatcherNET\JobDispatcherNET.csproj" />
+    <ProjectReference Include="..\..\JobDispatcherNET\JobDispatcherNET.csproj" />
   </ItemGroup>
 
   <ItemGroup>

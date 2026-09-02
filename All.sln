@@ -5,19 +5,19 @@ VisualStudioVersion = 17.8.34330.188
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JobDispatcherNET", "JobDispatcherNET\JobDispatcherNET.csproj", "{195AE663-D834-3986-01D5-7EF5EF2C75B9}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleConsoleApp", "ExampleConsoleApp\ExampleConsoleApp.csproj", "{FA93AD03-6C88-E828-655A-F83F41E3BD7E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleConsoleApp", "samples\ExampleConsoleApp\ExampleConsoleApp.csproj", "{FA93AD03-6C88-E828-655A-F83F41E3BD7E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleChatServer", "ExampleChatServer\ExampleChatServer.csproj", "{5618A8C5-B2FE-05D1-AC9F-01AF26762261}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleChatServer", "samples\ExampleChatServer\ExampleChatServer.csproj", "{5618A8C5-B2FE-05D1-AC9F-01AF26762261}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleMmorpgServer", "ExampleMmorpgServer\ExampleMmorpgServer.csproj", "{5C38EF93-4D0B-4AF8-B0EA-9412D79038F9}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleMmorpgServer", "samples\ExampleMmorpgServer\ExampleMmorpgServer.csproj", "{5C38EF93-4D0B-4AF8-B0EA-9412D79038F9}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleSectorServer", "ExampleSectorServer\ExampleSectorServer.csproj", "{5249BAD1-00AE-430A-A2D0-45C3776F7632}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleSectorServer", "samples\ExampleSectorServer\ExampleSectorServer.csproj", "{5249BAD1-00AE-430A-A2D0-45C3776F7632}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgServer", "AdvancedMmorpgServer\AdvancedMmorpgServer.csproj", "{E63F4357-375B-45DD-B3AC-6102AA138970}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgServer", "samples\AdvancedMmorpgServer\AdvancedMmorpgServer.csproj", "{E63F4357-375B-45DD-B3AC-6102AA138970}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgClient", "AdvancedMmorpgClient\AdvancedMmorpgClient.csproj", "{6A95C83F-5253-49B0-AB0E-9B9E12FDBB14}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgClient", "samples\AdvancedMmorpgClient\AdvancedMmorpgClient.csproj", "{6A95C83F-5253-49B0-AB0E-9B9E12FDBB14}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgTests", "AdvancedMmorpgTests\AdvancedMmorpgTests.csproj", "{F2953847-B342-47B7-8EEB-D55A892A1426}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AdvancedMmorpgTests", "samples\AdvancedMmorpgTests\AdvancedMmorpgTests.csproj", "{F2953847-B342-47B7-8EEB-D55A892A1426}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JobDispatcherNET.Tests", "JobDispatcherNET.Tests\JobDispatcherNET.Tests.csproj", "{4D4008FD-267A-4233-8DA1-4C5234EF8634}"
 EndProject
@@ -250,6 +250,13 @@ Global
 		{44FFAE8F-25C0-4C56-9AF4-543AA744B4A4} = {808186BE-9BD0-DD1D-D574-36EEAD1E7F8F}
 		{B1299C57-9E5C-4391-A620-558DADAF52D2} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{ADA4932C-001B-4E07-9CB6-D88E721C7EC5} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{FA93AD03-6C88-E828-655A-F83F41E3BD7E} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{5618A8C5-B2FE-05D1-AC9F-01AF26762261} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{5C38EF93-4D0B-4AF8-B0EA-9412D79038F9} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{5249BAD1-00AE-430A-A2D0-45C3776F7632} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{E63F4357-375B-45DD-B3AC-6102AA138970} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{6A95C83F-5253-49B0-AB0E-9B9E12FDBB14} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{F2953847-B342-47B7-8EEB-D55A892A1426} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {560D3881-D190-4C53-BAA7-9BB089C75615}

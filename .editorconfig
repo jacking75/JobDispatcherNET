@@ -146,7 +146,7 @@ dotnet_naming_rule.parameters_and_locals_are_camel_case.severity = suggestion
 dotnet_diagnostic.CA2007.severity = none      # ConfigureAwait: actor continuations must come back to the actor.
 dotnet_diagnostic.IDE0055.severity = silent   # Formatting is reviewed by humans, not enforced as an error.
 
-[{JobDispatcherNET.Tests,JobDispatcherNET.Benchmarks,AdvancedMmorpgTests}/**.cs]
+[{JobDispatcherNET.Tests,JobDispatcherNET.Benchmarks,samples/AdvancedMmorpgTests}/**.cs]
 # Test and benchmark code exercises obsolete members on purpose and does not need docs.
 dotnet_diagnostic.CS1591.severity = none
 dotnet_diagnostic.CS0618.severity = none

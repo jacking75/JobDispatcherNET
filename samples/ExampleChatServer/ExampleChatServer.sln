@@ -4,7 +4,7 @@ VisualStudioVersion = 17.13.35931.197
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExampleChatServer", "ExampleChatServer.csproj", "{E05AAACF-613A-42F1-98FC-6F6C861679D9}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JobDispatcherNET", "..\JobDispatcherNET\JobDispatcherNET.csproj", "{A8CA2D31-B49F-AB28-576A-0770A07F089A}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JobDispatcherNET", "..\..\JobDispatcherNET\JobDispatcherNET.csproj", "{A8CA2D31-B49F-AB28-576A-0770A07F089A}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

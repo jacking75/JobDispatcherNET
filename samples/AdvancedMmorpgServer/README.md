@@ -52,7 +52,7 @@ dotnet build All.sln
 ### 서버 실행
 
 ```bash
-cd AdvancedMmorpgServer
+cd samples/AdvancedMmorpgServer
 dotnet run
 # 다른 설정 파일 사용:
 # dotnet run -- mytestconfig.json
@@ -77,7 +77,7 @@ dotnet run
 서버가 켜져 있는 상태에서:
 
 ```bash
-cd AdvancedMmorpgClient
+cd samples/AdvancedMmorpgClient
 dotnet run
 ```
 

@@ -11,10 +11,10 @@
 
 ```bash
 # 1) 서버 먼저
-cd AdvancedMmorpgServer && dotnet run
+cd samples/AdvancedMmorpgServer && dotnet run
 
 # 2) 클라이언트 (별도 터미널)
-cd AdvancedMmorpgClient && dotnet run
+cd samples/AdvancedMmorpgClient && dotnet run
 ```
 
 `clientconfig.json`에서 봇 수(`bots.count`), tick 주기(`bots.tickIntervalMs`), 화면 크기 등을 조정합니다.  
