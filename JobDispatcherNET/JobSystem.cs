@@ -21,6 +21,16 @@ public sealed record JobSystemOptions
     public int TimerSpinThresholdMs { get; init; } = 16;
 
     /// <summary>
+    /// Shortest period <see cref="AsyncExecutable.DoAsyncEvery"/> will accept. Default 1 ms;
+    /// <see cref="TimeSpan.Zero"/> disables the check (any positive period is then allowed).
+    ///
+    /// A server that derives tick periods from client input — a skill cooldown, a configurable
+    /// poll interval — would otherwise accept a one-tick period, re-arm the timer every
+    /// millisecond and, under <see cref="TimerPrecision.High"/>, spin the timer thread at 100%.
+    /// </summary>
+    public TimeSpan MinTimerPeriod { get; init; } = TimeSpan.FromMilliseconds(1);
+
+    /// <summary>
     /// Windows only, opt-in: raise the global system timer resolution to 1 ms for the lifetime of
     /// the timer thread. Process-wide and increases power draw — enable only if measurements show
     /// the default ~15.6 ms resolution is too coarse for your tick rate.
@@ -34,8 +44,9 @@ public sealed record JobSystemOptions
     public bool PublishMeter { get; init; } = true;
 
     /// <summary>
-    /// Throw when actor code blocks a worker thread waiting on another actor's result — a
-    /// guaranteed deadlock under the leader-flush model. Defaults to true in DEBUG builds.
+    /// Throw when actor code sets up a guaranteed deadlock: blocking a worker thread while waiting
+    /// on another actor's result, or an <see cref="AsyncReentrancy.Exclusive"/> actor asking itself
+    /// for something from inside one of its own jobs. Defaults to true in DEBUG builds.
     /// </summary>
     public bool DetectBlockingWaitOnWorker { get; init; } = IsDebugBuild;
 
@@ -44,6 +55,16 @@ public sealed record JobSystemOptions
 
     /// <summary>Logger for this system. <c>null</c> falls back to <see cref="JobLog.Current"/>.</summary>
     public IJobLogger? Logger { get; init; }
+
+    /// <summary>
+    /// Bound applied to actors on this system that do not set <see cref="JobOptions.MaxQueueSize"/>
+    /// themselves. <c>null</c> (the default) keeps the historical unbounded behaviour.
+    ///
+    /// An unbounded actor queue is an OOM vector, and the per-actor setting only helps on actors
+    /// somebody remembered to configure. Setting this puts a ceiling under every actor at once;
+    /// an actor that names its own <see cref="JobOptions.MaxQueueSize"/> still wins.
+    /// </summary>
+    public int? DefaultMaxQueueSize { get; init; }
 
     private static bool IsDebugBuild
     {
@@ -232,10 +253,21 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     /// Run an action on a worker thread. This is the supported way to hand work from a network
     /// or thread-pool thread into the worker pool without becoming an actor's leader yourself.
     /// </summary>
-    public void Post(Action action)
+    /// <returns>
+    /// <c>false</c> when the system has stopped accepting work or been disposed, in which case
+    /// nothing was queued. Posting is not gated on workers existing — they may start later — but it
+    /// is gated on the shutdown door, because work posted past it piles up on a queue with nothing
+    /// left to drain it.
+    /// </returns>
+    public bool Post(Action action)
     {
         ArgumentNullException.ThrowIfNull(action);
+
+        if (!AcceptingWork || Volatile.Read(ref _disposed) != 0)
+            return false;
+
         Enqueue(new ReadyItem(null, action));
+        return true;
     }
 
     internal void Schedule(AsyncExecutable actor) => Enqueue(new ReadyItem(actor, null));

@@ -136,6 +136,9 @@ public sealed class ClientSession
     private const int OutgoingCapacity = 1000;
     private const int SlowClientDropLimit = 200;
 
+    /// <summary>Inbound packets one session may have queued before it is dropped.</summary>
+    private const int MaxPendingPackets = 512;
+
     private readonly BlockingCollection<string> _outgoing =
         new(new ConcurrentQueue<string>(), OutgoingCapacity);
 
@@ -162,10 +165,17 @@ public sealed class ClientSession
 
         // The system-aware constructor schedules drains straight onto the worker pool — the
         // hand-rolled inbound command queue this sample used to need is gone.
+        //
+        // maxPending is this session's back-pressure. Without it one client that sends faster than
+        // the handler drains grows this queue until the process runs out of memory; with it the
+        // recv loop is told and drops the session. maxItemsPerDrain keeps that same client from
+        // holding a worker until its queue runs dry.
         _packetSequencer = new Sequencer<string>(
             server.System,
             handler: HandleOnePacket,
-            onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex));
+            onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex),
+            maxPending: MaxPendingPackets,
+            maxItemsPerDrain: 64);
     }
 
     public void OnLoggedIn(int playerId)
@@ -221,8 +231,17 @@ public sealed class ClientSession
 
                     var line = s[..idx].Trim('\r', ' ', '\t');
                     sb.Remove(0, idx + 1);
-                    if (line.Length > 0)
-                        _packetSequencer.Enqueue(line);
+                    if (line.Length == 0)
+                        continue;
+
+                    if (!_packetSequencer.Enqueue(line))
+                    {
+                        // Full, or the session is already closing. Either way this client is not
+                        // being served any more, so stop reading from it.
+                        JobLog.Warn(
+                            $"[세션 #{ConnectionId}] 수신 큐 초과({_packetSequencer.DroppedCount}건) — 연결을 끊는다");
+                        return;
+                    }
                 }
             }
         }

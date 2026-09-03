@@ -5,6 +5,81 @@ namespace JobDispatcherNET.Tests;
 public sealed class BoundedQueueTests
 {
     [Fact]
+    public void AnActorWithNoBoundOfItsOwnInheritsTheSystemDefault()
+    {
+        // B5: the per-actor bound only helps on actors somebody remembered to configure.
+        using var host = new TestSystem(workers: 1, options: new JobSystemOptions
+        {
+            Name = "default-bound",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+            DetectBlockingWaitOnWorker = false,
+            DefaultMaxQueueSize = 2,
+        });
+
+        var actor = new BlockingActor(new JobOptions { System = host.System, Mode = ExecutionMode.Scheduled });
+        Assert.Equal(2, actor.MaxQueueSize);
+
+        actor.BlockAndWait();                       // one of the two slots is taken
+        Assert.True(actor.Enqueue());
+        Assert.False(actor.Enqueue(), "the system default bound was not applied");
+
+        actor.Release();
+        TestSystem.SpinWaitFor(() => actor.Done == 2, TimeSpan.FromSeconds(5), "the actor never drained");
+    }
+
+    [Fact]
+    public void AnActorsOwnBoundBeatsTheSystemDefault()
+    {
+        using var host = new TestSystem(workers: 1, options: new JobSystemOptions
+        {
+            Name = "default-bound-override",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+            DetectBlockingWaitOnWorker = false,
+            DefaultMaxQueueSize = 2,
+        });
+
+        var actor = new GateActor(new JobOptions { System = host.System, MaxQueueSize = 64 });
+        Assert.Equal(64, actor.MaxQueueSize);
+    }
+
+    [Fact]
+    public void AnActorNameCannotForgeALogLine()
+    {
+        // B3: a server that names actors after player nicknames would otherwise let a newline in a
+        // nickname write a whole extra log entry.
+        using var host = new TestSystem(workers: 0);
+
+        var actor = new GateActor(host.Options() with
+        {
+            Name = "player\r\n[JobDispatcherNET][Error] forged" + new string('x', 500),
+        });
+
+        Assert.DoesNotContain(actor.Name, c => char.IsControl(c));
+        Assert.True(actor.Name.Length <= 128, $"name is {actor.Name.Length} characters");
+        Assert.StartsWith("player??", actor.Name, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PostReportsThatAStoppedSystemWillNotRunTheAction()
+    {
+        // B2: work posted past the shutdown door used to pile up on a queue with nothing left to
+        // drain it, and the caller was never told.
+        using var host = new TestSystem(workers: 1);
+
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(host.System.Post(ran.SetResult));
+        Assert.True(ran.Task.Wait(TimeSpan.FromSeconds(5)), "the posted action never ran");
+        TestSystem.SpinWaitFor(() => host.System.ReadyQueueDepth == 0, TimeSpan.FromSeconds(5),
+            "the ready queue never settled");
+
+        host.System.AcceptingWork = false;
+        Assert.False(host.System.Post(static () => { }), "Post accepted work after the gate closed");
+        Assert.Equal(0, host.System.ReadyQueueDepth);
+    }
+
+    [Fact]
     public void QueueNeverExceedsTheConfiguredLimit()
     {
         using var host = new TestSystem(workers: 1);

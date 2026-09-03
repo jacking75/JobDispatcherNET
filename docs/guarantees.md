@@ -110,6 +110,11 @@ dispatcher's supervisor logs which actor was running and restarts the slot. See
 when the dispatcher is actually stopping; at any other time it is a crash like any other, and the
 slot is restarted.
 
+**Actor names cannot forge a log line.** `Name` goes straight into log messages, so a server that
+names actors after player nicknames would otherwise let a newline in a nickname write a whole extra
+log entry. Control characters in a name become `?` and the name is capped at 128 characters
+(`BoundedQueueTests.AnActorNameCannotForgeALogLine`).
+
 **A throwing `IJobLogger` cannot take a thread down.** The library logs from worker threads and from
 the timer thread, neither of which has anything above it to catch an escaping exception — a log sink
 that failed once used to stop every timer on the system permanently. Every library-internal log call
@@ -125,7 +130,7 @@ already `false`. The reasons, from `DropReason`:
 
 | Reason | Cause |
 |---|---|
-| `QueueFull` | The actor is at `JobOptions.MaxQueueSize`. (An interleaved `await` continuation is exempt — see [Async jobs](#async-jobs).) |
+| `QueueFull` | The actor is at its effective bound — `JobOptions.MaxQueueSize`, or `JobSystemOptions.DefaultMaxQueueSize` if the actor set none. (An interleaved `await` continuation is exempt — see [Async jobs](#async-jobs).) |
 | `ShuttingDown` | `JobSystem.AcceptingWork` is false (set by `StopAsync`, `Dispose`, or by you). |
 | `Disposed` | The actor's `DisposeAsync` has completed. |
 | `Faulted` | The actor tripped `MaxConsecutiveFailures`. |

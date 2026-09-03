@@ -14,15 +14,26 @@ namespace JobDispatcherNET;
 /// <para><b>Use it like this.</b> The IO thread only calls <see cref="Enqueue"/>. The first caller
 /// to find no drain scheduled wins a CAS and invokes the <c>scheduleDrain</c> callback once; that
 /// callback hands a drain action to a worker (<see cref="JobSystem.Post(Action)"/> does this for
-/// you if you use the <see cref="Sequencer{T}(JobSystem, Action{T}, Action{Exception})"/>
+/// you if you use the <see cref="Sequencer{T}(JobSystem, Action{T}, Action{Exception}, int, int)"/>
 /// constructor). The worker runs the handler for each queued item in order.</para>
+///
+/// <para><b>Bound it.</b> A sequencer fed by a network socket needs <c>maxPending</c>. Without one a
+/// single client that sends faster than the handler drains grows that session's queue until the
+/// process runs out of memory.</para>
 /// </summary>
 public sealed class Sequencer<T>
 {
     private readonly ConcurrentQueue<T> _queue = new();
     private readonly Action<T> _handler;
-    private readonly Action<Action> _scheduleDrain;
+    private readonly Func<Action, bool> _scheduleDrain;
     private readonly Action<Exception>? _onError;
+    private readonly int _maxPending;
+    private readonly int _maxItemsPerDrain;
+
+    // Kept by hand rather than read from the queue: ConcurrentQueue.Count walks its segments and
+    // can spin, which is the wrong shape for a check on every inbound packet.
+    private int _pending;
+    private long _dropped;
     private int _drainScheduled;
     private int _stopped;
     private int _aborted;
@@ -30,32 +41,86 @@ public sealed class Sequencer<T>
     /// <param name="handler">Handles one item. Called serially, on whichever thread runs the drain.</param>
     /// <param name="scheduleDrain">Hands the drain action to a worker thread.</param>
     /// <param name="onError">Called when <paramref name="handler"/> throws. Defaults to logging.</param>
-    public Sequencer(Action<T> handler, Action<Action> scheduleDrain, Action<Exception>? onError = null)
+    /// <param name="maxPending">
+    /// Most items that may be accepted and unhandled at once; <c>0</c> (the default) is unbounded.
+    /// <b>Set this on anything fed by untrusted input.</b> The documented pattern is one sequencer
+    /// per session, and an unbounded one is a per-session memory bomb: a client that sends faster
+    /// than the handler drains grows that queue until the process dies. This is the sequencer's
+    /// counterpart to <see cref="JobOptions.MaxQueueSize"/>, and it behaves the same way —
+    /// <see cref="Enqueue"/> returns <c>false</c> and the network layer drops the session.
+    /// </param>
+    /// <param name="maxItemsPerDrain">
+    /// Items one drain handles before handing the rest back to the worker pool; <c>0</c> (the
+    /// default) drains to empty. The counterpart to <see cref="JobOptions.MaxJobsPerFlush"/>: it
+    /// stops one flooding session from owning a worker until its queue runs dry.
+    /// </param>
+    public Sequencer(Action<T> handler, Action<Action> scheduleDrain, Action<Exception>? onError = null,
+        int maxPending = 0, int maxItemsPerDrain = 0)
+        : this(handler, Wrap(scheduleDrain), onError, maxPending, maxItemsPerDrain)
     {
-        ArgumentNullException.ThrowIfNull(handler);
-        ArgumentNullException.ThrowIfNull(scheduleDrain);
-        _handler = handler;
-        _scheduleDrain = scheduleDrain;
-        _onError = onError;
     }
 
     /// <summary>
     /// Convenience overload that schedules drains onto <paramref name="system"/>'s worker pool,
     /// so callers no longer need their own inbound command queue.
     /// </summary>
-    public Sequencer(JobSystem system, Action<T> handler, Action<Exception>? onError = null)
-        : this(handler, ScheduleOn(system), onError)
+    /// <param name="system">System whose worker pool runs the drains.</param>
+    /// <param name="handler">Handles one item. Called serially, on whichever worker runs the drain.</param>
+    /// <param name="onError">Called when <paramref name="handler"/> throws. Defaults to logging.</param>
+    /// <param name="maxPending">
+    /// Most items that may be accepted and unhandled at once; <c>0</c> (the default) is unbounded.
+    /// Set it on anything fed by untrusted input — see the other constructor.
+    /// </param>
+    /// <param name="maxItemsPerDrain">
+    /// Items one drain handles before handing the rest back to the pool; <c>0</c> drains to empty.
+    /// </param>
+    public Sequencer(JobSystem system, Action<T> handler, Action<Exception>? onError = null,
+        int maxPending = 0, int maxItemsPerDrain = 0)
+        : this(handler, PostTo(system), onError, maxPending, maxItemsPerDrain)
     {
     }
 
-    private static Action<Action> ScheduleOn(JobSystem system)
+    private Sequencer(Action<T> handler, Func<Action, bool> scheduleDrain, Action<Exception>? onError,
+        int maxPending, int maxItemsPerDrain)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxPending);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItemsPerDrain);
+
+        _handler = handler;
+        _scheduleDrain = scheduleDrain;
+        _onError = onError;
+        _maxPending = maxPending;
+        _maxItemsPerDrain = maxItemsPerDrain;
+    }
+
+    private static Func<Action, bool> Wrap(Action<Action> scheduleDrain)
+    {
+        ArgumentNullException.ThrowIfNull(scheduleDrain);
+        return drain =>
+        {
+            scheduleDrain(drain);
+            return true;   // a caller-supplied scheduler has no way to say no
+        };
+    }
+
+    private static Func<Action, bool> PostTo(JobSystem system)
     {
         ArgumentNullException.ThrowIfNull(system);
         return system.Post;
     }
 
-    /// <summary>Items waiting to be handled.</summary>
-    public int PendingCount => _queue.Count;
+    /// <summary>
+    /// Items accepted and not yet handled. Counted before the item reaches the queue and released
+    /// after the handler returns, so it reads high rather than low — which is what a bound needs.
+    /// </summary>
+    public int PendingCount => Volatile.Read(ref _pending);
+
+    /// <summary>The <c>maxPending</c> bound this sequencer was built with. <c>0</c> is unbounded.</summary>
+    public int MaxPending => _maxPending;
+
+    /// <summary>Items refused because <see cref="MaxPending"/> was reached.</summary>
+    public long DroppedCount => Interlocked.Read(ref _dropped);
 
     /// <summary>True once <see cref="Stop"/> or <see cref="Abort"/> has been called.</summary>
     public bool IsStopped => Volatile.Read(ref _stopped) != 0;
@@ -74,9 +139,38 @@ public sealed class Sequencer<T>
         if (Volatile.Read(ref _stopped) != 0)
             return false;
 
+        if (!TryReserveSlot())
+            return false;
+
         _queue.Enqueue(item);
         TryScheduleDrain();
         return true;
+    }
+
+    /// <summary>
+    /// Claim one slot under <see cref="MaxPending"/>. A CAS rather than increment-then-check, for
+    /// the same reason the actor's admission uses one: two producers that both incremented past the
+    /// bound would each have to undo it, and by then the count has already lied.
+    /// </summary>
+    private bool TryReserveSlot()
+    {
+        if (_maxPending == 0)
+        {
+            Interlocked.Increment(ref _pending);
+            return true;
+        }
+
+        while (true)
+        {
+            var current = Volatile.Read(ref _pending);
+            if (current >= _maxPending)
+            {
+                Interlocked.Increment(ref _dropped);
+                return false;
+            }
+            if (Interlocked.CompareExchange(ref _pending, current + 1, current) == current)
+                return true;
+        }
     }
 
     private void TryScheduleDrain()
@@ -84,9 +178,10 @@ public sealed class Sequencer<T>
         if (Interlocked.CompareExchange(ref _drainScheduled, 1, 0) != 0)
             return;
 
+        bool scheduled;
         try
         {
-            _scheduleDrain(Drain);
+            scheduled = _scheduleDrain(Drain);
         }
         catch
         {
@@ -95,30 +190,56 @@ public sealed class Sequencer<T>
             Interlocked.Exchange(ref _drainScheduled, 0);
             throw;
         }
+
+        if (!scheduled)
+        {
+            // The system refused the drain: it is shutting down or disposed. Release the claim so
+            // Stop, Abort or a later Enqueue can try again rather than leaving the queue with a
+            // drain that is permanently "already scheduled" and will never run.
+            Interlocked.Exchange(ref _drainScheduled, 0);
+        }
     }
 
     private void Drain()
     {
+        var handled = 0;
+
         try
         {
             while (_queue.TryDequeue(out var item))
             {
-                // Dequeue first, check abort second. Stopping at the check instead would leave an
-                // item enqueued by a producer that raced Abort sitting in the queue for the life of
-                // the session: Abort has already run its own drain, and no later drain would take
-                // it. Aborted means "do not handle these", not "do not remove them".
-                if (Volatile.Read(ref _aborted) != 0)
-                    continue;
-
                 try
                 {
-                    _handler(item);
+                    // Dequeue first, check abort second. Stopping at the check instead would leave
+                    // an item enqueued by a producer that raced Abort sitting in the queue for the
+                    // life of the session: Abort has already run its own drain, and no later drain
+                    // would take it. Aborted means "do not handle these", not "do not remove them".
+                    if (Volatile.Read(ref _aborted) != 0)
+                        continue;
+
+                    try
+                    {
+                        _handler(item);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (_onError is not null) _onError(ex);
+                        else JobLog.Error("Sequencer handler error", ex);
+                    }
                 }
-                catch (Exception ex)
+                finally
                 {
-                    if (_onError is not null) _onError(ex);
-                    else JobLog.Error("Sequencer handler error", ex);
+                    // In a finally because _onError is user code and can throw: leaking a slot on
+                    // that path would shrink a bounded sequencer a little on every handler failure
+                    // until it refused everything.
+                    Interlocked.Decrement(ref _pending);
                 }
+
+                // Fairness, mirroring MaxJobsPerFlush: hand the rest back rather than letting one
+                // flooding session hold a worker until its queue runs dry. The finally below
+                // reschedules, so nothing is left behind.
+                if (_maxItemsPerDrain != 0 && ++handled >= _maxItemsPerDrain)
+                    return;
             }
         }
         finally
@@ -175,7 +296,10 @@ public sealed class Sequencer<T>
 
         var discarded = 0;
         while (_queue.TryDequeue(out _))
+        {
+            Interlocked.Decrement(ref _pending);
             discarded++;
+        }
 
         // A racing producer calls TryScheduleDrain too, but its CAS can lose to a drain that is
         // already on its way out and has passed its own emptiness check. Without this the item — and

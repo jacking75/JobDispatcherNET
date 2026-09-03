@@ -85,6 +85,12 @@ Three problems, all fixed by `DoAsyncEvery`:
 `initialDelay` defaults to `period`; pass a small random jitter when spawning many entities on the
 same period so they do not all land on the same tick.
 
+Periods below `JobSystemOptions.MinTimerPeriod` (default 1 ms) are refused with
+`ArgumentOutOfRangeException`. A period derived from client input — a skill cooldown, a configurable
+poll interval — could otherwise be a single tick, re-arming the timer every millisecond and, under
+`TimerPrecision.High`, spinning the timer thread flat out. Set it to `TimeSpan.Zero` if you genuinely
+need finer periods; any positive period is then allowed.
+
 A repeating timer counts as **one** pending timer for its whole life, not one per firing.
 
 If you forget to cancel one, disposing its actor now retires it: the first firing that the disposed

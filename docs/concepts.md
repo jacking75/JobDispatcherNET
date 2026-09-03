@@ -160,12 +160,21 @@ worker.
 
 ```csharp
 // system is a JobSystem; the drain is posted to its worker pool for you.
-var packets = new Sequencer<string>(system, line => Handle(session, line));
+// maxPending is the session's back-pressure; maxItemsPerDrain keeps one loud session
+// from owning a worker until its queue runs dry.
+var packets = new Sequencer<string>(system, line => Handle(session, line),
+    onError: null, maxPending: 256, maxItemsPerDrain: 64);
 
 // IO thread only ever enqueues:
 if (!packets.Enqueue(line))
-    Log("session sequencer stopped, packet dropped");
+    session.Disconnect("inbound queue full");
 ```
+
+**Bound anything a client feeds.** `maxPending` defaults to `0`, which is unbounded, and an
+unbounded per-session queue is a per-session memory bomb: one client sending faster than the handler
+drains grows it until the process dies. It is the sequencer's `MaxQueueSize`, and it behaves the
+same way — `Enqueue` returns `false`, `DroppedCount` counts the refusals, and the network layer
+decides whether to drop the packet or the session.
 
 `Stop()` refuses new items and still handles everything already accepted — the orderly session
 close. `Abort()` refuses new items and throws the rest away; use it only when the remaining items

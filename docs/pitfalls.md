@@ -295,7 +295,7 @@ underneath a pending continuation is worse), so the fix is to give the awaited o
 
 ---
 
-## 9b. A timer tick runs after the entity despawned
+## 10. A timer tick runs after the entity despawned
 
 **Symptom.** An AI tick, a regen tick or a save tick runs once against an entity that has already
 been removed — an NRE on a nulled field, or a write into a sector that no longer exists — even though
@@ -311,7 +311,7 @@ cancelling from inside the actor's own `Despawn()` job guarantees no further tic
 
 ---
 
-## 10. `JobSystem.Post` with no workers running
+## 11. `JobSystem.Post` with no workers running
 
 **Symptom.** Work handed over with `system.Post(...)` never runs, and neither does a `Sequencer<T>`
 built with the `Sequencer(JobSystem, handler)` overload.
@@ -322,9 +322,33 @@ dispatcher there is nothing to drain it, and unlike a timer firing there is no f
 **Fix.** Start a dispatcher before posting. In tests, either start one or use the actor APIs directly
 (a `DoAsync` on an idle actor is flushed by the caller, so it works with zero workers).
 
+`Post` does return `false` once the system has stopped accepting work or been disposed — check it, so
+work handed over during a shutdown is not silently lost. It deliberately does *not* return `false`
+merely because no worker is running yet: workers can start later, and refusing would break the normal
+"build the pool, then start it" order.
+
 ---
 
-## 11. Two `JobSystem`s and the process-wide statics
+## 12. An `Exclusive` actor asking itself
+
+**Symptom.** A job on an `AsyncReentrancy.Exclusive` actor awaits `this.Ask(...)` or
+`this.AskAsync(...)` and the task never completes. Nothing is blocked, nothing is logged, and the
+actor sits there looking idle.
+
+**Cause.** The answer is queued behind the job that is asking, and an Exclusive actor runs nothing
+else until that job finishes. The job is waiting for a queue it has itself stopped.
+`GuardBlockingWait` cannot see this one: no thread is parked, the await simply never returns.
+
+**Fix.** Split the work into two jobs and let the actor's queue carry the state between them, or use
+`AsyncReentrancy.Interleaved`, whose queue keeps moving during an await. With
+`JobSystemOptions.DetectBlockingWaitOnWorker` on (the default in DEBUG builds) the library throws an
+`InvalidOperationException` at the `Ask` instead of letting you find out in production
+(`AsyncJobTests.AnExclusiveActorAskingItselfIsRefusedInsteadOfDeadlocking`). `RunAsync` on yourself
+has the same shape, but is not guarded — a fire-and-forget self-`RunAsync` is legitimate.
+
+---
+
+## 13. Two `JobSystem`s and the process-wide statics
 
 **Symptom.** Stopping one subsystem stops the other. Parallel tests interfere.
 

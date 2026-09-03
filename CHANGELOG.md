@@ -13,6 +13,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`Sequencer<T>` had no bound.** The documented pattern is one sequencer per session, fed straight
+  from a socket, and an unbounded one is a per-session memory bomb: a client that sends faster than
+  the handler drains grows that queue until the process dies. The constructors take `maxPending`
+  (`0`, unbounded, stays the default for compatibility), and `Enqueue` returns `false` once it is
+  reached so the network layer can drop the client. `PendingCount` is now a counter rather than
+  `ConcurrentQueue.Count`, and `DroppedCount` reports the refusals. The samples and the project
+  template pass a bound and act on the refusal.
+- **`JobSystem.Post` accepted work past the shutdown door.** It ignored `AcceptingWork` and disposal,
+  so anything posted afterwards piled onto a ready queue with no worker left to drain it. It now
+  returns `bool`: `false` means nothing was queued. (Posting with no workers *running* is still
+  accepted — they can start later.)
+- **An actor `Name` could forge a log line.** `Name` goes straight into log messages, so a server
+  naming actors after player nicknames let a newline in a nickname write a whole extra log entry.
+  Control characters become `?` and the name is capped at 128 characters.
+- **A repeating timer could be scheduled with a one-tick period.** A period derived from client input
+  re-armed the timer every millisecond and, under `TimerPrecision.High`, spun the timer thread flat
+  out. Periods below the new `JobSystemOptions.MinTimerPeriod` (default 1 ms) are refused with
+  `ArgumentOutOfRangeException`; set it to `TimeSpan.Zero` to opt out.
+- **An `Exclusive` actor asking itself hung silently.** A job that awaits `this.Ask(...)` on an
+  `AsyncReentrancy.Exclusive` actor waits for a queue it has itself stopped, and because nothing
+  blocks a thread `GuardBlockingWait` never saw it — the task simply never completed. `Ask` and
+  `AskAsync` now throw when called on the actor whose job is running, under the same
+  `JobSystemOptions.DetectBlockingWaitOnWorker` flag (on in DEBUG builds).
+
 ### Fixed
 
 - **`await actor.DisposeAsync()` could wait forever.** The drain handshake had the disposer publish
@@ -106,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Sequencer.Abort()`'s return value counts only what that call discarded.** An item from a producer
   that was already inside `Enqueue` can land afterwards and is discarded by the drain instead, so it
   is not included.
+- **`JobSystem.Post` returns `bool`** rather than `void`. Source-compatible for the usual
+  statement-position call; a binary break, which 0.x is the time for.
+- **`Sequencer<T>.PendingCount` counts accepted-and-unhandled items**, including the one the handler
+  is working on, rather than `ConcurrentQueue.Count`. It reads high rather than low, which is what a
+  bound needs — and reading it no longer walks the queue's segments.
 
 ### Added
 
@@ -122,6 +153,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the joins.
 - **`JobMetrics.SystemTagName`** — the meter tag key (`jobdispatcher.system`) carrying the owning
   system's name, so collectors and tests can name it rather than hard-coding the string.
+- **`Sequencer<T>` `maxPending` / `maxItemsPerDrain` constructor arguments**, with `MaxPending`,
+  `PendingCount` and `DroppedCount` to observe them. `maxItemsPerDrain` is the sequencer's
+  `MaxJobsPerFlush`: it hands the worker back rather than letting one flooding session run its queue
+  dry.
+- **`JobSystemOptions.DefaultMaxQueueSize`** — the bound applied to actors on the system that do not
+  name one themselves. The per-actor setting only protects actors somebody remembered to configure.
+  `AsyncExecutable.MaxQueueSize` reports whichever bound is in force.
+- **`JobSystemOptions.MinTimerPeriod`** (default 1 ms) — floor for `DoAsyncEvery`.
 
 ## [0.10.0] - 2026-08-31
 

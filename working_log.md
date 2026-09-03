@@ -1,5 +1,15 @@
 # Working Log
 
+## 2026-09-03 15:45 KST - 리뷰 B1~B6 수정 (남용 내성 · 취약점)
+
+- B1: `Sequencer<T>`에 `maxPending`(세션 백프레셔)과 `maxItemsPerDrain`(워커 독점 방지) 생성자 인자 추가. `PendingCount`를 `ConcurrentQueue.Count` 대신 전용 카운터로 바꾸고 `MaxPending`/`DroppedCount` 노출. 샘플 3곳(AdvancedMmorpgServer, PipelinesServer, 프로젝트 템플릿)과 README 예제도 상한을 걸고 거부를 처리하도록 수정.
+- B2: `JobSystem.Post`를 `bool` 반환으로 변경 — 게이트가 닫혔거나 disposed면 큐에 넣지 않고 `false`. `Sequencer`는 스케줄 거부 시 드레인 클레임을 되돌려 큐가 영구히 "이미 예약됨" 상태로 막히지 않게 함.
+- B3: 액터 `Name`의 제어문자를 `?`로 치환하고 128자로 절단 — 플레이어 닉네임이 로그 라인을 위조하지 못하게.
+- B4: `JobSystemOptions.MinTimerPeriod`(기본 1ms) 신설. 그 아래 주기의 `DoAsyncEvery`는 `ArgumentOutOfRangeException`.
+- B5: `JobSystemOptions.DefaultMaxQueueSize` 신설 — 액터가 `MaxQueueSize`를 지정하지 않으면 시스템 기본값 적용. `AsyncExecutable.MaxQueueSize`로 실제 적용 상한 조회 가능.
+- B6: Exclusive 액터가 자기 작업 안에서 자신에게 `Ask`/`AskAsync` 하면 DEBUG(`DetectBlockingWaitOnWorker`)에서 예외. 블로킹이 아니라 `GuardBlockingWait`가 못 잡던 교착.
+- 테스트 12개 추가(98개 전부 통과, net8.0/net10.0). 8개는 옛 동작에서 실패 확인. 기존 `ExclusiveActorStaysExclusiveAcrossManyAsyncHandshakes`의 잠재 레이스(Done 도달 시점과 카운터 감소 시점 차이)도 함께 수정.
+
 ## 2026-09-03 12:05 KST - 리뷰 A7~A12 수정 (A절 전체 완료)
 
 - A7: `AskSync`가 `Task.Wait` 대신 완료 핸들을 기다리도록 바꿔 작업 예외를 `AggregateException`으로 감싸지 않고 원본 그대로 던지게 함.

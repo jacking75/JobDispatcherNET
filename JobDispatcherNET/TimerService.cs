@@ -74,6 +74,7 @@ internal sealed class TimerService : IDisposable
     private readonly JobSystem _system;
     private readonly TimerPrecision _precision;
     private readonly int _spinThresholdMs;
+    private readonly TimeSpan _minPeriod;
     private readonly long _startTimestamp = Stopwatch.GetTimestamp();
     private readonly Thread _thread;
     private long _pending;
@@ -85,6 +86,7 @@ internal sealed class TimerService : IDisposable
         _system = system;
         _precision = precision;
         _spinThresholdMs = Math.Max(1, spinThresholdMs);
+        _minPeriod = system.Options.MinTimerPeriod > TimeSpan.Zero ? system.Options.MinTimerPeriod : TimeSpan.Zero;
         _thread = new Thread(Loop)
         {
             IsBackground = true,
@@ -130,6 +132,14 @@ internal sealed class TimerService : IDisposable
     {
         if (period <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(period), "period must be positive");
+
+        if (period < _minPeriod)
+        {
+            throw new ArgumentOutOfRangeException(nameof(period),
+                $"period must be at least {_minPeriod.TotalMilliseconds:0.###}ms. A shorter one re-arms the " +
+                "timer every tick and, under TimerPrecision.High, spins the timer thread. " +
+                $"Lower {nameof(JobSystemOptions)}.{nameof(JobSystemOptions.MinTimerPeriod)} if you really need it.");
+        }
 
         if (Volatile.Read(ref _disposed) != 0)
         {

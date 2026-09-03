@@ -171,6 +171,61 @@ public sealed class AsyncJobTests
     }
 
     [Fact]
+    public void AnExclusiveActorAskingItselfIsRefusedInsteadOfDeadlocking()
+    {
+        // B6: the answer is queued behind the job that is asking, and an Exclusive actor runs
+        // nothing else until that job finishes. Nothing blocks a thread, so the blocking-wait guard
+        // never sees it — the awaited task just never completes.
+        using var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "self-ask",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+            DetectBlockingWaitOnWorker = true,
+        });
+        using var dispatcher = new JobDispatcher(2, new JobDispatcherOptions { System = system, IdleWaitMs = 5 });
+        _ = dispatcher.RunWorkerThreadsAsync();
+
+        var actor = new SelfAskingActor(new JobOptions
+        {
+            System = system,
+            AsyncReentrancy = AsyncReentrancy.Exclusive,
+        });
+
+        Assert.True(actor.TryAskSelf());
+        TestSystem.SpinWaitFor(() => actor.Caught is not null, TimeSpan.FromSeconds(5),
+            "the self-ask guard never fired");
+        Assert.IsType<InvalidOperationException>(actor.Caught);
+    }
+
+    [Fact]
+    public async Task AnInterleavedActorMayAskItself()
+    {
+        // The same call is fine when the queue keeps moving during the await, so the guard must not
+        // fire for Interleaved actors.
+        using var host = new TestSystem(workers: 2);
+        var actor = new SelfAskingActor(host.Options());
+
+        Assert.Equal(7, await actor.AskSelfAsync());
+        Assert.Null(actor.Caught);
+    }
+
+    private sealed class SelfAskingActor(JobOptions options) : AsyncExecutable(options)
+    {
+        public Exception? Caught { get; private set; }
+
+        public bool TryAskSelf() => DoAsync(static a => a.AskSelf(), this);
+
+        public Task<int> AskSelfAsync() => AskAsync(async () => await Ask(() => 7));
+
+        private void AskSelf()
+        {
+            try { _ = Ask(() => 7); }
+            catch (Exception ex) { Caught = ex; }
+        }
+    }
+
+    [Fact]
     public async Task ExclusiveReentrancyBlocksOtherJobsUntilTheAwaitCompletes()
     {
         using var host = new TestSystem(workers: 4);
@@ -320,6 +375,117 @@ public sealed class AsyncJobTests
 
 public sealed class SequencerTests
 {
+    [Fact]
+    public void ABoundedSequencerRefusesItemsPastItsLimit()
+    {
+        // B1: the documented pattern is one sequencer per session. Unbounded, a client that sends
+        // faster than the handler drains grows that queue until the process dies.
+        using var host = new TestSystem(workers: 0);      // nothing drains, so the bound is visible
+
+        var handled = 0;
+        var sequencer = new Sequencer<int>(
+            item => Interlocked.Increment(ref handled),
+            scheduleDrain: static _ => { },               // swallow the drain: keep the queue full
+            onError: null,
+            maxPending: 4);
+
+        Assert.Equal(4, sequencer.MaxPending);
+        for (var i = 0; i < 4; i++)
+            Assert.True(sequencer.Enqueue(i), $"item {i} should have fitted");
+
+        Assert.False(sequencer.Enqueue(99), "the bound was not enforced");
+        Assert.False(sequencer.Enqueue(100));
+
+        Assert.Equal(4, sequencer.PendingCount);
+        Assert.Equal(2, sequencer.DroppedCount);
+        Assert.Equal(0, Volatile.Read(ref handled));
+    }
+
+    [Fact]
+    public void ABoundedSequencerFreesSlotsAsItemsAreHandled()
+    {
+        using var host = new TestSystem(workers: 2);
+
+        var handled = 0;
+        var sequencer = new Sequencer<int>(host.System, _ => Interlocked.Increment(ref handled),
+            onError: null, maxPending: 8);
+
+        var accepted = 0;
+        for (var round = 0; round < 50; round++)
+        {
+            for (var i = 0; i < 100; i++)
+            {
+                if (sequencer.Enqueue(i))
+                    accepted++;
+            }
+
+            // Handling an item is what gives its slot back, so let the drain catch up. Without this
+            // the whole loop finishes before a worker even wakes and only the first 8 ever fit.
+            TestSystem.SpinWaitFor(() => sequencer.PendingCount == 0, TimeSpan.FromSeconds(10),
+                $"round {round}: {sequencer.PendingCount} items never drained");
+        }
+
+        Assert.Equal(accepted, Volatile.Read(ref handled));
+        Assert.Equal(5_000 - accepted, sequencer.DroppedCount);
+        Assert.True(accepted >= 50 * 8, $"only {accepted} items were accepted; the bound never re-opened");
+        Assert.True(accepted < 5_000, "everything was accepted, so the bound was not in force");
+    }
+
+    [Fact]
+    public void MaxItemsPerDrainHandsTheWorkerBackInsteadOfDrainingToEmpty()
+    {
+        // The Sequencer counterpart to MaxJobsPerFlush: one flooding session must not own a worker
+        // until its queue runs dry.
+        var batches = new List<int>();
+        var drains = new List<Action>();
+
+        var handledInBatch = 0;
+        var sequencer = new Sequencer<int>(
+            _ => handledInBatch++,
+            scheduleDrain: drains.Add,
+            onError: null,
+            maxPending: 0,
+            maxItemsPerDrain: 3);
+
+        for (var i = 0; i < 7; i++)
+            Assert.True(sequencer.Enqueue(i));
+
+        // One drain was scheduled by the first Enqueue; run drains until the queue is empty,
+        // recording how much each one got through.
+        while (drains.Count > 0)
+        {
+            var next = drains[0];
+            drains.RemoveAt(0);
+            handledInBatch = 0;
+            next();
+            batches.Add(handledInBatch);
+        }
+
+        Assert.Equal([3, 3, 1], batches);
+        Assert.Equal(0, sequencer.PendingCount);
+    }
+
+    [Fact]
+    public void ADrainRefusedByAStoppedSystemCanBeScheduledAgainLater()
+    {
+        // B2 fallout: Post now reports refusal, and the sequencer has to release its drain claim
+        // when it does — otherwise the queue is stuck at "a drain is already scheduled" forever.
+        using var host = new TestSystem(workers: 2);
+
+        var handled = 0;
+        var sequencer = new Sequencer<int>(host.System, _ => Interlocked.Increment(ref handled));
+
+        host.System.AcceptingWork = false;
+        Assert.True(sequencer.Enqueue(1));
+        Assert.Equal(0, Volatile.Read(ref handled));
+
+        host.System.AcceptingWork = true;
+        Assert.True(sequencer.Enqueue(2));
+
+        TestSystem.SpinWaitFor(() => Volatile.Read(ref handled) == 2, TimeSpan.FromSeconds(5),
+            $"only {Volatile.Read(ref handled)} of 2 items were handled after the gate reopened");
+    }
+
     [Fact]
     public void EnqueueRacingAbortNeverStrandsAnItem()
     {

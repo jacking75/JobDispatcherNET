@@ -37,8 +37,11 @@ internal sealed class SessionActor : AsyncExecutable
         _world = world;
         Id = world.AllocateId();
 
+        // maxPending bounds what one client can queue up: an unbounded per-session queue is how
+        // a single slow-to-handle client takes the whole process down.
         _inbound = new Sequencer<string>(system, HandleLine,
-            ex => JobLog.Error($"[session {Id}] handler failed", ex));
+            ex => JobLog.Error($"[session {Id}] handler failed", ex),
+            maxPending: 256, maxItemsPerDrain: 64);
     }
 
     public void Start()
@@ -84,8 +87,14 @@ internal sealed class SessionActor : AsyncExecutable
                 {
                     var line = pending.ToString(0, newline).TrimEnd('\r');
                     pending.Remove(0, newline + 1);
-                    if (line.Length > 0)
-                        _inbound.Enqueue(line);
+                    if (line.Length == 0)
+                        continue;
+
+                    if (!_inbound.Enqueue(line))
+                    {
+                        JobLog.Warn($"[session {Id}] inbound queue full; dropping the connection");
+                        return;
+                    }
                 }
             }
         }

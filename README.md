@@ -153,9 +153,12 @@ public sealed class PlayerActor : AsyncExecutable
 }
 
 // Packets from an IO thread, kept in order, handled on a worker:
-var packets = new Sequencer<string>(system, line => PacketHandler.Handle(session, line));
+// maxPending is this session's back-pressure: unbounded, one fast client is an OOM.
+var packets = new Sequencer<string>(system, line => PacketHandler.Handle(session, line),
+    onError: null, maxPending: 256);
 // ...on the socket thread:
-packets.Enqueue(line);
+if (!packets.Enqueue(line))
+    session.Disconnect("inbound queue full");
 
 // Shutdown.
 await system.StopAsync(TimeSpan.FromSeconds(10));

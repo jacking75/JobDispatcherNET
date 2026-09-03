@@ -52,6 +52,9 @@ public sealed class SessionConnection
     /// <summary>Dropped outbound frames tolerated before the client is disconnected.</summary>
     public const int SlowClientDropLimit = 64;
 
+    /// <summary>Inbound frames one session may have queued before Enqueue starts refusing.</summary>
+    public const int MaxPendingFrames = 512;
+
     private readonly Socket _socket;
     private readonly NetworkStream _stream;
     private readonly PipeReader _reader;
@@ -93,11 +96,15 @@ public sealed class SessionConnection
             SingleWriter = false,
         });
 
-        // The system-aware ctor posts drains straight onto the worker pool.
+        // The system-aware ctor posts drains straight onto the worker pool. maxPending is the
+        // inbound bound: without it a client that sends faster than HandleFrame drains would grow
+        // this queue — and the pooled buffers it holds — until the process died.
         _inbound = new Sequencer<InboundFrame>(
             server.System,
             handler: HandleFrame,
-            onError: ex => JobLog.Error($"[session #{ConnectionId}] frame handling failed", ex));
+            onError: ex => JobLog.Error($"[session #{ConnectionId}] frame handling failed", ex),
+            maxPending: MaxPendingFrames,
+            maxItemsPerDrain: 64);
     }
 
     /// <summary>Monotonic connection id.</summary>
@@ -189,7 +196,8 @@ public sealed class SessionConnection
 
         if (!_inbound.Enqueue(new InboundFrame(opcode, rented, length)))
         {
-            // Sequencer stopped: the session is closing and nothing more will be handled.
+            // Stopped (the session is closing) or full (the client is outrunning the handler).
+            // Either way the frame will not be handled, so give its buffer straight back.
             ArrayPool<byte>.Shared.Return(rented);
         }
     }

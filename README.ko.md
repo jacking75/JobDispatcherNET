@@ -150,9 +150,12 @@ public sealed class PlayerActor : AsyncExecutable
 }
 
 // IO 스레드가 받은 패킷을 순서대로, 워커에서 처리:
-var packets = new Sequencer<string>(system, line => PacketHandler.Handle(session, line));
+// maxPending 은 이 세션의 백프레셔다. 상한이 없으면 빠른 클라이언트 하나가 OOM 을 만든다.
+var packets = new Sequencer<string>(system, line => PacketHandler.Handle(session, line),
+    onError: null, maxPending: 256);
 // ...소켓 스레드에서:
-packets.Enqueue(line);
+if (!packets.Enqueue(line))
+    session.Disconnect("수신 큐가 가득 참");
 
 // 종료
 await system.StopAsync(TimeSpan.FromSeconds(10));

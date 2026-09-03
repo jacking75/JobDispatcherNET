@@ -54,12 +54,15 @@ public sealed class ConcurrencyReviewTests
 
             Assert.True(pending.Wait(TimeSpan.FromSeconds(10)), $"round {round}: async job never finished");
 
-            TestSystem.SpinWaitFor(() => actor.Done == 40, TimeSpan.FromSeconds(10),
-                $"round {round}: only {actor.Done} of 40 jobs ran");
+            // Both conditions in one wait: Done is incremented inside the job, but the counter
+            // only drops once the flush loop has retired that job, so Done can reach 40 a moment
+            // before the actor is actually empty.
+            TestSystem.SpinWaitFor(() => actor.Done == 40 && actor.RemainingTaskCount == 0,
+                TimeSpan.FromSeconds(10),
+                $"round {round}: {actor.Done} of 40 jobs ran, queue depth {actor.RemainingTaskCount}");
 
             Assert.Equal(1, actor.MaxConcurrent);
             Assert.Equal(40, actor.NonAtomicCount);
-            Assert.Equal(0, actor.RemainingTaskCount);
         }
 
         Assert.Equal(0, host.System.InFlightJobs);

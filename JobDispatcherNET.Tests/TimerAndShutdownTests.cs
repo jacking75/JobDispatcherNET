@@ -150,6 +150,42 @@ public sealed class TimerTests
     }
 
     [Fact]
+    public void ARepeatingTimerPeriodBelowTheMinimumIsRefused()
+    {
+        // B4: a period derived from client input could be a single tick, re-arming the timer every
+        // millisecond and — under TimerPrecision.High — spinning the timer thread flat out.
+        using var host = new TestSystem(workers: 1);
+        var actor = new TickActor(host.Options());
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => actor.Every(TimeSpan.FromTicks(1)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => actor.Every(TimeSpan.Zero));
+
+        using var handle = new TimerScope(actor.Every(TimeSpan.FromMilliseconds(1)));
+        TestSystem.SpinWaitFor(() => actor.Ticks >= 1, TimeSpan.FromSeconds(5),
+            "the minimum period itself was refused");
+    }
+
+    [Fact]
+    public void TheMinimumTimerPeriodCanBeLowered()
+    {
+        using var host = new TestSystem(workers: 1, options: new JobSystemOptions
+        {
+            Name = "fine-timers",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+            DetectBlockingWaitOnWorker = false,
+            MinTimerPeriod = TimeSpan.Zero,
+        });
+        var actor = new TickActor(host.Options());
+
+        using var handle = new TimerScope(actor.Every(TimeSpan.FromTicks(1)));
+        TestSystem.SpinWaitFor(() => actor.Ticks >= 1, TimeSpan.FromSeconds(5), "the timer never ticked");
+
+        // Zero is still not a period.
+        Assert.Throws<ArgumentOutOfRangeException>(() => actor.Every(TimeSpan.Zero));
+    }
+
+    [Fact]
     public async Task ARepeatingTimerRetiresItselfWhenItsActorIsDisposed()
     {
         // A12: a repeating timer on a disposed actor fired into a closed door once a period, adding

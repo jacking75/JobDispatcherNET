@@ -55,9 +55,25 @@ Handle the refusal. `DoAsync` returns `false`; with `DropPolicy.Reject` (default
 `OnDropped(actor, reason)` also fires, on the producer's thread, so keep it cheap — a counter bump,
 not a log line per drop. `DropPolicy.Silent` skips the callback and keeps the counter.
 
+`JobSystemOptions.DefaultMaxQueueSize` puts the same ceiling under every actor on the system that
+did not name a bound of its own. The per-actor setting only protects actors somebody remembered to
+configure; this one catches the rest. An actor's own `MaxQueueSize` still wins, and
+`AsyncExecutable.MaxQueueSize` reports whichever is in force.
+
 `JobOptions.MaxConsecutiveFailures` is the other bound worth setting on actors driven by untrusted
 input: after N consecutive throws the actor goes `IsFaulted` and refuses everything until
 `ClearFault()`, which stops one broken entity from filling the log at line rate.
+
+## `Sequencer<T>` bounds
+
+`maxPending` is `MaxQueueSize` for a sequencer, and it matters more: the documented pattern is one
+sequencer per session, fed straight from a socket. Size it the same way — worst tolerable latency
+times the handler's rate — and treat `Enqueue` returning `false` as back-pressure, which for a
+session usually means disconnecting the client. `DroppedCount` counts what was refused.
+
+`maxItemsPerDrain` is `MaxJobsPerFlush` for a sequencer: after that many items the drain hands the
+rest back to the ready queue instead of running the session dry, so one flooding client cannot hold
+a worker. Both default to `0`, which is unbounded, for compatibility.
 
 ## `MaxJobsPerFlush` — fairness
 

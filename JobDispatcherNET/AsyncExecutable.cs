@@ -68,19 +68,56 @@ public abstract class AsyncExecutable : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
         _system = options.System ?? JobSystem.Default;
-        _maxQueueSize = options.MaxQueueSize is int max && max > 0 ? max : 0;
+
+        // The actor's own bound wins; the system default is the floor under actors nobody
+        // configured, which is where an unbounded queue usually turns into an OOM.
+        var bound = options.MaxQueueSize ?? _system.Options.DefaultMaxQueueSize;
+        _maxQueueSize = bound is int max && max > 0 ? max : 0;
         _mode = options.Mode;
         _maxJobsPerFlush = options.MaxJobsPerFlush > 0 ? options.MaxJobsPerFlush : int.MaxValue;
         _maxConsecutiveFailures = Math.Max(0, options.MaxConsecutiveFailures);
         _reentrancy = options.AsyncReentrancy;
-        Name = options.Name ?? GetType().Name;
+        Name = SanitizeName(options.Name ?? GetType().Name);
 
         if (_reentrancy == AsyncReentrancy.Interleaved)
             _syncContext = new ActorSynchronizationContext(this);
     }
 
-    /// <summary>Name used in logs and diagnostics. Defaults to the runtime type name.</summary>
+    /// <summary>
+    /// Name used in logs and diagnostics. Defaults to the runtime type name.
+    /// Control characters are replaced and the name is truncated — see <see cref="SanitizeName"/>.
+    /// </summary>
     public string Name { get; }
+
+    /// <summary>
+    /// The queue bound actually in force: <see cref="JobOptions.MaxQueueSize"/> if the actor set
+    /// one, otherwise <see cref="JobSystemOptions.DefaultMaxQueueSize"/>. <c>null</c> is unbounded.
+    /// </summary>
+    public int? MaxQueueSize => _maxQueueSize == 0 ? null : _maxQueueSize;
+
+    /// <summary>
+    /// Names go straight into log lines, and a server that names actors after player-supplied
+    /// nicknames would otherwise let a newline in a nickname forge a whole log entry. Control
+    /// characters become <c>?</c> and the name is capped at 128 characters, which is more than
+    /// enough to identify an actor and not enough to shape a log file.
+    /// </summary>
+    private static string SanitizeName(string name)
+    {
+        const int maxLength = 128;
+
+        var capped = name.Length <= maxLength ? name : name[..maxLength];
+
+        char[]? scrubbed = null;
+        for (var i = 0; i < capped.Length; i++)
+        {
+            if (!char.IsControl(capped[i]))
+                continue;
+            scrubbed ??= capped.ToCharArray();
+            scrubbed[i] = '?';
+        }
+
+        return scrubbed is null ? capped : new string(scrubbed);
+    }
 
     /// <summary>The job system this actor belongs to.</summary>
     public JobSystem System => _system;
@@ -223,6 +260,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public Task<TResult> Ask<TResult>(Func<TResult> func)
     {
         ArgumentNullException.ThrowIfNull(func);
+        GuardSelfAsk(nameof(Ask));
         var tcs = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var queued = TryEnqueue(
             static t =>
@@ -243,6 +281,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public Task<TResult> Ask<TState, TResult>(Func<TState, TResult> func, TState state)
     {
         ArgumentNullException.ThrowIfNull(func);
+        GuardSelfAsk(nameof(Ask));
         var tcs = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var queued = TryEnqueue(
             static t =>
@@ -314,6 +353,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public Task<TResult> AskAsync<TResult>(Func<Task<TResult>> asyncFunc)
     {
         ArgumentNullException.ThrowIfNull(asyncFunc);
+        GuardSelfAsk(nameof(AskAsync));
         var tcs = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var queued = TryEnqueue(
             static t => t.Self.StartAsyncJob(t.Fn, t.Tcs),
@@ -324,6 +364,37 @@ public abstract class AsyncExecutable : IAsyncDisposable
             tcs.TrySetException(new JobRejectedException(reason, $"Actor '{Name}' refused the async job ({reason})."));
 
         return tcs.Task;
+    }
+
+    /// <summary>
+    /// Refuse an <see cref="AsyncReentrancy.Exclusive"/> actor asking *itself* for something from
+    /// inside one of its own jobs.
+    ///
+    /// The answer is queued behind the job that is asking, and an Exclusive actor runs nothing else
+    /// until that job finishes — so awaiting the answer waits on a queue the waiter has itself
+    /// stopped. Nothing recovers: no thread is blocked, so
+    /// <see cref="JobDiagnostics.GuardBlockingWait"/> sees nothing wrong; the task simply never
+    /// completes. Armed by the same
+    /// <see cref="JobSystemOptions.DetectBlockingWaitOnWorker"/> flag, on for DEBUG builds.
+    ///
+    /// <see cref="AsyncReentrancy.Interleaved"/> actors are fine: their queue keeps moving during
+    /// the await, so the answer arrives.
+    /// </summary>
+    private void GuardSelfAsk(string apiName)
+    {
+        if (_reentrancy != AsyncReentrancy.Exclusive)
+            return;
+        if (!_system.Options.DetectBlockingWaitOnWorker)
+            return;
+        if (!ReferenceEquals(ThreadContext.CurrentExecuter, this))
+            return;
+
+        throw new InvalidOperationException(
+            $"Actor '{Name}' called {apiName} on itself from inside one of its own jobs. With " +
+            $"{nameof(AsyncReentrancy)}.{nameof(AsyncReentrancy.Exclusive)} the actor runs nothing " +
+            "else until the calling job finishes, so awaiting that task can never complete. Split " +
+            $"the work into two jobs, or use {nameof(AsyncReentrancy)}.{nameof(AsyncReentrancy.Interleaved)}. " +
+            $"Set {nameof(JobSystemOptions)}.{nameof(JobSystemOptions.DetectBlockingWaitOnWorker)} = false to disable this check.");
     }
 
     private void StartAsyncJob(Func<Task> fn, TaskCompletionSource tcs)
