@@ -136,12 +136,16 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
         if (Interlocked.Exchange(ref _started, 1) != 0)
             throw new InvalidOperationException("RunWorkerThreadsAsync has already been called on this dispatcher.");
 
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
         _allWorkersDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         lock (_lifecycleLock)
         {
+            // Inside the lock, with the same reasoning as the re-check in TryRestart: a check
+            // outside it could be overtaken by a concurrent TryStop, and the threads we then
+            // started would read a cancellation source TryStop had already disposed. That surfaced
+            // as an ObjectDisposedException logged as a bogus "worker crashed".
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             for (var slot = 0; slot < WorkerCount; slot++)
                 StartWorkerOnSlot(slot, isRestart: false);
         }
@@ -308,9 +312,16 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Stop the workers and wait for them to exit.
+    ///
+    /// <para>Blocks the calling thread. Prefer <see cref="TryStopAsync"/> from async code, and note
+    /// that calling this from inside a job — a job that disposes its own system — is allowed but
+    /// cannot wait for the worker it is running on.</para>
     /// </summary>
-    /// <param name="joinTimeout">How long to wait for each worker thread.</param>
-    /// <returns><c>true</c> if every worker exited within the timeout.</returns>
+    /// <param name="joinTimeout">
+    /// Total budget for joining the workers, not a budget per thread. Spending the full timeout on
+    /// each of N threads in turn meant a pool with one stuck worker took N × timeout to give up.
+    /// </param>
+    /// <returns><c>true</c> if every worker that could be waited for exited within the timeout.</returns>
     public bool TryStop(TimeSpan joinTimeout)
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -327,41 +338,68 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
             snapshot = (Thread[])_threads.Clone();
         }
 
-        System.SignalWork();
+        // PulseAll, not Pulse: a single pulse wakes one waiter, which on a pool of idle workers is
+        // very likely not the one being joined right now. They would each still time out of their
+        // own idle wait, but only after IdleWaitMs, and shutdown would crawl.
+        System.SignalAllWork();
 
+        var started = Stopwatch.GetTimestamp();
         var allStopped = true;
+        var joinedSelf = false;
+
         foreach (var thread in snapshot)
         {
             if (thread is not { IsAlive: true })
                 continue;
 
-            System.SignalWork();
-            if (thread.Join(joinTimeout))
+            if (ReferenceEquals(thread, Thread.CurrentThread))
+            {
+                // A job running on this very worker asked for the stop. Joining ourselves can only
+                // time out, so it used to log a straggler on every such shutdown. The thread leaves
+                // its loop as soon as this job returns.
+                joinedSelf = true;
+                continue;
+            }
+
+            System.SignalAllWork();
+
+            var remaining = joinTimeout - Stopwatch.GetElapsedTime(started);
+            if (remaining < TimeSpan.Zero)
+                remaining = TimeSpan.Zero;
+
+            if (thread.Join(remaining))
                 continue;
 
             allStopped = false;
             System.Logger.Error(
-                $"Worker thread '{thread.Name}' did not stop within {joinTimeout.TotalMilliseconds:F0}ms. " +
-                "A job is probably blocking (a lock, a synchronous wait, or an infinite loop).");
+                $"Worker thread '{thread.Name}' did not stop within the {joinTimeout.TotalMilliseconds:F0}ms " +
+                "shutdown budget. A job is probably blocking (a lock, a synchronous wait, or an infinite loop).");
         }
 
         // Only safe to dispose once every worker has genuinely left; a straggler still reads the
         // token, and an ObjectDisposedException there surfaces as a bogus "worker crashed" log.
-        if (allStopped)
+        // That includes the caller's own worker thread when it stopped its own pool.
+        if (allStopped && !joinedSelf)
             _cts.Dispose();
 
         return allStopped;
     }
 
+    /// <summary>
+    /// <see cref="TryStop"/> without blocking the caller. The joins still happen on a thread, just
+    /// not this one — which matters inside <c>StopAsync</c>, where the alternative was holding an
+    /// async caller for the whole shutdown budget.
+    /// </summary>
+    /// <param name="joinTimeout">Total budget for joining the workers.</param>
+    /// <returns><c>true</c> if every worker that could be waited for exited within the timeout.</returns>
+    public Task<bool> TryStopAsync(TimeSpan joinTimeout) => Task.Run(() => TryStop(joinTimeout));
+
     /// <inheritdoc />
     public void Dispose() => TryStop(TimeSpan.FromSeconds(5));
 
     /// <inheritdoc />
-    public ValueTask DisposeAsync()
-    {
-        Dispose();
-        return ValueTask.CompletedTask;
-    }
+    public async ValueTask DisposeAsync() =>
+        await TryStopAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
 }
 
 /// <summary>

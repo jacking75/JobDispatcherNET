@@ -206,3 +206,9 @@ deadlocks: the thread that would run the work you are waiting on is the thread y
 `AskSync` calls `JobDiagnostics.GuardBlockingWait`, which throws an `InvalidOperationException`
 naming the actor when `JobSystemOptions.DetectBlockingWaitOnWorker` is on (the default in DEBUG
 builds). Call the same guard at the top of your own blocking helpers.
+
+When the job itself throws, `AskSync` rethrows **that** exception, not an `AggregateException`
+wrapping it, so `catch (InvalidDataException)` around an `AskSync` works the way it reads
+(`AskTests.AskSyncThrowsTheJobsOwnExceptionRatherThanAnAggregate`). It still throws `TimeoutException`
+when the actor does not answer in time. `Ask`/`AskAsync` are unaffected — awaiting a task has always
+unwrapped.

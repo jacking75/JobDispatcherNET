@@ -150,6 +150,28 @@ public sealed class TimerTests
     }
 
     [Fact]
+    public async Task ARepeatingTimerRetiresItselfWhenItsActorIsDisposed()
+    {
+        // A12: a repeating timer on a disposed actor fired into a closed door once a period, adding
+        // a drop each time and holding PendingTimerCount above zero — which is what made StopAsync
+        // burn its whole drain timeout.
+        using var host = new TestSystem(workers: 2);
+        var actor = new TickActor(host.Options());
+        var handle = actor.Every(TimeSpan.FromMilliseconds(10));
+
+        TestSystem.SpinWaitFor(() => actor.Ticks >= 2, TimeSpan.FromSeconds(5), "the timer never ticked");
+
+        await actor.DisposeAsync(TimeSpan.FromSeconds(5));
+
+        TestSystem.SpinWaitFor(() => host.System.PendingTimerCount == 0, TimeSpan.FromSeconds(5),
+            "the repeating timer kept firing into the disposed actor");
+
+        Assert.False(handle.IsPending);
+        Assert.True(await host.System.DrainAsync(TimeSpan.FromSeconds(2)),
+            "the drain was still waiting on the retired timer");
+    }
+
+    [Fact]
     public void ABrokenLoggerDoesNotStopTheTimerThread()
     {
         // A4: with no workers the timer thread also runs the jobs, so both the watchdog warning and

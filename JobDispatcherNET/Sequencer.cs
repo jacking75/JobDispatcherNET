@@ -63,6 +63,11 @@ public sealed class Sequencer<T>
     /// <summary>
     /// Add an item. Returns <c>false</c> if the sequencer is stopped, so the caller can tell the
     /// difference between "queued" and "thrown away".
+    ///
+    /// <para>One caveat: a call that races <see cref="Abort"/> can return <c>true</c> and still have
+    /// its item discarded. Nothing can close that window — the decision is made before
+    /// <see cref="Abort"/> runs — so the drain path throws the item away rather than leaving it
+    /// queued with nobody to take it.</para>
     /// </summary>
     public bool Enqueue(T item)
     {
@@ -96,8 +101,15 @@ public sealed class Sequencer<T>
     {
         try
         {
-            while (Volatile.Read(ref _aborted) == 0 && _queue.TryDequeue(out var item))
+            while (_queue.TryDequeue(out var item))
             {
+                // Dequeue first, check abort second. Stopping at the check instead would leave an
+                // item enqueued by a producer that raced Abort sitting in the queue for the life of
+                // the session: Abort has already run its own drain, and no later drain would take
+                // it. Aborted means "do not handle these", not "do not remove them".
+                if (Volatile.Read(ref _aborted) != 0)
+                    continue;
+
                 try
                 {
                     _handler(item);
@@ -119,10 +131,11 @@ public sealed class Sequencer<T>
             Interlocked.Exchange(ref _drainScheduled, 0);
 
             // Anything that arrived between the last dequeue and the release above still has to
-            // run. Stopped is deliberately NOT part of this condition: Stop() means "no new items",
-            // not "throw away the ones already accepted". Checking it here is what used to lose a
-            // session's final disconnect marker.
-            if (!_queue.IsEmpty && Volatile.Read(ref _aborted) == 0)
+            // be taken off the queue. Neither Stopped nor Aborted belongs in this condition:
+            // Stop() means "no new items", not "throw away the ones already accepted" — checking it
+            // here is what used to lose a session's final disconnect marker — and an aborted
+            // sequencer still has to drain-and-discard, or the item is stranded.
+            if (!_queue.IsEmpty)
                 TryScheduleDrain();
         }
     }
@@ -145,15 +158,31 @@ public sealed class Sequencer<T>
     /// Refuse new items and discard everything still queued. Use only when the remaining items
     /// genuinely must not run — a hard shutdown, or a session whose socket is already gone.
     /// </summary>
-    /// <returns>The number of items discarded.</returns>
+    /// <returns>
+    /// The number of items this call discarded. An item from a producer that was already inside
+    /// <see cref="Enqueue"/> can land afterwards; it is discarded by the drain instead, so it is not
+    /// counted here.
+    /// </returns>
     public int Abort()
     {
         Volatile.Write(ref _stopped, 1);
-        Volatile.Write(ref _aborted, 1);
+
+        // Interlocked, not a release store: the loop below reads the queue that a producer past the
+        // Stopped check is about to write, and store-load is the reordering that lets the two miss
+        // each other. The fence does not close the window — nothing can — but it narrows it to the
+        // producers genuinely in flight, and the reschedule below covers those.
+        Interlocked.Exchange(ref _aborted, 1);
 
         var discarded = 0;
         while (_queue.TryDequeue(out _))
             discarded++;
+
+        // A racing producer calls TryScheduleDrain too, but its CAS can lose to a drain that is
+        // already on its way out and has passed its own emptiness check. Without this the item — and
+        // whatever it holds a reference to — sits in the queue for the life of the process.
+        if (!_queue.IsEmpty)
+            TryScheduleDrain();
+
         return discarded;
     }
 }

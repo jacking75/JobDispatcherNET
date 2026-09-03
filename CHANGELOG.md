@@ -64,6 +64,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and cancelled the handle, which in a game server shows up as an NRE or a reference to an already
   removed sector. The callback now carries the timer entry and re-reads its state when the actor runs
   it, so a cancel lands right up until the callback actually starts.
+- **`AskSync` wrapped the job's exception in an `AggregateException`.** `Task.Wait` rethrows wrapped,
+  so the `GetAwaiter().GetResult()` that would have unwrapped it was never reached and a
+  `catch (InvalidDataException)` around an `AskSync` never fired. It now waits on the task's handle
+  and rethrows the original, stack trace intact.
+- **A start racing a stop logged a worker crash that never happened.** The disposed check in
+  `RunWorkerThreadsAsync` sat outside the lifecycle lock, so threads could go up after `TryStop` had
+  disposed the cancellation source they were about to read; the resulting `ObjectDisposedException`
+  was logged as "worker slot crashed". The check is inside the lock now, and a start that loses the
+  race throws `ObjectDisposedException` to its caller instead.
+- **`TryStop` applied its timeout per thread and tried to join its own.** A pool of N stuck workers
+  took N × timeout to give up; the timeout is now one budget for the whole pool. A job that stops its
+  own pool no longer spends that budget joining the thread it is running on and then reporting itself
+  as a straggler. Shutdown also wakes idle workers with `PulseAll` rather than a single `Pulse`, which
+  otherwise woke the wrong waiter and left each join to time out of its own idle wait.
+- **An item enqueued while `Sequencer.Abort()` ran stayed in the queue forever.** `Abort` finished its
+  own drain and every later drain then refused to dequeue anything, so an item from a producer that
+  was already inside `Enqueue` sat there with nobody left to take it — for a session sequencer, a slot
+  never given back. The drain now dequeues and discards while aborted, and `Abort` schedules one more
+  drain on the way out.
+- **A repeating timer kept firing into a disposed actor.** Every period it was refused with
+  `Disposed`, counting a drop and holding `PendingTimerCount` above zero — which made `StopAsync`
+  burn its whole drain timeout for a timer that could never do anything again. Such a timer now
+  retires itself on the first refusal.
 
 ### Changed
 
@@ -73,6 +96,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consequently a guarantee that no further tick runs on that actor, so the `_despawned` flag that
   paired with `Cancel()` is genuinely unnecessary now. `TimersFired` counts hand-offs to an actor, so
   a firing later claimed by `Cancel()` is counted in both `TimersFired` and `TimersCancelled`.
+- **Metrics are now tagged per system.** Every instrument's meter carries a `jobdispatcher.system`
+  tag holding `JobSystemOptions.Name`. Two systems in one process published identical instrument
+  names with nothing to tell their series apart, so a collector generally rendered them as one.
+- **`AskSync` throws the job's own exception** rather than an `AggregateException` wrapping it. Code
+  that caught `AggregateException` around an `AskSync` needs to catch the real exception type.
+- **`JobDispatcherBase.DisposeAsync` no longer blocks the caller** while worker threads are joined;
+  it uses the new `TryStopAsync`, as does `JobSystem.StopAsync`.
+- **`Sequencer.Abort()`'s return value counts only what that call discarded.** An item from a producer
+  that was already inside `Enqueue` can land afterwards and is discarded by the drain instead, so it
+  is not included.
 
 ### Added
 
@@ -85,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StopAsync` needs a way out. The parameterless overload is unchanged and still waits forever.
 - **`JobDispatcherOptions.MaxRestartBackoff`** (default 1 minute) — ceiling on the doubling in
   `RestartBackoff`. With it a large `MaxRestartsPerWorker` is safe to configure.
+- **`JobDispatcherBase.TryStopAsync(TimeSpan)`** — `TryStop` without blocking the caller's thread on
+  the joins.
+- **`JobMetrics.SystemTagName`** — the meter tag key (`jobdispatcher.system`) carrying the owning
+  system's name, so collectors and tests can name it rather than hard-coding the string.
 
 ## [0.10.0] - 2026-08-31
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Xunit;
 
 namespace JobDispatcherNET.Tests;
@@ -413,6 +414,143 @@ public sealed class ConcurrencyReviewTests
 
         dispatcher.Dispose();
         system.Dispose();
+    }
+
+    /// <summary>
+    /// A9 — the disposed check in <see cref="JobDispatcherBase.RunWorkerThreadsAsync"/> sat outside
+    /// the lifecycle lock, so a start racing a stop could put threads up after <c>TryStop</c> had
+    /// disposed the cancellation source they were about to read. That surfaced as an
+    /// <see cref="ObjectDisposedException"/> logged as a worker crash that never happened.
+    /// </summary>
+    [Fact]
+    public void StartingWorkersWhileStoppingNeverLogsACrashThatDidNotHappen()
+    {
+        for (var round = 0; round < 50; round++)
+        {
+            var log = new RecordingJobLogger();
+            var system = new JobSystem(new JobSystemOptions
+            {
+                Name = $"start-stop-race-{round}",
+                Logger = log,
+                PublishMeter = false,
+            });
+            var dispatcher = new JobDispatcher(4, new JobDispatcherOptions { System = system, IdleWaitMs = 1 });
+
+            var starter = new Thread(() =>
+            {
+                // Losing the race is a legitimate outcome; being told so is the point.
+                try { _ = dispatcher.RunWorkerThreadsAsync(); }
+                catch (ObjectDisposedException) { }
+            });
+            starter.Start();
+
+            dispatcher.TryStop(TimeSpan.FromSeconds(10));
+            Assert.True(starter.Join(TimeSpan.FromSeconds(10)), $"round {round}: the starter hung");
+
+            TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 0, TimeSpan.FromSeconds(10),
+                $"round {round}: {system.LiveWorkerCount} workers still alive");
+            Assert.False(log.Contains("crashed"), $"round {round}: a worker logged a crash that never happened");
+
+            system.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A10(a) — the join timeout was applied to each thread in turn, so a pool of N stuck workers
+    /// took N × timeout to give up rather than the timeout the caller asked for.
+    /// </summary>
+    [Fact]
+    public void TryStopSpendsOneBudgetAcrossEveryWorker()
+    {
+        var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "join-budget",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+        });
+
+        StuckRunnable.Reset();
+        var dispatcher = new JobDispatcher<StuckRunnable>(4, new JobDispatcherOptions
+        {
+            System = system,
+            RestartFailedWorkers = false,
+        });
+        _ = dispatcher.RunWorkerThreadsAsync();
+        TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 4, TimeSpan.FromSeconds(5),
+            "workers did not start");
+
+        StuckRunnable.Stick();      // every worker now ignores the token
+        Thread.Sleep(20);
+
+        var started = Stopwatch.GetTimestamp();
+        Assert.False(dispatcher.TryStop(TimeSpan.FromMilliseconds(500)));
+        var elapsed = Stopwatch.GetElapsedTime(started);
+
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(1_200),
+            $"TryStop took {elapsed.TotalMilliseconds:F0}ms to spend a 500ms budget across 4 workers");
+
+        StuckRunnable.Release();
+        TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 0, TimeSpan.FromSeconds(10),
+            "workers never exited");
+        system.Dispose();
+    }
+
+    /// <summary>
+    /// A10(b) — a job that stops its own pool cannot join the thread it is running on. TryStop used
+    /// to try anyway, burn the whole budget on it and report a straggler that was itself.
+    /// </summary>
+    [Fact]
+    public void StoppingThePoolFromInsideAJobDoesNotJoinItsOwnThread()
+    {
+        var log = new RecordingJobLogger();
+        var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "self-stop",
+            Logger = log,
+            PublishMeter = false,
+        });
+        var dispatcher = new JobDispatcher(2, new JobDispatcherOptions { System = system, IdleWaitMs = 5 });
+        _ = dispatcher.RunWorkerThreadsAsync();
+        TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 2, TimeSpan.FromSeconds(5),
+            "workers did not start");
+
+        var stopped = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        system.Post(() => stopped.TrySetResult(dispatcher.TryStop(TimeSpan.FromSeconds(2))));
+
+        Assert.True(stopped.Task.Wait(TimeSpan.FromSeconds(10)), "the job never returned from TryStop");
+        Assert.True(stopped.Task.Result, "TryStop reported a straggler for the thread it was running on");
+        Assert.False(log.Contains("did not stop within"), "TryStop logged its own thread as a straggler");
+
+        TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 0, TimeSpan.FromSeconds(10),
+            "workers never exited");
+        system.Dispose();
+    }
+
+    private sealed class StuckRunnable : IRunnable
+    {
+        private static readonly ManualResetEventSlim Gate = new(false);
+        private static int _stuck;
+
+        public static void Reset()
+        {
+            Interlocked.Exchange(ref _stuck, 0);
+            Gate.Reset();
+        }
+
+        public static void Stick() => Interlocked.Exchange(ref _stuck, 1);
+
+        public static void Release() => Gate.Set();
+
+        public bool Run(CancellationToken cancellationToken)
+        {
+            if (Volatile.Read(ref _stuck) != 0)
+                Gate.Wait(TimeSpan.FromSeconds(30));
+            else
+                cancellationToken.WaitHandle.WaitOne(2);
+            return true;
+        }
+
+        public void Dispose() { }
     }
 
     private sealed class AlwaysCrashingRunnable : IRunnable

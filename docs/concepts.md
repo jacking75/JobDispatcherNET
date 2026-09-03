@@ -167,6 +167,13 @@ if (!packets.Enqueue(line))
     Log("session sequencer stopped, packet dropped");
 ```
 
+`Stop()` refuses new items and still handles everything already accepted — the orderly session
+close. `Abort()` refuses new items and throws the rest away; use it only when the remaining items
+genuinely must not run. One caveat on `Abort()`: a call to `Enqueue` that was already in flight can
+return `true` and still have its item discarded. Nothing can close that window, since the decision
+was made before `Abort` ran, so the item is dropped rather than left in a queue nobody will drain
+(`SequencerTests.EnqueueRacingAbortNeverStrandsAnItem`).
+
 ## Where to go next
 
 - [Guarantees & non-guarantees](guarantees.md) — the precise contract, including memory visibility.

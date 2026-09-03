@@ -1,9 +1,43 @@
+using System.Diagnostics.Metrics;
 using Xunit;
 
 namespace JobDispatcherNET.Tests;
 
 public sealed class MetricsTests
 {
+    [Fact]
+    public void EachSystemTagsItsMeterWithItsOwnName()
+    {
+        // A8: two systems publish identical instrument names. Without a meter tag a collector has
+        // no way to tell their series apart and shows them as one.
+        var names = new HashSet<string>(StringComparer.Ordinal);
+
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, _) =>
+            {
+                if (instrument.Meter.Name != JobMetrics.MeterName || instrument.Meter.Tags is null)
+                    return;
+
+                foreach (var tag in instrument.Meter.Tags)
+                {
+                    if (tag.Key == JobMetrics.SystemTagName && tag.Value is string name)
+                        lock (names) { names.Add(name); }
+                }
+            },
+        };
+        listener.Start();
+
+        using var alpha = new JobSystem(new JobSystemOptions { Name = "meter-alpha", Logger = NullJobLogger.Instance });
+        using var beta = new JobSystem(new JobSystemOptions { Name = "meter-beta", Logger = NullJobLogger.Instance });
+
+        lock (names)
+        {
+            Assert.Contains("meter-alpha", names);
+            Assert.Contains("meter-beta", names);
+        }
+    }
+
     [Fact]
     public void ExecutedPlusDroppedAccountsForEveryAttempt()
     {

@@ -365,7 +365,16 @@ internal sealed class TimerService : IDisposable
         if (entry.Repeating)
         {
             _system.Metrics.OnTimerFired();
-            _system.DispatchTimerJob(entry.Owner, entry.RentTickJob());
+
+            if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out var refusal)
+                && refusal == DropReason.Disposed)
+            {
+                // The owner is gone for good, so re-arming can only fire into a closed door once a
+                // period: a drop counted every tick, and a pending timer that never goes away, which
+                // is exactly what makes StopAsync burn its whole drain timeout.
+                entry.Retire(TimerRetirement.Discarded);
+                return;
+            }
 
             // Re-arm from the scheduled time to avoid drift, but never schedule into the past.
             var next = entry.DueTick + ToMillis(entry.Period);
@@ -388,7 +397,7 @@ internal sealed class TimerService : IDisposable
         Interlocked.Decrement(ref _pending);
         _system.Metrics.OnTimerFired();
 
-        if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob()))
+        if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out _))
         {
             // The actor refused the job (full, faulted, disposed, or the system is stopping), so
             // the callback will never run. Retire the handle silently: the refusal is already

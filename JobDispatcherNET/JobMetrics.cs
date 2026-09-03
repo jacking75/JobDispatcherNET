@@ -43,11 +43,19 @@ public readonly record struct JobMetricsSnapshot(
 /// ping-pong a single line. Everything is also published through
 /// <see cref="System.Diagnostics.Metrics"/> under the meter name <c>JobDispatcherNET</c>,
 /// so OpenTelemetry and <c>dotnet-counters</c> pick it up with no extra wiring.
+///
+/// <para>Each system's meter carries a <c>jobdispatcher.system</c> tag holding
+/// <see cref="JobSystemOptions.Name"/>. Two systems in one process publish the same instrument
+/// names, and without that tag a collector has no way to tell their values apart — it just sees two
+/// series it cannot name, which usually ends up rendered as one.</para>
 /// </summary>
 public sealed class JobMetrics : IDisposable
 {
     /// <summary>Meter name used for all instruments.</summary>
     public const string MeterName = "JobDispatcherNET";
+
+    /// <summary>Meter-level tag carrying the owning system's <see cref="JobSystemOptions.Name"/>.</summary>
+    public const string SystemTagName = "jobdispatcher.system";
 
     private readonly StripedCounter _executed = new();
     private readonly StripedCounter _dropped = new();
@@ -75,7 +83,10 @@ public sealed class JobMetrics : IDisposable
         if (!publishMeter)
             return;
 
-        _meter = new Meter(MeterName);
+        _meter = new Meter(new MeterOptions(MeterName)
+        {
+            Tags = [new KeyValuePair<string, object?>(SystemTagName, system?.Name ?? "default")],
+        });
         _meter.CreateObservableCounter("jobdispatcher.jobs.executed", () => _executed.Value, unit: "{job}",
             description: "Jobs that ran to completion.");
         _meter.CreateObservableCounter("jobdispatcher.jobs.dropped", () => _dropped.Value, unit: "{job}",

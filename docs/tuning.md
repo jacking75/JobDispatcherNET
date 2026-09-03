@@ -170,10 +170,17 @@ the slot is logged and restarted like any other.
 The restart log names the actor that was running when the thread died, so a rising `WorkerRestarts`
 is directly actionable.
 
+`TryStop(joinTimeout)` spends that timeout as **one budget across the whole pool**, not per thread,
+so a pool with several stuck workers gives up when you asked it to. It skips joining the calling
+thread when a job stops its own pool — that join could only ever time out. `TryStopAsync` is the same
+thing without blocking the caller, and is what `JobSystem.StopAsync` uses.
+
 ## Find the bottleneck from the metrics
 
 `system.Metrics.Snapshot()` returns a `JobMetricsSnapshot`; the same values are published as
-OpenTelemetry / `dotnet-counters` instruments under the meter `JobDispatcherNET`.
+OpenTelemetry / `dotnet-counters` instruments under the meter `JobDispatcherNET`. Every instrument
+carries a meter-level `jobdispatcher.system` tag holding `JobSystemOptions.Name`, so two systems in
+one process stay distinguishable — group or filter on it.
 
 | Snapshot field | Meter instrument | Rising means | Do this |
 |---|---|---|---|
@@ -185,7 +192,7 @@ OpenTelemetry / `dotnet-counters` instruments under the meter `JobDispatcherNET`
 | `LiveWorkers` | `jobdispatcher.workers.live` | *Falling* below the configured count. | A slot exceeded `MaxRestartsPerWorker` and is permanently down; the log names it. Restart the process or raise the budget. |
 | `WorkerRestarts` | `jobdispatcher.worker.restarts` | Worker threads are dying. | An exception is escaping `IRunnable.Run`. The log line names the actor that was running. |
 | `PendingTimerJobs` | `jobdispatcher.timers.pending` | Timers are being scheduled faster than they fire, or handles are never cancelled. | Usually leaked `DoAsyncEvery` handles on despawned entities — this is also what makes `StopAsync` time out. |
-| `TimersDiscarded` | `jobdispatcher.timers.discarded` | Timers were dropped because the system was stopping. | Expected at shutdown; anything at runtime means work scheduled onto a system that is already stopping. |
+| `TimersDiscarded` | `jobdispatcher.timers.discarded` | Timers were dropped because the system was stopping, or because a repeating timer's actor had been disposed. | Expected at shutdown. At runtime it usually means a repeating timer outlived the actor that owned it — harmless now that it retires itself, but a sign of a handle nobody cancelled. |
 | `TimersFired` vs `TotalJobsExecuted` | — | Firings climb while executions do not. | The timer thread is dispatching but the actors are not draining — see `ReadyQueueDepth`. |
 | `ActiveJobPoolSize` | `jobdispatcher.pool.size` | Pinned at `Job.MaxPoolSize`. | The pool is saturated and the overflow is going to the GC. Raise `MaxPoolSize` only if gen-0 pressure actually shows in a profile. |
 | `jobdispatcher.job.duration` (detailed) | histogram | p99 far above p50. | A few slow jobs are holding leaders. Set `MaxJobDuration` to get them named in the log. |

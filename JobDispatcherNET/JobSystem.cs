@@ -281,6 +281,10 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         return handled;
     }
 
+    /// <summary>
+    /// Wake one idle worker. Used when a single item arrives, where one waiter is exactly the
+    /// number needed.
+    /// </summary>
     internal void SignalWork()
     {
         if (Volatile.Read(ref _waiters) == 0)
@@ -288,6 +292,19 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         lock (_signal)
         {
             Monitor.Pulse(_signal);
+        }
+    }
+
+    /// <summary>
+    /// Wake every idle worker. Used where the point is "everybody re-check your exit condition" —
+    /// shutdown and the drain loop — and where waking the wrong single waiter costs a whole idle
+    /// timeout. Unconditional: the caller cannot afford to skip on a stale <c>_waiters</c> read.
+    /// </summary>
+    internal void SignalAllWork()
+    {
+        lock (_signal)
+        {
+            Monitor.PulseAll(_signal);
         }
     }
 
@@ -317,8 +334,8 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     // ── timers ──────────────────────────────────────────────────────────────
 
     /// <summary>Hand a fired timer's job to its actor. False when the actor refused it.</summary>
-    internal bool DispatchTimerJob(AsyncExecutable owner, JobEntry job) =>
-        owner.DoTaskFromTimer(job);
+    internal bool DispatchTimerJob(AsyncExecutable owner, JobEntry job, out DropReason reason) =>
+        owner.DoTaskFromTimer(job, out reason);
 
     internal void WarnTimerFallbackOnce()
     {
@@ -382,7 +399,15 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         }
         foreach (var dispatcher in dispatchers)
         {
-            try { dispatcher.Dispose(); }
+            try
+            {
+                // Joining worker threads is a blocking operation, and there is no reason for an
+                // async caller to hold its own thread for the whole budget while it happens.
+                if (dispatcher is JobDispatcherBase pool)
+                    await pool.TryStopAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                else
+                    dispatcher.Dispose();
+            }
             catch (Exception ex) { Logger.Error("Dispatcher shutdown failed", ex); }
         }
 
@@ -408,7 +433,7 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
                 return false;
             }
 
-            SignalWork();
+            SignalAllWork();
             await Task.Delay(2).ConfigureAwait(false);
         }
 

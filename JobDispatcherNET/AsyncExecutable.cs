@@ -270,8 +270,15 @@ public abstract class AsyncExecutable : IAsyncDisposable
     {
         JobDiagnostics.GuardBlockingWait(_system, nameof(AskSync));
         var task = Ask(func);
-        if (!task.Wait(timeout))
+
+        // Waiting on the handle rather than Task.Wait: Wait rethrows a failed task's exception
+        // wrapped in an AggregateException, so the caller saw that instead of the exception the job
+        // actually threw and never reached the GetResult below. GetAwaiter().GetResult() rethrows
+        // the original, stack trace intact. The handle is allocated lazily and only on the slow
+        // path, which for a blocking API is not worth optimising away.
+        if (!task.IsCompleted && !((IAsyncResult)task).AsyncWaitHandle.WaitOne(timeout))
             throw new TimeoutException($"Actor '{Name}' did not answer within {timeout.TotalMilliseconds:F0}ms.");
+
         return task.GetAwaiter().GetResult();
     }
 
@@ -601,14 +608,24 @@ public abstract class AsyncExecutable : IAsyncDisposable
         return true;
     }
 
-    internal bool DoTaskFromTimer(JobEntry task)
+    /// <summary>
+    /// Queue a fired timer's job. The reason is reported because the timer service acts on it:
+    /// a repeating timer whose actor has been disposed is retired rather than re-armed.
+    /// </summary>
+    internal bool DoTaskFromTimer(JobEntry task, out DropReason reason)
     {
-        if (!TryReserve(out var reason))
+        if (!TryReserve(out reason))
         {
             task.Discard();
             return Refuse(reason);
         }
-        return Admit(task, fromTimer: true);
+
+        if (Admit(task, fromTimer: true))
+            return true;
+
+        // Admit only refuses for one reason; TryReserve already covered the others.
+        reason = DropReason.QueueFull;
+        return false;
     }
 
     /// <summary>Queue a pre-built job. Kept for callers that build <see cref="JobEntry"/> themselves.</summary>

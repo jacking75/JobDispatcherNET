@@ -283,7 +283,9 @@ the workers last. See [Shutdown](shutdown.md).
 
 **Fix.** Cancel repeating timers as part of your shutdown — normally by despawning the entities that
 own them, since each `Despawn()` should cancel its own handles. The message names the culprit: a
-non-zero `timers=` with `in-flight=0` is always this.
+non-zero `timers=` with `in-flight=0` is always this. Disposing the owning actor also works as a
+backstop — a repeating timer whose actor refuses a firing with `Disposed` retires itself — but only
+for actors you actually dispose.
 
 **The other shape of the same symptom** is `async=` non-zero with everything else at zero: an
 `AsyncReentrancy.Interleaved` job is parked on an `await` that never completes — a socket read or an

@@ -87,6 +87,12 @@ same period so they do not all land on the same tick.
 
 A repeating timer counts as **one** pending timer for its whole life, not one per firing.
 
+If you forget to cancel one, disposing its actor now retires it: the first firing that the disposed
+actor refuses stops the timer instead of re-arming it, so it no longer fires into a closed door once
+a period and no longer pins `PendingTimerCount` above zero
+(`TimerTests.ARepeatingTimerRetiresItselfWhenItsActorIsDisposed`). That is a safety net, not a
+substitute for cancelling — a timer on an actor you never dispose still pins the drain.
+
 ## Precision
 
 `JobSystemOptions.TimerPrecision`:
@@ -173,7 +179,7 @@ the normal admission path:
 |---|---|
 | `TimersFired` | Firings dispatched to an actor (a repeating timer contributes one per tick). Counts the hand-off, so a firing later claimed by `Cancel()` is counted here and in `TimersCancelled`. |
 | `TimersCancelled` | `Cancel()` calls that kept a callback from running, whether or not it had already been dispatched. |
-| `TimersDiscarded` | Timers thrown away because the service was stopping, or scheduled after it stopped. |
+| `TimersDiscarded` | Timers thrown away because the service was stopping, scheduled after it stopped, or — for a repeating timer — retired because its actor had been disposed. |
 | `PendingTimerJobs` / `JobSystem.PendingTimerCount` | Scheduled and not yet fired. Repeating timers count as 1 each. |
 
 With `JobSystemOptions.EnableDetailedMetrics = true`, the `jobdispatcher.timer.lag` histogram records

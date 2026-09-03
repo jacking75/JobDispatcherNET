@@ -1,5 +1,15 @@
 # Working Log
 
+## 2026-09-03 12:05 KST - 리뷰 A7~A12 수정 (A절 전체 완료)
+
+- A7: `AskSync`가 `Task.Wait` 대신 완료 핸들을 기다리도록 바꿔 작업 예외를 `AggregateException`으로 감싸지 않고 원본 그대로 던지게 함.
+- A8: `MeterOptions.Tags`로 계측기에 `jobdispatcher.system` 태그(시스템 이름) 부착 — 한 프로세스의 두 `JobSystem`을 구분 가능.
+- A9: `RunWorkerThreadsAsync`의 disposed 검사를 `_lifecycleLock` 안으로 이동 — 시작/종료 경합 시 가짜 "worker crashed" 로그 제거.
+- A10: `TryStop`을 (a) 스레드별이 아닌 전체 예산 하나로, (b) 자기 자신 Join 생략, (c) `TryStopAsync` 추가 후 `StopAsync`/`DisposeAsync`가 사용, (d) 종료·드레인 시 `SignalAllWork`(PulseAll)로 변경.
+- A11: `Sequencer` 드레인이 aborted 상태에서도 dequeue-and-discard 하도록 바꾸고 `Abort`가 마지막에 `TryScheduleDrain()` 호출 — Abort와 경합한 `Enqueue` 항목의 영구 잔류 제거.
+- A12: 반복 타이머가 `Disposed` 액터에 거부당하면 재무장하지 않고 스스로 은퇴 — `PendingTimerCount`가 영원히 1로 남아 `StopAsync`가 타임아웃되던 경로 제거.
+- 회귀 테스트 8개 추가(86개 전부 통과, net8.0/net10.0). 7개는 옛 동작에서 실패하는 것을 확인(A11은 레이스라 재현율 약 75%).
+
 ## 2026-09-03 11:39 KST - 리뷰 A4·A5·A6 수정 (로거 예외 가드, 워커 재시작 안전화, 타이머 취소 시점)
 
 - A4: `SafeJobLogger`로 라이브러리 내부 로그 호출을 전부 감싸고, 타이머 루프를 반복 단위(+연속 실패 백오프)와 항목 단위로 가드. `Flush`의 회계를 `finally`로 옮기고 `RunFlushLoop`에 리더십 복구 안전망 추가.

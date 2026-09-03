@@ -72,6 +72,34 @@ public sealed class AskTests
         Assert.Equal(7, actor.AskSync(() => actor.Value, TimeSpan.FromSeconds(5)));
     }
 
+    [Fact]
+    public void AskSyncThrowsTheJobsOwnExceptionRatherThanAnAggregate()
+    {
+        // A7: Task.Wait rethrows wrapped, so the caller got an AggregateException and the
+        // GetAwaiter().GetResult() that would have unwrapped it was never reached.
+        using var host = new TestSystem(workers: 2);
+        var actor = new CounterActor(host.Options());
+
+        var thrown = Assert.Throws<InvalidDataException>(
+            () => actor.AskSync<int>(() => throw new InvalidDataException("bad packet"), TimeSpan.FromSeconds(5)));
+
+        Assert.Equal("bad packet", thrown.Message);
+    }
+
+    [Fact]
+    public void AskSyncStillTimesOutWhenTheActorNeverAnswers()
+    {
+        using var host = new TestSystem(workers: 1);
+        var blocker = new BlockingActor(host.Options(mode: ExecutionMode.Scheduled));
+        blocker.BlockAndWait();
+
+        Assert.Throws<TimeoutException>(() => blocker.AskSync(() => 1, TimeSpan.FromMilliseconds(200)));
+
+        blocker.Release();
+        TestSystem.SpinWaitFor(() => blocker.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the actor never drained");
+    }
+
     private sealed class CounterActor(JobOptions options) : AsyncExecutable(options)
     {
         private int _value;
@@ -292,6 +320,42 @@ public sealed class AsyncJobTests
 
 public sealed class SequencerTests
 {
+    [Fact]
+    public void EnqueueRacingAbortNeverStrandsAnItem()
+    {
+        // A11: Abort ran its own drain and then refused to dequeue anything else, so an item from a
+        // producer that was already inside Enqueue sat in the queue with nobody left to take it.
+        using var host = new TestSystem(workers: 2);
+
+        for (var round = 0; round < 200; round++)
+        {
+            var sequencer = new Sequencer<int>(host.System, static _ => { });
+
+            // Several producers, because the window is "somebody is between Enqueue's stopped check
+            // and its write when Abort's own drain loop finds the queue empty".
+            var producers = new Thread[4];
+            for (var p = 0; p < producers.Length; p++)
+            {
+                producers[p] = new Thread(() =>
+                {
+                    for (var i = 0; i < 20_000 && sequencer.Enqueue(i); i++)
+                    {
+                    }
+                });
+                producers[p].Start();
+            }
+
+            Thread.Sleep(1);
+            sequencer.Abort();
+
+            foreach (var producer in producers)
+                Assert.True(producer.Join(TimeSpan.FromSeconds(10)), $"round {round}: a producer hung");
+
+            TestSystem.SpinWaitFor(() => sequencer.PendingCount == 0, TimeSpan.FromSeconds(5),
+                $"round {round}: {sequencer.PendingCount} items stranded in an aborted sequencer");
+        }
+    }
+
     [Fact]
     public void ItemsAreHandledInArrivalOrderByOneThreadAtATime()
     {
