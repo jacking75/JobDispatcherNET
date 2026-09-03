@@ -224,7 +224,7 @@ public sealed class ConcurrencyReviewTests
             $"pending timer count settled at {host.System.PendingTimerCount}, not 0 — " +
             "a negative count means a cancel and a firing both claimed the same timer");
 
-        // Every timer either fired or was cancelled, never both.
+        // Every handle resolved exactly once: Cancel() either claimed it or reported it had run.
         Assert.Equal(armed, fired + cancelled);
 
         TestSystem.SpinWaitFor(() => actor.Executed == fired, TimeSpan.FromSeconds(20),
@@ -233,7 +233,12 @@ public sealed class ConcurrencyReviewTests
 
         var metrics = host.System.Metrics.Snapshot();
         Assert.Equal(cancelled, metrics.TimersCancelled);
-        Assert.Equal(fired, metrics.TimersFired);
+
+        // TimersFired counts entries the timer thread handed to the actor, which is not the same as
+        // callbacks that ran: a cancel landing while the job is still queued on the actor claims it
+        // (A6). So the counter sits between the callbacks that ran and everything ever armed.
+        Assert.InRange(metrics.TimersFired, actor.Executed, armed);
+
         Assert.True(fired > 0, "no timer ever won the race; the test proved nothing");
         Assert.True(cancelled > 0, "no cancel ever won the race; the test proved nothing");
     }
@@ -337,6 +342,138 @@ public sealed class ConcurrencyReviewTests
             $"peak {actor.MaxObservedQueueDepth} is below the live depth {depth}");
 
         actor.Release();
+    }
+
+    /// <summary>
+    /// A5 — the restart path runs outside the worker's own try/catch, so anything it throws is an
+    /// unhandled exception on a dedicated thread and ends the process. Unbounded backoff doubling
+    /// is the reachable one: Thread.Sleep(TimeSpan) rejects anything past ~24.8 days.
+    /// </summary>
+    [Fact]
+    public void ExhaustingTheRestartBudgetLeavesTheSlotDownWithoutKillingTheProcess()
+    {
+        var log = new RecordingJobLogger();
+        var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "restart-budget",
+            Logger = log,
+            PublishMeter = false,
+        });
+
+        AlwaysCrashingRunnable.Reset();
+        var dispatcher = new JobDispatcher<AlwaysCrashingRunnable>(1, new JobDispatcherOptions
+        {
+            System = system,
+            RestartFailedWorkers = true,
+            MaxRestartsPerWorker = 40,          // attempt 26 overflowed the old backoff
+            RestartBackoff = TimeSpan.FromMilliseconds(1),
+            MaxRestartBackoff = TimeSpan.FromMilliseconds(5),
+            RestartCountResetAfter = TimeSpan.Zero,
+        });
+        _ = dispatcher.RunWorkerThreadsAsync();
+
+        TestSystem.SpinWaitFor(() => log.Contains("permanently down"), TimeSpan.FromSeconds(30),
+            $"the slot never gave up; it crashed {AlwaysCrashingRunnable.Crashes} times");
+
+        Assert.Equal(40, system.Metrics.Snapshot().WorkerRestarts);
+        TestSystem.SpinWaitFor(() => system.LiveWorkerCount == 0, TimeSpan.FromSeconds(10),
+            "the exhausted slot is still running");
+
+        dispatcher.Dispose();
+        system.Dispose();
+    }
+
+    /// <summary>
+    /// A5 — an OperationCanceledException with no stop in progress is a crash, not a clean exit.
+    /// Treating every OCE as normal made the slot vanish with neither a log line nor a restart.
+    /// </summary>
+    [Fact]
+    public void AnUnexpectedCancellationCrashesTheWorkerInsteadOfRetiringItSilently()
+    {
+        var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "unexpected-oce",
+            Logger = NullJobLogger.Instance,
+            PublishMeter = false,
+        });
+
+        CancellingRunnable.Reset();
+        var dispatcher = new JobDispatcher<CancellingRunnable>(1, new JobDispatcherOptions
+        {
+            System = system,
+            RestartFailedWorkers = true,
+            MaxRestartsPerWorker = 3,
+            RestartBackoff = TimeSpan.FromMilliseconds(1),
+            RestartCountResetAfter = TimeSpan.Zero,
+        });
+        _ = dispatcher.RunWorkerThreadsAsync();
+
+        TestSystem.SpinWaitFor(() => system.Metrics.Snapshot().WorkerRestarts >= 3, TimeSpan.FromSeconds(20),
+            "the worker retired silently instead of being restarted");
+
+        dispatcher.Dispose();
+        system.Dispose();
+    }
+
+    private sealed class AlwaysCrashingRunnable : IRunnable
+    {
+        private static int _crashes;
+
+        public static int Crashes => Volatile.Read(ref _crashes);
+
+        public static void Reset() => Interlocked.Exchange(ref _crashes, 0);
+
+        public bool Run(CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _crashes);
+            throw new InvalidOperationException("this worker never survives an iteration");
+        }
+
+        public void Dispose() { }
+    }
+
+    private sealed class CancellingRunnable : IRunnable
+    {
+        private static int _runs;
+
+        public static void Reset() => Interlocked.Exchange(ref _runs, 0);
+
+        public bool Run(CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _runs);
+
+            // A token of our own, already cancelled: nothing to do with the dispatcher stopping.
+            // This is what an inner Task.Wait that gets cancelled looks like from out here.
+            using var own = new CancellationTokenSource();
+            own.Cancel();
+            own.Token.ThrowIfCancellationRequested();
+            return true;
+        }
+
+        public void Dispose() { }
+    }
+
+    private sealed class RecordingJobLogger : IJobLogger
+    {
+        private readonly List<string> _lines = [];
+
+        public bool IsEnabled(JobLogLevel level) => true;
+
+        public void Log(JobLogLevel level, string message, Exception? exception = null)
+        {
+            lock (_lines)
+            {
+                _lines.Add(message);
+            }
+        }
+
+        public bool Contains(string fragment)
+        {
+            lock (_lines)
+            {
+                return _lines.Exists(line => line.Contains(fragment, StringComparison.Ordinal));
+            }
+        }
     }
 
     private sealed class ExclusiveProbe(JobOptions options) : AsyncExecutable(options)

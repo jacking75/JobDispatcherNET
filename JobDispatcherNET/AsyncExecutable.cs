@@ -688,10 +688,37 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 next.Flush();
             }
         }
+        catch (Exception ex)
+        {
+            // Flush is not meant to throw — ExecuteJob catches anything a job can do — but if it
+            // ever does, leadership dies with this thread while the counter still says the actor is
+            // busy. No producer can claim an actor whose count is above zero, so it would stay
+            // wedged for the life of the process. Hand it, and anything queued behind it on this
+            // thread, back to the system before letting the exception continue on its way.
+            var stuck = ThreadContext.CurrentExecuter ?? this;
+            _system.Logger.Error($"Flush loop for actor '{stuck.Name}' failed; handing leadership back", ex);
+
+            stuck.RescheduleAfterFailedFlush();
+            while (ThreadContext.ExecuterQueue.TryDequeue(out var abandoned))
+                abandoned.RescheduleAfterFailedFlush();
+
+            throw;
+        }
         finally
         {
             ThreadContext.CurrentExecuter = null;
         }
+    }
+
+    /// <summary>
+    /// Put an actor whose flush blew up back on the ready queue, so a worker picks its leadership
+    /// up. Deliberately not <see cref="ScheduleOrFlush"/>: flushing inline from here would re-enter
+    /// the loop that just failed, on the same thread, with the same input.
+    /// </summary>
+    private void RescheduleAfterFailedFlush()
+    {
+        if (Volatile.Read(ref _remainingTaskCount) > 0)
+            _system.Schedule(this);
     }
 
     internal void Flush()
@@ -707,10 +734,21 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 spinner = new SpinWait();
                 iterations = 0;
 
-                ExecuteJob(job);
-
-                _system.OnJobRetired();
-                var remaining = Interlocked.Decrement(ref _remainingTaskCount);
+                int remaining;
+                try
+                {
+                    ExecuteJob(job);
+                }
+                finally
+                {
+                    // In a finally so the accounting survives an exception from ExecuteJob itself
+                    // (it catches everything the job can throw, but the metric and watchdog calls
+                    // around it are not the library's code). Skipping it would leave the counter
+                    // permanently one job above the truth, which pins the actor as busy forever and
+                    // makes every later drain time out.
+                    _system.OnJobRetired();
+                    remaining = Interlocked.Decrement(ref _remainingTaskCount);
+                }
 
                 if (Volatile.Read(ref _suspendState) != SuspendNone)
                 {

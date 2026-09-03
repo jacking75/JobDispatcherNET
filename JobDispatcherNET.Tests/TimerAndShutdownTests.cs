@@ -97,6 +97,123 @@ public sealed class TimerTests
         Assert.True(fired.Task.Result, "the timer job did not run on a worker thread");
     }
 
+    [Fact]
+    public void CancellingAOneShotAfterItFiredButBeforeItRanStopsTheCallback()
+    {
+        // A6: the timer thread hands the callback to the actor as an ordinary job. While that job
+        // waits its turn the callback has not run, so a cancel must still be able to claim it.
+        using var host = new TestSystem(workers: 1);
+        var actor = new BlockingActor(host.Options(mode: ExecutionMode.Scheduled));
+        actor.BlockAndWait();                       // nothing behind the blocked job can run
+
+        var ran = 0;
+        var handle = actor.DoAsyncAfter(TimeSpan.FromMilliseconds(20), () => Interlocked.Increment(ref ran));
+
+        TestSystem.SpinWaitFor(() => host.System.PendingTimerCount == 0, TimeSpan.FromSeconds(5),
+            "the timer never fired");
+        Assert.True(handle.IsPending, "a fired-but-not-yet-run timer is still pending");
+
+        Assert.True(handle.Cancel(), "a fired-but-not-yet-run timer must still be cancellable");
+        Assert.False(handle.IsPending);
+        Assert.False(handle.Cancel(), "a second Cancel must report that it did nothing");
+
+        actor.Release();
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the actor never drained");
+
+        Assert.Equal(0, Volatile.Read(ref ran));
+    }
+
+    [Fact]
+    public void CancellingARepeatingTimerDropsATickAlreadyQueuedOnTheActor()
+    {
+        // A6 for repeating timers: this is the despawn case. An entity cancels its AI tick and the
+        // tick already sitting on its queue used to run anyway, against a dead entity.
+        using var host = new TestSystem(workers: 1);
+        var actor = new BlockingActor(host.Options(mode: ExecutionMode.Scheduled));
+        actor.BlockAndWait();
+
+        var ticks = 0;
+        var handle = actor.DoAsyncEvery(TimeSpan.FromMilliseconds(10), () => Interlocked.Increment(ref ticks));
+
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount >= 2, TimeSpan.FromSeconds(5),
+            "no tick ever queued up behind the blocked job");
+
+        Assert.True(handle.Cancel());
+
+        actor.Release();
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the actor never drained");
+
+        Assert.Equal(0, Volatile.Read(ref ticks));
+        Assert.Equal(0, host.System.PendingTimerCount);
+    }
+
+    [Fact]
+    public void ABrokenLoggerDoesNotStopTheTimerThread()
+    {
+        // A4: with no workers the timer thread also runs the jobs, so both the watchdog warning and
+        // the timer-fallback warning are logged from it. One throw used to kill it silently, and
+        // with it every timer on the system for the life of the process.
+        var system = new JobSystem(new JobSystemOptions
+        {
+            Name = "broken-logger",
+            Logger = new ThrowingJobLogger(),
+            PublishMeter = false,
+            MaxJobDuration = TimeSpan.FromTicks(1),      // every job trips the watchdog -> Logger.Warn
+        });
+
+        var actor = new TickActor(new JobOptions { System = system });
+        var handle = actor.Every(TimeSpan.FromMilliseconds(5));
+
+        TestSystem.SpinWaitFor(() => actor.Ticks >= 5, TimeSpan.FromSeconds(10),
+            $"the timer thread stopped after {actor.Ticks} ticks; the logger took it down");
+
+        Assert.True(ThrowingJobLogger.Calls > 0, "the logger was never reached, so nothing was proven");
+
+        handle.Cancel();
+        system.Dispose();
+    }
+
+    [Fact]
+    public void ABrokenLoggerDoesNotWedgeAnActor()
+    {
+        // The same throw inside a flush used to escape before the counter was decremented, leaving
+        // the actor stuck at "somebody is flushing me" with no leader.
+        using var host = new TestSystem(workers: 2, options: new JobSystemOptions
+        {
+            Name = "broken-logger-flush",
+            Logger = new ThrowingJobLogger(),
+            PublishMeter = false,
+            DetectBlockingWaitOnWorker = false,
+            MaxJobDuration = TimeSpan.FromTicks(1),
+        });
+
+        var actor = new CountingActor(host.Options());
+        for (var i = 0; i < 200; i++)
+            Assert.True(actor.Bump());
+
+        TestSystem.SpinWaitFor(() => actor.Executed == 200, TimeSpan.FromSeconds(10),
+            $"only {actor.Executed} of 200 jobs ran");
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(10),
+            $"the actor stayed at depth {actor.RemainingTaskCount} after draining");
+    }
+
+    private sealed class ThrowingJobLogger : IJobLogger
+    {
+        private static int _calls;
+
+        public static int Calls => Volatile.Read(ref _calls);
+
+        public bool IsEnabled(JobLogLevel level) => true;
+
+        public void Log(JobLogLevel level, string message, Exception? exception = null)
+        {
+            Interlocked.Increment(ref _calls);
+            throw new InvalidOperationException("the log sink is down");
+        }
+    }
+
     private sealed class TimerActor(JobOptions options, TaskCompletionSource<long> sink) : AsyncExecutable(options)
     {
         public ITimerHandle After(TimeSpan delay) => DoAsyncAfter(delay, static a => a.Fire(), this);

@@ -89,6 +89,25 @@ system, and disposed with the system.
 - Cancelled entries are left in the priority queue and skipped when they come due, so a workload that
   schedules and cancels far-future timers in a loop holds them until their original due time.
 
+## Amendment — cancellation reaches past the firing
+
+The contract above left a gap that took a while to surface. "Firing goes through normal admission"
+means the callback becomes an ordinary job on the owner's queue, and on a busy actor that job waits
+its turn like any other. `Cancel()` originally gave up at the hand-off, so for the whole of that wait
+— easily hundreds of milliseconds — a cancelled timer still ran. A repeating tick could therefore run
+against an entity that had already despawned and cancelled its handle, which is exactly the failure
+the flag-free design was meant to remove.
+
+`TimerEntry` is now a four-state machine (`Armed`, `Fired`, `Executed`, `Cancelled`) and the job
+handed to the actor carries the entry rather than the user callback, so it re-reads the state when it
+finally runs. `Cancel()` therefore means "the callback will not run" and only returns `false` once it
+actually has. The same word arbitrates the pending-count accounting, replacing the interlocked
+exchange on the job field that used to do it.
+
+Because an actor runs one job at a time, this makes cancelling from inside the owner's own job a
+guarantee: no tick queued before that job can run after it. `TimersFired` now counts hand-offs, so a
+firing later claimed by `Cancel()` appears in both `TimersFired` and `TimersCancelled`.
+
 ## Alternatives considered
 
 - **Short-term patch: `TimerQueue.Dispose(bool migrate)`** that hands pending entries to another live

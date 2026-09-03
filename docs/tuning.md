@@ -153,10 +153,19 @@ job overruns the limit, which is usually the question you actually have.
 
 `JobDispatcherOptions.RestartFailedWorkers` (default true) restarts a worker slot whose thread died
 from an unhandled exception — which for `JobDispatcher<T>` means an exception escaping your
-`IRunnable.Run`, since job exceptions are already contained. `MaxRestartsPerWorker` (5) and
-`RestartBackoff` (1 s, doubling) bound the retries, and `RestartCountResetAfter` (5 minutes) refills
-the budget for a slot that has been healthy since its last restart — without it a server that
-hiccups five times over months is permanently down a worker.
+`IRunnable.Run`, since job exceptions are already contained. `MaxRestartsPerWorker` (5),
+`RestartBackoff` (1 s, doubling) and `MaxRestartBackoff` (1 minute, the ceiling on that doubling)
+bound the retries, and `RestartCountResetAfter` (5 minutes) refills the budget for a slot that has
+been healthy since its last restart — without it a server that hiccups five times over months is
+permanently down a worker.
+
+Raise `MaxRestartsPerWorker` freely: the backoff is clamped, so a large budget no longer means a slot
+that waits days between attempts. The wait is also interruptible, so `TryStop` does not have to sit
+through it.
+
+An `OperationCanceledException` escaping `Run` counts as a clean exit only while the dispatcher is
+stopping. At any other time — an inner `Task.Wait` whose own token fired, say — it is a crash, and
+the slot is logged and restarted like any other.
 
 The restart log names the actor that was running when the thread died, so a rising `WorkerRestarts`
 is directly actionable.

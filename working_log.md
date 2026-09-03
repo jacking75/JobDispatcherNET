@@ -1,5 +1,12 @@
 # Working Log
 
+## 2026-09-03 11:39 KST - 리뷰 A4·A5·A6 수정 (로거 예외 가드, 워커 재시작 안전화, 타이머 취소 시점)
+
+- A4: `SafeJobLogger`로 라이브러리 내부 로그 호출을 전부 감싸고, 타이머 루프를 반복 단위(+연속 실패 백오프)와 항목 단위로 가드. `Flush`의 회계를 `finally`로 옮기고 `RunFlushLoop`에 리더십 복구 안전망 추가.
+- A5: `MaxRestartBackoff`(기본 1분) 신설로 백오프 지수 증가 상한 설정, `TryRestart` 전체를 try/catch로 감싸 프로세스 종료 위험 제거, `Thread.Sleep` 대신 중지 토큰 대기로 변경. `OperationCanceledException`은 실제 중지 중일 때만 정상 종료로 처리.
+- A6: `TimerEntry`를 4상태 머신(Armed/Fired/Executed/Cancelled)으로 재작성하고 콜백 Job이 엔트리를 state로 들도록 변경. 발화 후 액터 큐에서 대기 중인 콜백도 `Cancel()`로 취소 가능해짐(계약 변경 — CHANGELOG/timers.md/ADR 0003에 기록).
+- 회귀 테스트 5개 추가(78개 전부 통과, net8.0/net10.0). 새 테스트가 옛 동작에서 실제로 실패하는 것까지 확인 — A4는 테스트 호스트 프로세스가 죽는 것으로 재현.
+
 ## 2026-09-03 10:40 KST - 리뷰 A1·A2·A3 버그 수정 (드레인 핸드셰이크, async 연속 작업, 드레인 조건)
 
 - A1: `AsyncExecutable.DisposeAsync`의 드레인 핸드셰이크를 `Interlocked.Exchange`로 발행하도록 고쳐 store-load 재배치로 신호가 유실되던 경로를 차단. 상한을 줄 수 있는 `DisposeAsync(TimeSpan)`/`DisposeAsync(CancellationToken)` 오버로드 추가(실패 시 예외 대신 `false`).

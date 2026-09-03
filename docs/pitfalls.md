@@ -293,6 +293,22 @@ underneath a pending continuation is worse), so the fix is to give the awaited o
 
 ---
 
+## 9b. A timer tick runs after the entity despawned
+
+**Symptom.** An AI tick, a regen tick or a save tick runs once against an entity that has already
+been removed — an NRE on a nulled field, or a write into a sector that no longer exists — even though
+`Despawn()` cancelled the handle.
+
+**Cause.** Historical. A firing handed the callback to the actor as an ordinary job, and from that
+moment `Cancel()` reported `false` and the queued job ran anyway. On a busy actor the gap between
+"fired" and "ran" is easily hundreds of milliseconds, so this was not a narrow race.
+
+**Fix.** Nothing to do: `Cancel()` now claims a callback right up until it starts running, so
+cancelling from inside the actor's own `Despawn()` job guarantees no further tick. If you carry a
+`_despawned` flag checked at the top of every tick purely for this, it is no longer needed.
+
+---
+
 ## 10. `JobSystem.Post` with no workers running
 
 **Symptom.** Work handed over with `system.Post(...)` never runs, and neither does a `Sequencer<T>`

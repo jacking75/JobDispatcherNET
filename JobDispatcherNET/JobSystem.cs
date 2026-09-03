@@ -102,6 +102,7 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
 
     private TimerService? _timers;
     private readonly object _timerLock = new();
+    private readonly IJobLogger _logger;
 
     private int _readyDepth;
     private int _waiters;
@@ -118,6 +119,7 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         Options = options;
+        _logger = options.Logger is null ? JobLog.Safe : new SafeJobLogger(options.Logger);
         Metrics = new JobMetrics(this, options.EnableDetailedMetrics, options.PublishMeter);
     }
 
@@ -130,8 +132,13 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     /// <summary>Name from <see cref="JobSystemOptions.Name"/>.</summary>
     public string Name => Options.Name;
 
-    /// <summary>Logger for this system.</summary>
-    public IJobLogger Logger => Options.Logger ?? JobLog.Current;
+    /// <summary>
+    /// Logger for this system, wrapped so that a throwing implementation cannot kill the thread
+    /// that was logging. The library logs from the timer thread and from workers, neither of which
+    /// has anything to catch an escaping exception. Read <see cref="JobSystemOptions.Logger"/> for
+    /// the instance that was configured.
+    /// </summary>
+    public IJobLogger Logger => _logger;
 
     /// <summary>
     /// Shutdown gate. Setting this to <c>false</c> makes every actor on this system refuse new
@@ -309,7 +316,8 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
 
     // ── timers ──────────────────────────────────────────────────────────────
 
-    internal void DispatchTimerJob(AsyncExecutable owner, JobEntry job) =>
+    /// <summary>Hand a fired timer's job to its actor. False when the actor refused it.</summary>
+    internal bool DispatchTimerJob(AsyncExecutable owner, JobEntry job) =>
         owner.DoTaskFromTimer(job);
 
     internal void WarnTimerFallbackOnce()

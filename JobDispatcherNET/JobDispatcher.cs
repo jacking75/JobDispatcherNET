@@ -20,6 +20,17 @@ public sealed record JobDispatcherOptions
     public TimeSpan RestartBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// Ceiling for the doubling in <see cref="RestartBackoff"/>. Default 1 minute.
+    ///
+    /// Not cosmetic: unbounded doubling overflows long before a generous
+    /// <see cref="MaxRestartsPerWorker"/> runs out — <c>Thread.Sleep(TimeSpan)</c> rejects anything
+    /// past ~24.8 days — and that throw would happen on the worker's own thread with nothing left
+    /// to catch it, taking the process down. Values at or below <see cref="TimeSpan.Zero"/> mean
+    /// "never back off further than <see cref="RestartBackoff"/>".
+    /// </summary>
+    public TimeSpan MaxRestartBackoff { get; init; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
     /// If a worker slot stays up this long after a restart, its restart budget is refilled.
     /// Without this a server that hiccups five times over months is permanently down a worker.
     /// Default 5 minutes; <see cref="TimeSpan.Zero"/> disables the refill.
@@ -170,12 +181,16 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
             WorkerLoop(slot, _cts.Token);
             exitedNormally = true;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
         {
             exitedNormally = true;
         }
         catch (Exception ex)
         {
+            // Note the filter above: an OperationCanceledException with no stop in progress is a
+            // crash like any other — a Task.Wait inside IRunnable.Run being cancelled, say. Treating
+            // every OCE as a clean exit made the worker slot vanish with neither a log line nor a
+            // restart.
             var running = ThreadContext.CurrentExecuter;
             var where = running is null ? string.Empty : $" while running actor '{running.Name}'";
             System.Logger.Error($"Worker slot #{slot} crashed{where}", ex);
@@ -194,7 +209,20 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
             && Volatile.Read(ref _disposed) == 0
             && !_cts.IsCancellationRequested)
         {
-            if (TryRestart(slot))
+            // Guarded because this runs *outside* the try/catch above, on a dedicated thread: an
+            // exception escaping here is an unhandled exception on a thread nobody owns, which ends
+            // the process. Losing one worker slot is not worth that.
+            var restarted = false;
+            try
+            {
+                restarted = TryRestart(slot);
+            }
+            catch (Exception ex)
+            {
+                System.Logger.Error($"Worker slot #{slot} could not be restarted; slot is down", ex);
+            }
+
+            if (restarted)
                 return;
         }
 
@@ -220,12 +248,15 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
         }
 
         System.Metrics.OnWorkerRestart();
-        var backoff = TimeSpan.FromMilliseconds(
-            Options.RestartBackoff.TotalMilliseconds * Math.Pow(2, attempts - 1));
+        var backoff = RestartBackoffFor(attempts);
         System.Logger.Warn(
             $"Restarting worker slot #{slot} (attempt {attempts}/{Options.MaxRestartsPerWorker}) after {backoff.TotalMilliseconds:F0}ms");
 
-        Thread.Sleep(backoff);
+        // Waiting on the token rather than sleeping: this thread is still the one TryStop will try
+        // to join for this slot, so a plain sleep through a long backoff would make shutdown report
+        // a straggler that is only waiting to be replaced.
+        if (backoff > TimeSpan.Zero && _cts.Token.WaitHandle.WaitOne(backoff))
+            return false;
 
         // Re-check and start under the lifecycle lock so the decision cannot be overtaken by a
         // TryStop that has already passed its own scan of the thread array.
@@ -237,6 +268,28 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
             StartWorkerOnSlot(slot, isRestart: true);
             return true;
         }
+    }
+
+    /// <summary>
+    /// Exponential backoff, clamped to <see cref="JobDispatcherOptions.MaxRestartBackoff"/> and to
+    /// what <c>WaitHandle.WaitOne</c> accepts. Both clamps matter: the doubling reaches infinity by
+    /// attempt 1025 and overflows a sleep long before that, and this runs where a throw would kill
+    /// the process rather than a worker.
+    /// </summary>
+    private TimeSpan RestartBackoffFor(int attempts)
+    {
+        var baseMs = Options.RestartBackoff.TotalMilliseconds;
+        if (baseMs <= 0 || double.IsNaN(baseMs))
+            return TimeSpan.Zero;
+
+        var capMs = Options.MaxRestartBackoff > TimeSpan.Zero
+            ? Options.MaxRestartBackoff.TotalMilliseconds
+            : baseMs;
+        capMs = Math.Min(capMs, int.MaxValue);
+
+        // 62 is already far past any cap a caller could set; it only keeps Math.Pow finite.
+        var scaled = baseMs * Math.Pow(2, Math.Min(attempts - 1, 62));
+        return TimeSpan.FromMilliseconds(Math.Clamp(scaled, 0, capMs));
     }
 
     /// <summary>The body of one worker thread. Runs until the token is cancelled.</summary>

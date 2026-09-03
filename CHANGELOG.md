@@ -36,6 +36,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers while a continuation was still on its way back onto the actor. `DrainAsync` now also waits
   for `JobSystem.PendingAsyncJobs`, and `AsyncExecutable.DisposeAsync` for the actor's own
   `PendingAsyncJobs`. The drain-timeout log gained an `async=…` field.
+- **A throwing `IJobLogger` could stop every timer on a system, permanently.** The timer thread runs
+  user code — an `OnDropped` callback, the jobs themselves when there are no workers — and logs from
+  inside its own error handling, but had no try/catch of its own and no supervisor. One throw from a
+  log sink (a full disk, a dead Serilog sink) killed it silently and nothing ever restarted it. The
+  same throw inside a flush escaped before the actor's job counter was decremented, wedging that
+  actor as permanently busy. Three layers now: every library-internal log call goes through a wrapper
+  that swallows whatever the logger throws, the timer thread guards each iteration (with a short
+  backoff on a run of failures) and each entry it dispatches, and a flush loop that fails anyway
+  logs, hands the actor's leadership back to the ready queue, and does its counter accounting in a
+  `finally`.
+- **The worker-restart path could take the process down.** `TryRestart` runs outside the worker's own
+  try/catch, on a dedicated thread, so anything it throws is an unhandled exception that ends the
+  process. The reachable one was the backoff: doubling with no ceiling overflows what
+  `Thread.Sleep(TimeSpan)` accepts at ~24.8 days, which a generous `MaxRestartsPerWorker` reaches.
+  The backoff is now clamped by the new `MaxRestartBackoff`, the whole restart is wrapped, and the
+  wait is on the stopping token instead of `Thread.Sleep`, so shutdown no longer has to sit through
+  it.
+- **An unexpected `OperationCanceledException` retired a worker slot silently.** `RunWorker` treated
+  every OCE as a clean exit, so one thrown by user code with no stop in progress — an inner
+  `Task.Wait` whose own token fired — lost the slot with neither a log line nor a restart. The catch
+  is now filtered on the dispatcher actually stopping; anything else is a crash like any other.
+- **A timer that had fired but not yet run could not be cancelled.** From the moment the timer thread
+  handed the callback to its actor, `Cancel()` returned `false` and the callback ran regardless — and
+  on a busy actor that job waits its turn like any other, so the window is easily hundreds of
+  milliseconds. A repeating tick could therefore run *after* the entity that owned it had despawned
+  and cancelled the handle, which in a game server shows up as an NRE or a reference to an already
+  removed sector. The callback now carries the timer entry and re-reads its state when the actor runs
+  it, so a cancel lands right up until the callback actually starts.
+
+### Changed
+
+- **`ITimerHandle.Cancel()` returns `true` in more cases.** It now means "the callback will not run",
+  rather than "the timer had not been dispatched yet"; `false` is reserved for a callback that has
+  already run or a handle already cancelled. Cancelling from inside one of the owner's own jobs is
+  consequently a guarantee that no further tick runs on that actor, so the `_despawned` flag that
+  paired with `Cancel()` is genuinely unnecessary now. `TimersFired` counts hand-offs to an actor, so
+  a firing later claimed by `Cancel()` is counted in both `TimersFired` and `TimersCancelled`.
 
 ### Added
 
@@ -46,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — dispose with an upper bound on the drain wait, returning `false` rather than throwing when they
   give up. Nothing drains an actor's queue once its workers are gone, so an actor disposed after
   `StopAsync` needs a way out. The parameterless overload is unchanged and still waits forever.
+- **`JobDispatcherOptions.MaxRestartBackoff`** (default 1 minute) — ceiling on the doubling in
+  `RestartBackoff`. With it a large `MaxRestartsPerWorker` is safe to configure.
 
 ## [0.10.0] - 2026-08-31
 

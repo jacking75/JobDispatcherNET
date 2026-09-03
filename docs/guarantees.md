@@ -106,7 +106,16 @@ caught in `JobSystem.DrainReady`, logged, and forwarded to `AsyncExecutable.OnEr
 
 An exception that escapes the whole worker loop (from `IRunnable.Run`, say) kills the thread; the
 dispatcher's supervisor logs which actor was running and restarts the slot. See
-[Tuning](tuning.md#worker-supervision).
+[Tuning](tuning.md#worker-supervision). An `OperationCanceledException` counts as a clean exit only
+when the dispatcher is actually stopping; at any other time it is a crash like any other, and the
+slot is restarted.
+
+**A throwing `IJobLogger` cannot take a thread down.** The library logs from worker threads and from
+the timer thread, neither of which has anything above it to catch an escaping exception — a log sink
+that failed once used to stop every timer on the system permanently. Every library-internal log call
+goes through a wrapper that swallows whatever the logger throws, the timer thread guards each
+iteration, and a flush that fails anyway hands the actor's leadership back to the ready queue rather
+than leaving it wedged.
 
 ## What `DoAsync` returning `false` means
 

@@ -10,13 +10,21 @@ namespace JobDispatcherNET;
 public interface ITimerHandle
 {
     /// <summary>
-    /// Cancel the timer. Returns <c>true</c> if it was cancelled before firing; <c>false</c> if it
-    /// had already fired (or was already cancelled). For a repeating timer, cancelling stops all
-    /// further firings.
+    /// Cancel the timer. Returns <c>true</c> if the callback will not run — including when the
+    /// timer has already fired and its job is still sitting on the owning actor's queue. Returns
+    /// <c>false</c> only once the callback has actually run, or if it was already cancelled. For a
+    /// repeating timer, cancelling stops all further firings and drops any tick already queued.
+    ///
+    /// <para>Cancelling from inside one of the owner's own jobs — a <c>Despawn</c> job, typically —
+    /// therefore guarantees no further tick runs on that actor: the actor runs one job at a time,
+    /// so the cancel is committed before any queued tick gets its turn.</para>
     /// </summary>
     bool Cancel();
 
-    /// <summary>True while the timer is still scheduled to fire at least once more.</summary>
+    /// <summary>
+    /// True while the callback may still run: the timer is scheduled, or it has fired and is
+    /// waiting its turn on the owner's queue.
+    /// </summary>
     bool IsPending { get; }
 }
 
@@ -34,6 +42,19 @@ public enum TimerPrecision
     /// thread briefly burning CPU before each firing. Use for tight simulation ticks.
     /// </summary>
     High,
+}
+
+/// <summary>Why a timer stopped being pending. Decides which counter is bumped.</summary>
+internal enum TimerRetirement
+{
+    /// <summary>No counter. Used when the firing was already counted as a dropped job.</summary>
+    None,
+
+    /// <summary>The caller cancelled it.</summary>
+    Cancelled,
+
+    /// <summary>The timer service was disposed with the timer still armed.</summary>
+    Discarded,
 }
 
 /// <summary>
@@ -101,8 +122,7 @@ internal sealed class TimerService : IDisposable
         if (Enqueue(entry, CurrentTick + ToMillis(delay), isNew: true))
             return entry;
 
-        entry.DiscardJob();
-        _system.Metrics.OnTimerDiscarded();
+        entry.Retire(TimerRetirement.Discarded);
         return CancelledHandle.Instance;
     }
 
@@ -122,7 +142,7 @@ internal sealed class TimerService : IDisposable
         if (Enqueue(entry, CurrentTick + ToMillis(initialDelay), isNew: true))
             return entry;
 
-        _system.Metrics.OnTimerDiscarded();
+        entry.Retire(TimerRetirement.Discarded);
         return CancelledHandle.Instance;
     }
 
@@ -158,79 +178,132 @@ internal sealed class TimerService : IDisposable
 
             _queue.Enqueue(entry, dueTick);
             if (isNew)
+            {
                 Interlocked.Increment(ref _pending);
+                entry.MarkArmed();      // it now holds a pending slot; Retire is what gives it back
+            }
             Monitor.Pulse(_lock);
             return true;
         }
     }
 
-    /// <summary>Account for a timer that was cancelled before it fired.</summary>
-    internal void OnCancelled()
+    /// <summary>Account for a timer reaching its terminal state.</summary>
+    /// <param name="releaseSlot">
+    /// True when the entry still held a slot in <see cref="PendingCount"/>. A one-shot gives its
+    /// slot back the moment it is handed to its actor, so a cancel landing after that must not give
+    /// it back a second time — a negative count made shutdown skip waiting for timers that really
+    /// were still armed.
+    /// </param>
+    /// <param name="retirement">Which counter to bump, if any.</param>
+    internal void OnRetired(bool releaseSlot, TimerRetirement retirement)
     {
-        Interlocked.Decrement(ref _pending);
-        _system.Metrics.OnTimerCancelled();
+        if (releaseSlot)
+            Interlocked.Decrement(ref _pending);
+
+        switch (retirement)
+        {
+            case TimerRetirement.Cancelled:
+                _system.Metrics.OnTimerCancelled();
+                break;
+            case TimerRetirement.Discarded:
+                _system.Metrics.OnTimerDiscarded();
+                break;
+            default:
+                break;
+        }
     }
 
+    /// <summary>
+    /// The timer thread.
+    ///
+    /// Every iteration is guarded. This thread has no supervisor — nothing restarts it, and an
+    /// escaping exception stops every timer on the system for the life of the process. The user
+    /// code that runs here (an <see cref="JobOptions.OnDropped"/> callback, an
+    /// <see cref="IJobLogger"/>, and the jobs themselves when there are no workers to hand them to)
+    /// is not the library's to trust, so one bad iteration costs a log line and nothing more.
+    /// </summary>
     private void Loop()
     {
         ThreadContext.CurrentSystem = _system;
         using var resolution = SystemTimerResolution.Acquire(_system.Options.RaiseSystemTimerResolution);
 
+        var consecutiveFailures = 0;
+
         while (Volatile.Read(ref _disposed) == 0)
         {
-            long spinTarget = -1;
-
-            TimerEntry[]? due = null;
-
-            lock (_lock)
+            try
             {
-                CollectDueLocked();
-
-                if (_dueBuffer.Count > 0)
-                {
-                    // Take the entries out under the lock. DispatchDue runs unlocked, and
-                    // Dispose can call DiscardAll from another thread; handing over a private
-                    // array means the two can never touch the same list at once.
-                    due = _dueBuffer.ToArray();
-                    _dueBuffer.Clear();
-                }
-
-                if (due is null)
-                {
-                    if (_queue.Count == 0)
-                    {
-                        Monitor.Wait(_lock, MaxWaitMs);
-                        continue;
-                    }
-
-                    _queue.TryPeek(out _, out var nextDue);
-                    var remaining = nextDue - CurrentTick;
-                    if (remaining <= 0)
-                        continue;
-
-                    if (_precision == TimerPrecision.High && remaining <= _spinThresholdMs)
-                    {
-                        spinTarget = nextDue;
-                    }
-                    else
-                    {
-                        Monitor.Wait(_lock, (int)Math.Min(remaining, MaxWaitMs));
-                        continue;
-                    }
-                }
+                LoopOnce();
+                consecutiveFailures = 0;
             }
-
-            if (spinTarget >= 0)
+            catch (Exception ex)
             {
-                SpinUntil(spinTarget);
-                continue;
-            }
+                _system.Logger.Error($"Timer thread '{_thread.Name}' iteration failed; continuing", ex);
 
-            if (due is not null)
-                DispatchDue(due);
+                // A failure that repeats is usually a broken dependency rather than one bad timer.
+                // Back off so the thread cannot spin a core logging the same thing thousands of
+                // times a second, but keep the delay short enough that timers stay roughly on time
+                // once whatever it was recovers.
+                if (++consecutiveFailures >= 3)
+                    Thread.Sleep(Math.Min(1000, 10 << Math.Min(consecutiveFailures, 7)));
+            }
         }
 
         DiscardAll();
+    }
+
+    /// <summary>One pass: collect what is due, then either wait, spin, or dispatch.</summary>
+    private void LoopOnce()
+    {
+        long spinTarget = -1;
+        TimerEntry[]? due = null;
+
+        lock (_lock)
+        {
+            CollectDueLocked();
+
+            if (_dueBuffer.Count > 0)
+            {
+                // Take the entries out under the lock. DispatchDue runs unlocked, and
+                // Dispose can call DiscardAll from another thread; handing over a private
+                // array means the two can never touch the same list at once.
+                due = _dueBuffer.ToArray();
+                _dueBuffer.Clear();
+            }
+
+            if (due is null)
+            {
+                if (_queue.Count == 0)
+                {
+                    Monitor.Wait(_lock, MaxWaitMs);
+                    return;
+                }
+
+                _queue.TryPeek(out _, out var nextDue);
+                var remaining = nextDue - CurrentTick;
+                if (remaining <= 0)
+                    return;
+
+                if (_precision == TimerPrecision.High && remaining <= _spinThresholdMs)
+                {
+                    spinTarget = nextDue;
+                }
+                else
+                {
+                    Monitor.Wait(_lock, (int)Math.Min(remaining, MaxWaitMs));
+                    return;
+                }
+            }
+        }
+
+        if (spinTarget >= 0)
+        {
+            SpinUntil(spinTarget);
+            return;
+        }
+
+        if (due is not null)
+            DispatchDue(due);
     }
 
     private void CollectDueLocked()
@@ -265,46 +338,62 @@ internal sealed class TimerService : IDisposable
         var now = CurrentTick;
         foreach (var entry in due)
         {
-            if (entry.IsCancelled)
-                continue;
-
-            var lag = now - entry.DueTick;
-            if (lag > 0)
-                _system.Metrics.RecordTimerLag(lag);
-
-            if (entry.Repeating)
+            // Guarded per entry, not per batch: dispatch reaches user code (an OnDropped callback,
+            // and the job itself when there are no workers to hand it to), and one bad timer must
+            // not cost the rest of this batch their firing. They have already been taken out of the
+            // queue, so dropping them here would strand their pending slots for good.
+            try
             {
-                var action = entry.RepeatAction;
-                if (action is null)
-                    continue;
-
-                _system.Metrics.OnTimerFired();
-                _system.DispatchTimerJob(entry.Owner, Job.Rent(action));
-
-                // Re-arm from the scheduled time to avoid drift, but never schedule into the past.
-                var next = entry.DueTick + ToMillis(entry.Period);
-                if (next <= now)
-                    next = now + ToMillis(entry.Period);
-
-                if (!Enqueue(entry, next, isNew: false))
-                {
-                    // Disposed while we were dispatching: release this timer's pending slot.
-                    Interlocked.Decrement(ref _pending);
-                    _system.Metrics.OnTimerDiscarded();
-                }
+                DispatchOne(entry, now);
             }
-            else
+            catch (Exception ex)
             {
-                // TakeJob is the single arbiter for a one-shot timer. Whoever wins the exchange
-                // owns the accounting, so a Cancel() racing this firing cannot also decrement.
-                var job = entry.TakeJob();
-                if (job is null)
-                    continue;
-
-                Interlocked.Decrement(ref _pending);
-                _system.Metrics.OnTimerFired();
-                _system.DispatchTimerJob(entry.Owner, job);
+                _system.Logger.Error($"Timer dispatch for actor '{entry.Owner.Name}' failed", ex);
             }
+        }
+    }
+
+    private void DispatchOne(TimerEntry entry, long now)
+    {
+        if (entry.IsCancelled)
+            return;
+
+        var lag = now - entry.DueTick;
+        if (lag > 0)
+            _system.Metrics.RecordTimerLag(lag);
+
+        if (entry.Repeating)
+        {
+            _system.Metrics.OnTimerFired();
+            _system.DispatchTimerJob(entry.Owner, entry.RentTickJob());
+
+            // Re-arm from the scheduled time to avoid drift, but never schedule into the past.
+            var next = entry.DueTick + ToMillis(entry.Period);
+            if (next <= now)
+                next = now + ToMillis(entry.Period);
+
+            if (!Enqueue(entry, next, isNew: false))
+            {
+                // Disposed while we were dispatching: release this timer's pending slot.
+                entry.Retire(TimerRetirement.Discarded);
+            }
+            return;
+        }
+
+        // The state machine is the single arbiter for a one-shot. Whoever wins the transition out
+        // of Armed owns the accounting, so a Cancel() racing this firing cannot decrement as well.
+        if (!entry.TryBeginFiring())
+            return;
+
+        Interlocked.Decrement(ref _pending);
+        _system.Metrics.OnTimerFired();
+
+        if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob()))
+        {
+            // The actor refused the job (full, faulted, disposed, or the system is stopping), so
+            // the callback will never run. Retire the handle silently: the refusal is already
+            // counted as a drop, and the pending slot went back at the firing above.
+            entry.Retire(TimerRetirement.None);
         }
     }
 
@@ -312,32 +401,14 @@ internal sealed class TimerService : IDisposable
     {
         lock (_lock)
         {
+            // Retire is idempotent and knows whether the entry still holds a pending slot, so a
+            // one-shot that DispatchDue already fired is left alone here.
             while (_queue.Count > 0)
-                Discard(_queue.Dequeue());
+                _queue.Dequeue().Retire(TimerRetirement.Discarded);
 
-            // Entries collected but not yet handed to DispatchDue still hold a pending slot.
             foreach (var entry in _dueBuffer)
-                Discard(entry);
+                entry.Retire(TimerRetirement.Discarded);
             _dueBuffer.Clear();
-        }
-
-        void Discard(TimerEntry entry)
-        {
-            if (entry.IsCancelled)
-                return;     // already accounted for in OnCancelled
-
-            if (!entry.Repeating)
-            {
-                // Taking the job is what claims a one-shot. If it is already gone, DispatchDue
-                // fired it and did the accounting.
-                var job = entry.TakeJob();
-                if (job is null)
-                    return;
-                job.Discard();
-            }
-
-            Interlocked.Decrement(ref _pending);
-            _system.Metrics.OnTimerDiscarded();
         }
     }
 
@@ -360,11 +431,32 @@ internal sealed class TimerService : IDisposable
         DiscardAll();
     }
 
+    /// <summary>
+    /// One scheduled timer, and the state machine that decides whether its callback runs.
+    ///
+    /// <para>The states exist because "fired" and "ran" are not the same moment. The timer thread
+    /// hands the callback to the owning actor as an ordinary job, and if the actor is busy that job
+    /// can sit on its queue for a good while. The entry itself is carried as that job's state and
+    /// re-reads the state when it finally gets its turn, which is what lets a cancel land in that
+    /// window — a repeating AI tick used to run once more *after* the entity that owned it had
+    /// despawned and cancelled the handle.</para>
+    ///
+    /// <para>The same word also arbitrates the pending-count accounting: whoever wins the
+    /// transition out of <c>Armed</c> owns the slot, so a cancel racing a firing can never give the
+    /// same slot back twice. A negative <see cref="PendingCount"/> made shutdown skip waiting for
+    /// timers that really were still armed.</para>
+    /// </summary>
     internal sealed class TimerEntry : ITimerHandle
     {
+        private const int New = 0;          // built, not yet queued: holds no pending slot
+        private const int Armed = 1;        // in the timer queue, holding one pending slot
+        private const int Fired = 2;        // handed to the owner's queue, slot already released
+        private const int Executed = 3;     // the callback ran (one-shot only)
+        private const int Cancelled = 4;    // terminal: the callback will not run
+
         private readonly TimerService _service;
         private JobEntry? _job;
-        private int _cancelled;
+        private int _state = New;
 
         public TimerEntry(TimerService service, AsyncExecutable owner, JobEntry? job,
             Action? repeatAction, TimeSpan period, bool repeating)
@@ -383,44 +475,72 @@ internal sealed class TimerService : IDisposable
         public bool Repeating { get; }
         public long DueTick { get; set; }
 
-        public bool IsCancelled => Volatile.Read(ref _cancelled) != 0;
+        public bool IsCancelled => Volatile.Read(ref _state) == Cancelled;
 
-        public bool IsPending => !IsCancelled && (Repeating || Volatile.Read(ref _job) is not null);
+        /// <inheritdoc />
+        public bool IsPending => Volatile.Read(ref _state) is Armed or Fired;
 
         /// <summary>
-        /// Cancel the timer.
-        ///
-        /// For a one-shot, taking the job is what decides ownership: <see cref="DispatchDue"/>
-        /// takes it with the same interlocked exchange, so exactly one of the two sides can claim
-        /// the entry. Deciding by *reading* the job instead — as this used to — let a cancel that
-        /// raced a firing decrement the pending count a second time, and a negative count made
-        /// shutdown skip waiting for timers that really were still armed.
+        /// Called under the service lock once the entry is on the queue and its pending slot has
+        /// been counted. The handle is not published to the caller until this has happened, so
+        /// nothing can be racing it.
         /// </summary>
-        public bool Cancel()
-        {
-            if (Interlocked.Exchange(ref _cancelled, 1) != 0)
-                return false;
+        internal void MarkArmed() => Volatile.Write(ref _state, Armed);
 
+        /// <summary>
+        /// Claim a one-shot for firing. A repeating entry stays <c>Armed</c> across ticks — it is
+        /// re-queued immediately and holds its single pending slot until it is retired.
+        /// </summary>
+        internal bool TryBeginFiring() =>
+            Interlocked.CompareExchange(ref _state, Fired, Armed) == Armed;
+
+        /// <summary>
+        /// The job handed to the owning actor. It carries the entry rather than the user callback
+        /// so the cancellation check happens when the actor runs it, not when the timer fired.
+        /// </summary>
+        internal JobEntry RentTickJob() => Job<TimerEntry>.Rent(static e => e.Run(), this);
+
+        private void Run()
+        {
             if (Repeating)
             {
-                // A repeating entry holds exactly one pending slot for its whole life and the
-                // exchange above already made us its sole claimant.
-                _service.OnCancelled();
-                return true;
+                if (Volatile.Read(ref _state) == Cancelled)
+                    return;     // cancelled while this tick sat on the actor's queue
+                RepeatAction?.Invoke();
+                return;
             }
 
-            var job = Interlocked.Exchange(ref _job, null);
-            if (job is null)
-                return false;   // DispatchDue got there first: the timer has already fired
+            if (Interlocked.CompareExchange(ref _state, Executed, Fired) != Fired)
+                return;         // cancelled first; whoever cancelled discarded the job
 
-            job.Discard();
-            _service.OnCancelled();
-            return true;
+            Interlocked.Exchange(ref _job, null)?.Execute();
         }
 
-        public JobEntry? TakeJob() => Interlocked.Exchange(ref _job, null);
+        /// <inheritdoc />
+        public bool Cancel() => Retire(TimerRetirement.Cancelled);
 
-        public void DiscardJob() => Interlocked.Exchange(ref _job, null)?.Discard();
+        /// <summary>
+        /// Move to the terminal state, giving the pending slot back if this entry still holds one.
+        /// Idempotent: only the first caller sees <c>true</c> and does the accounting.
+        /// </summary>
+        internal bool Retire(TimerRetirement retirement)
+        {
+            while (true)
+            {
+                var state = Volatile.Read(ref _state);
+                if (state is Executed or Cancelled)
+                    return false;
+
+                if (Interlocked.CompareExchange(ref _state, Cancelled, state) != state)
+                    continue;
+
+                // Armed is the only state that still owns a slot in PendingCount: New never took
+                // one, and a one-shot in Fired gave its own back when the timer thread dispatched it.
+                _service.OnRetired(releaseSlot: state == Armed, retirement);
+                Interlocked.Exchange(ref _job, null)?.Discard();
+                return true;
+            }
+        }
     }
 
     private sealed class CancelledHandle : ITimerHandle

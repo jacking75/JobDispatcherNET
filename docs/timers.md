@@ -19,7 +19,7 @@ scheduled them.
 ```csharp
 public interface ITimerHandle
 {
-    bool Cancel();      // true if cancelled before firing; false if it had already fired
+    bool Cancel();      // true if the callback will not run; false once it has run
     bool IsPending { get; }
 }
 
@@ -46,9 +46,20 @@ public sealed class NpcActor : AsyncExecutable
 }
 ```
 
-`Cancel()` returns `true` only for the call that actually cancelled a pending timer; a second call,
-or a call after it fired, returns `false`. Cancelling a repeating timer stops all further firings.
+`Cancel()` returns `true` for the call that keeps the callback from running, and `false` once it has
+run (or if the timer was already cancelled). Cancelling a repeating timer stops all further firings.
 Cancellation is counted in `TimersCancelled`.
+
+**"Fired" and "ran" are two different moments,** and `Cancel()` works right up to the second one. A
+firing hands the callback to the actor as an ordinary job; if the actor is busy, that job waits its
+turn like any other, and on a loaded actor the wait is easily hundreds of milliseconds. A cancel
+landing inside that window claims the job and it never runs
+(`TimerTests.CancellingAOneShotAfterItFiredButBeforeItRanStopsTheCallback`).
+
+That is what makes the `Despawn()` above sufficient on its own. Because the actor runs one job at a
+time, a `Cancel()` from inside one of its own jobs is committed before any queued tick can get its
+turn, so **no tick runs after the despawn** — you do not need a `_despawned` flag as well
+(`TimerTests.CancellingARepeatingTimerDropsATickAlreadyQueuedOnTheActor`).
 
 ## `DoAsyncEvery` versus the self-rescheduling idiom
 
@@ -160,8 +171,8 @@ the normal admission path:
 
 | Counter | Meaning |
 |---|---|
-| `TimersFired` | Firings dispatched (a repeating timer contributes one per tick). |
-| `TimersCancelled` | `Cancel()` calls that actually cancelled something. |
+| `TimersFired` | Firings dispatched to an actor (a repeating timer contributes one per tick). Counts the hand-off, so a firing later claimed by `Cancel()` is counted here and in `TimersCancelled`. |
+| `TimersCancelled` | `Cancel()` calls that kept a callback from running, whether or not it had already been dispatched. |
 | `TimersDiscarded` | Timers thrown away because the service was stopping, or scheduled after it stopped. |
 | `PendingTimerJobs` / `JobSystem.PendingTimerCount` | Scheduled and not yet fired. Repeating timers count as 1 each. |
 

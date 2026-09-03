@@ -63,12 +63,43 @@ public static class JobLoggerExtensions
 }
 
 /// <summary>
+/// Wraps a user <see cref="IJobLogger"/> so a failing one cannot take a thread down with it.
+///
+/// The library logs from the timer thread and from worker threads, and neither has a supervisor
+/// that can recover from an escaping exception: a Serilog sink that throws on a full disk used to
+/// stop every timer on the system for the life of the process. Every library-internal log call goes
+/// through this, so the only thing a broken logger costs is the log line.
+/// </summary>
+internal sealed class SafeJobLogger(IJobLogger? inner) : IJobLogger
+{
+    /// <summary>The wrapped logger. <c>null</c> follows <see cref="JobLog.Current"/>, which is mutable.</summary>
+    private IJobLogger Inner => inner ?? JobLog.Current;
+
+    /// <inheritdoc />
+    public bool IsEnabled(JobLogLevel level)
+    {
+        try { return Inner.IsEnabled(level); }
+        catch { return false; }
+    }
+
+    /// <inheritdoc />
+    public void Log(JobLogLevel level, string message, Exception? exception = null)
+    {
+        try { Inner.Log(level, message, exception); }
+        catch { /* a broken logger must not kill a worker or the timer thread */ }
+    }
+}
+
+/// <summary>
 /// Process-wide default logger, used by any <see cref="JobSystem"/> that was not given its own
 /// through <see cref="JobSystemOptions.Logger"/>.
 /// </summary>
 public static class JobLog
 {
     private static IJobLogger _instance = new ConsoleJobLogger();
+
+    /// <summary>Follows <see cref="Current"/> and swallows whatever it throws.</summary>
+    internal static readonly IJobLogger Safe = new SafeJobLogger(null);
 
     /// <summary>The current default logger. Never null.</summary>
     public static IJobLogger Current
@@ -77,17 +108,17 @@ public static class JobLog
         set => _instance = value ?? throw new ArgumentNullException(nameof(value));
     }
 
-    /// <summary>Log at <see cref="JobLogLevel.Debug"/>.</summary>
-    public static void Debug(string message) => _instance.Debug(message);
+    /// <summary>Log at <see cref="JobLogLevel.Debug"/>. Never throws, whatever the logger does.</summary>
+    public static void Debug(string message) => Safe.Debug(message);
 
-    /// <summary>Log at <see cref="JobLogLevel.Info"/>.</summary>
-    public static void Info(string message) => _instance.Info(message);
+    /// <summary>Log at <see cref="JobLogLevel.Info"/>. Never throws, whatever the logger does.</summary>
+    public static void Info(string message) => Safe.Info(message);
 
-    /// <summary>Log at <see cref="JobLogLevel.Warn"/>.</summary>
-    public static void Warn(string message) => _instance.Warn(message);
+    /// <summary>Log at <see cref="JobLogLevel.Warn"/>. Never throws, whatever the logger does.</summary>
+    public static void Warn(string message) => Safe.Warn(message);
 
-    /// <summary>Log at <see cref="JobLogLevel.Error"/>.</summary>
-    public static void Error(string message, Exception? exception = null) => _instance.Error(message, exception);
+    /// <summary>Log at <see cref="JobLogLevel.Error"/>. Never throws, whatever the logger does.</summary>
+    public static void Error(string message, Exception? exception = null) => Safe.Error(message, exception);
 }
 
 /// <summary>
