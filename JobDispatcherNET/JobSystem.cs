@@ -117,6 +117,8 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     private readonly StripedCounter _retired = new();
     private readonly StripedCounter _asyncStarted = new();
     private readonly StripedCounter _asyncCompleted = new();
+    private readonly StripedCounter _readyEnqueued = new();
+    private readonly StripedCounter _readyHandled = new();
     private readonly List<IDisposable> _dispatchers = [];
     private readonly object _dispatcherLock = new();
     private readonly long _startTimestamp = Stopwatch.GetTimestamp();
@@ -125,7 +127,6 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     private readonly object _timerLock = new();
     private readonly IJobLogger _logger;
 
-    private int _readyDepth;
     private int _waiters;
     private int _liveWorkers;
     private int _acceptingWork = 1;
@@ -177,8 +178,25 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     /// <summary>True when at least one worker thread is running.</summary>
     public bool HasWorkers => LiveWorkerCount > 0;
 
-    /// <summary>Actors and posted actions waiting for a worker.</summary>
-    public int ReadyQueueDepth => Volatile.Read(ref _readyDepth);
+    /// <summary>
+    /// Actors and posted actions waiting for a worker.
+    ///
+    /// Striped for the same reason <see cref="InFlightJobs"/> is: a plain shared counter put two
+    /// read-modify-writes on one cache line into every ready item, which every worker and every
+    /// producer then fought over. Read handled-then-enqueued so the depth can read high but never
+    /// spuriously low — a drain gate must not be fooled into stopping early.
+    /// </summary>
+    public int ReadyQueueDepth
+    {
+        get
+        {
+            var handled = _readyHandled.Value;
+            return (int)Math.Clamp(_readyEnqueued.Value - handled, 0, int.MaxValue);
+        }
+    }
+
+    /// <summary>Cheap emptiness check for the worker spin, with none of the counter arithmetic.</summary>
+    internal bool ReadyQueueIsEmpty => _readyQueue.IsEmpty;
 
     /// <summary>Timers scheduled and not yet fired.</summary>
     public long PendingTimerCount => Volatile.Read(ref _timers)?.PendingCount ?? 0;
@@ -278,7 +296,7 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         // run (see DrainReady). The depth then always over-estimates rather than under-estimates,
         // which is what a shutdown drain needs: incrementing after the enqueue left a window where
         // DrainAsync saw an empty system and stopped the workers out from under queued work.
-        Interlocked.Increment(ref _readyDepth);
+        _readyEnqueued.Increment();
         _readyQueue.Enqueue(item);
         SignalWork();
     }
@@ -307,7 +325,7 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref _readyDepth);
+                _readyHandled.Increment();
             }
         }
         return handled;

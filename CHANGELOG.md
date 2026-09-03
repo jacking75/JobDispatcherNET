@@ -13,6 +13,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **The `Job` pool no longer serialises every thread on one cache line.** `ConcurrentBag` plus a
+  shared `long` counter put three read-modify-writes on one process-wide line into every single job:
+  a decrement to rent, a read and an increment to recycle, and the bag's own empty-to-non-empty
+  transition counter, which moves on every job for a thread that rents and recycles one at a time.
+  The cost was not a constant overhead but a ceiling — **throughput fell as workers were added**.
+  Each thread now keeps its own stack and exchanges batches of 32 with a shared pool only when the
+  renting and recycling threads differ. Measured on one machine, medians of 7 runs: 8 producers into
+  1,000 `Scheduled` actors went 3.67 → 11.90 M jobs/s on one worker and 2.03 → 18.37 on eight, so the
+  curve now rises with the pool instead of falling; `LeaderFlush` fan-out 12.43 → 29.29; actor-to-actor
+  ring and single-actor inline about 1.6×. See [docs/benchmarks.md](docs/benchmarks.md#the-job-pool-c1),
+  including the change that was measured and **not** made.
+- **Workers spin briefly before parking** (`JobDispatcherOptions.SpinBeforeParkIterations`, default
+  10, 0 to disable). A parked worker registers as a waiter, and from then on every producer's enqueue
+  takes the signal lock and pulses while the woken worker pays a context switch — with short jobs that
+  cycle repeats continuously and worsens as the pool grows.
+- **The ready-queue depth counter is striped**, like `InFlightJobs` already was: it was a shared
+  `int` taking two interlocked operations per ready item, on a line every worker and every producer
+  touched.
+- **Scheduling a timer only wakes the timer thread when it needs waking** — when the queue was empty
+  or the new timer is due before the one already being waited for. It used to pulse on every call,
+  which on a server arming a timer per attack is tens of thousands of pointless wake-ups a second.
+  The due-entry hand-off also swaps two buffers instead of allocating an array per firing.
+- **`StripedCounter` cells are 128 bytes with the value in the second half.** At 64 bytes the array
+  header pushed the cells off the line boundary, so neighbours shared a line and the striping did
+  nothing for them.
+
 ### Security
 
 - **`Sequencer<T>` had no bound.** The documented pattern is one sequencer per session, fed straight
@@ -137,6 +165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Sequencer<T>.PendingCount` counts accepted-and-unhandled items**, including the one the handler
   is working on, rather than `ConcurrentQueue.Count`. It reads high rather than low, which is what a
   bound needs — and reading it no longer walks the queue's segments.
+- **`Job.MaxPoolSize` / `Job<TState>.MaxPoolSize` now cap the *shared* pool**, not a single global
+  one; each thread additionally keeps a local stack of up to 256 entries that the cap does not cover.
+  `PoolSize` (and the `ActiveJobPoolSize` metric and `jobdispatcher.pool.size` gauge) likewise report
+  the shared pool only, so a workload that rents and recycles on one thread reads zero while the pool
+  is doing its job. `MaxPoolSize = 0` still disables pooling entirely.
 
 ### Added
 
@@ -161,6 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name one themselves. The per-actor setting only protects actors somebody remembered to configure.
   `AsyncExecutable.MaxQueueSize` reports whichever bound is in force.
 - **`JobSystemOptions.MinTimerPeriod`** (default 1 ms) — floor for `DoAsyncEvery`.
+- **`JobDispatcherOptions.SpinBeforeParkIterations`** (default 10) — how long a worker looks for work
+  before parking on the monitor.
 
 ## [0.10.0] - 2026-08-31
 

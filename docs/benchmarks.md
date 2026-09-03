@@ -1,13 +1,22 @@
 # Benchmarks
 
-> **No numbers have been measured on this machine yet.** Every result cell below is empty on purpose.
-> Do not quote, estimate or infer figures for this library until this page has been filled in from an
-> actual run — and record the hardware, OS and runtime version alongside them when you do.
+> **Read the scope line on each table.** [The job pool](#the-job-pool-c1) below carries real
+> measurements, because a change was made on their strength — but from a purpose-built harness on one
+> machine, not from BenchmarkDotNet, and they are ratios worth trusting rather than absolutes worth
+> quoting. Everything under [Scenarios](#scenarios) is still unmeasured, and no figure for this
+> library should be quoted, estimated or inferred from anywhere else until it is filled in from an
+> actual run — with the hardware, OS and runtime version recorded alongside.
 
 The `JobDispatcherNET.Benchmarks` project (BenchmarkDotNet) is in the repository and runnable. What
-is missing is a real measurement run: only a smoke run has been done so far, on one Windows laptop,
-with the `Dry` job — enough to prove the harness executes and allocates nothing, nowhere near enough
-to publish.
+is missing is a full measurement run: only a smoke run has been done with the `Dry` job — enough to
+prove the harness executes and allocates nothing, nowhere near enough to publish.
+
+**Machine for every number on this page:** Windows 11 Pro 10.0.26200, 20 logical cores, .NET SDK
+10.0.400, Release, `ServerGarbageCollection=true`, `TieredPGO=true`, `PublishMeter=false`,
+`EnableDetailedMetrics=false`, `Logger=NullJobLogger`. It is a developer workstation, not a quiet
+bench: repeated runs of an unchanged build varied by ±30% on the worker-scaling rows, which is why
+only ratios of medians are reported and why the small changes below are described as unmeasurable
+rather than as wins.
 
 <details>
 <summary>Smoke run (not a result — <code>--job Dry</code>, single iteration, one machine)</summary>
@@ -41,6 +50,56 @@ Rules for a result that is worth publishing:
   allocation story is half the point.
 - State whether `EnableDetailedMetrics` and `PublishMeter` were on. They are hot-path costs and
   should be **off** for throughput runs and measured separately.
+
+## The job pool (C1)
+
+One measurement *has* been made properly, because a change was made on the strength of it: replacing
+the `Job` pool's `ConcurrentBag` + shared counter with a per-thread stack that exchanges batches with
+a shared pool. The old design put three read-modify-writes on one process-wide cache line into every
+job, and the effect was not a constant overhead — it was a **ceiling**.
+
+Same harness, same machine, back to back; each cell is the median of 7 runs after a warm-up.
+
+| scenario | before | after | |
+|---|---|---|---|
+| 8 producers → 1,000 `Scheduled` actors, **1** worker | 3.67 | 11.90 | 3.2× |
+| 8 producers → 1,000 `Scheduled` actors, **4** workers | 2.81 | 15.55 | 5.5× |
+| 8 producers → 1,000 `Scheduled` actors, **8** workers | 2.03 | 18.37 | 9.0× |
+| 8 producers → 1,000 `LeaderFlush` actors, 0 workers | 12.43 | 29.29 | 2.4× |
+| actor→actor ring, ×64 | 6.2–6.3 | 9.2–10.4 | ~1.6× |
+| single actor, single producer, inline | 7.47 | 11.91 | 1.6× |
+
+Millions of jobs per second, higher is better. Read the first three rows downward rather than across:
+**the old code got slower as workers were added** (3.67 → 2.03) and the new code gets faster
+(11.90 → 18.37). That is the shape of shared-cache-line contention, and it is why the change was
+worth making even though the job body here is a single field increment and therefore flatters any
+per-job saving. `ManyActorsThroughput` carries `Workers = 1, 4, 8` so the curve stays on the record.
+
+Alongside it: a short spin before a worker parks (`SpinBeforeParkIterations`), striping the
+ready-queue depth counter, one fewer wake-up per scheduled timer, and 128-byte striped-counter cells.
+These are inside the run-to-run noise of this machine individually; they are in because each removes
+a shared write or a wake-up that has no reason to exist, not because a number was attached to any one
+of them.
+
+### What was measured and *not* done
+
+Replacing the actor's `ConcurrentQueue<JobEntry>` with an intrusive Vyukov MPSC queue was proposed on
+the grounds that an actor queue is multi-producer/single-consumer by construction, so dequeue needs no
+CAS. Measured in isolation, in the shape an actor uses it, against `ConcurrentQueue`:
+
+| producers | `ConcurrentQueue` ns/item | intrusive MPSC ns/item |
+|---|---|---|
+| 1 | 36.9 / 21.8 / 22.9 | 32.7 / 38.1 / 34.6 |
+| 2 | 46.4 / 53.4 / 72.0 | 58.2 / 45.3 / 61.2 |
+| 4 | 90.2 / 122.3 / 38.9 | 63.8 / 52.8 / 57.2 |
+
+Three runs each. The sign of the difference flips between runs, and the one-producer column — the
+case that matters, since a thousand actors divide eight producers between them — is *worse* in two
+runs of three. The change would also require `JobEntry.Execute()` to stop recycling itself, because
+the node a Vyukov queue hands back becomes its next sentinel and cannot go into the pool until the
+dequeue after that. Changing a public contract and rewriting the queue that ADR 0004's admission
+invariant rests on, for a difference this measurement cannot even sign, is not a trade worth making.
+Revisit if a profile on real work shows the actor queue near the top.
 
 ## Scenarios
 

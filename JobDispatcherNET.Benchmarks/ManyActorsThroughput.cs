@@ -33,8 +33,12 @@ public class ManyActorsThroughput
     [Params(1, 100, 1000)]
     public int ActorCount { get; set; }
 
-    /// <summary>Size of the worker pool draining them.</summary>
-    [Params(4, 8)]
+    /// <summary>
+    /// Size of the worker pool draining them. 1, 4 and 8 so the run records a scaling curve:
+    /// before the job pool was made per-thread this went <i>down</i> as workers were added, because
+    /// every job hit the same shared cache line.
+    /// </summary>
+    [Params(1, 4, 8)]
     public int Workers { get; set; }
 
     /// <summary>Build the system, the pool and the actor set.</summary>

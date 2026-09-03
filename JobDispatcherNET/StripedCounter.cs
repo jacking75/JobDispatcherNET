@@ -12,10 +12,19 @@ namespace JobDispatcherNET;
 /// </summary>
 internal sealed class StripedCounter
 {
-    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    /// <summary>
+    /// 128 bytes, with the value in the second half.
+    ///
+    /// A 64-byte cell is one cache line, but the array header pushes element 0 off a line boundary,
+    /// so neighbouring cells straddle the same line and the striping does nothing for them. 128
+    /// bytes with the value at offset 64 lands each value in its own line whatever the header does,
+    /// and also separates the adjacent-line prefetch pairs that x86 fetches together. The cost is
+    /// 64 bytes of padding per stripe.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit, Size = 128)]
     private struct Cell
     {
-        [FieldOffset(0)] public long Value;
+        [FieldOffset(64)] public long Value;
     }
 
     private readonly Cell[] _cells;

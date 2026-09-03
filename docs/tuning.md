@@ -25,6 +25,14 @@ are background threads by default, they park on a monitor when idle, and they co
 Related `JobDispatcherOptions`: `ThreadPriority` (default `Normal`), `BackgroundThreads` (default
 true — set false if the pool must keep the process alive), `MaxStackSize`.
 
+`SpinBeforeParkIterations` (default 10) is how many times a worker looks for work before parking on
+the monitor. A parked worker registers as a waiter, and from then on every producer's enqueue takes
+the signal lock and pulses, and the woken worker pays a context switch — with short jobs a pool
+empties its queue constantly, so that cycle repeats continuously and gets worse as the pool grows. A
+few microseconds of spinning keeps the waiter count at zero while work is flowing and lets producers
+skip the lock. Set it to `0` on a latency-insensitive or battery-powered deployment; idle cost is
+otherwise nil, since the spin runs once and the worker then parks as before.
+
 > The worker loop reads `MaxReadyDrainPerTick` and `IdleWaitMs` from **`JobDispatcherOptions`**.
 > `JobSystemOptions` carries same-named properties, but the dispatcher does not read them — set them
 > on the dispatcher.
@@ -97,14 +105,27 @@ and other actors are visibly starved.
 
 ## Job pooling
 
-`Job` and `Job<TState>` are pooled in a `ConcurrentBag` capped by a static `MaxPoolSize`
-(default 16384 **each**, and `Job<TState>` has its own pool and its own cap per closed generic type).
-Anything beyond the cap is left to the GC rather than growing memory without bound.
+`Job` and `Job<TState>` are pooled per thread: each thread keeps a small local stack (256 entries)
+and exchanges batches of 32 with a shared pool when the two sides of a workload are different threads.
+`MaxPoolSize` (default 16384 **each**, and `Job<TState>` has its own pool and its own cap per closed
+generic type) caps the **shared** pool; anything beyond it is left to the GC rather than growing
+memory without bound.
+
+The shape is the point. Renting and recycling on the same thread — `LeaderFlush`, and every
+actor-to-actor call — touches no shared memory at all. Only the asymmetric case (a producer thread
+rents, a worker recycles) reaches the shared pool, and then once per 32 jobs rather than once per
+job. The previous `ConcurrentBag` design put three read-modify-writes on one process-wide cache line
+into every single job, which is why throughput used to *fall* as workers were added; see
+[Benchmarks](benchmarks.md#the-job-pool-c1).
 
 - Size it to your steady-state peak of concurrent in-flight jobs, not to your throughput. Pooling
   more than you ever hold at once is wasted working set.
-- The `ActiveJobPoolSize` metric (and the `jobdispatcher.pool.size` gauge) reports the **non-generic**
-  `Job` pool only. `Job<TState>.PoolSize` is per state type and is not aggregated.
+- The `ActiveJobPoolSize` metric (and the `jobdispatcher.pool.size` gauge) reports the **shared**
+  pool of the **non-generic** `Job` only. Per-thread stacks are not counted, so on a workload that
+  rents and recycles on one thread it reads zero while the pool is working perfectly.
+  `Job<TState>.PoolSize` is per state type and is not aggregated.
+- `MaxPoolSize = 0` turns pooling off entirely, local stacks included. Useful for measuring what the
+  pool is buying you; not a production setting.
 - Rented jobs are recycled in a `finally`, so a throwing job still returns its entry, and a *refused*
   job is discarded straight back into the pool.
 

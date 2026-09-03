@@ -51,6 +51,19 @@ public sealed record JobDispatcherOptions
     /// <summary>How long an idle worker blocks before re-checking. Only used by the non-generic dispatcher.</summary>
     public int IdleWaitMs { get; init; } = 20;
 
+    /// <summary>
+    /// Times a worker spins looking for work before parking on the monitor. Default 10;
+    /// <c>0</c> parks immediately.
+    ///
+    /// A parked worker registers itself as a waiter, and from that moment every producer's enqueue
+    /// takes the signal lock and pulses — and the worker it wakes pays a context switch. With short
+    /// jobs a pool empties its queue constantly, so under load the workers park and unpark
+    /// continuously and the cost grows with the pool size. A few microseconds of spinning keeps the
+    /// waiter count at zero while work is actually flowing, and producers skip the lock entirely.
+    /// Idle costs nothing extra: the spin runs once and then the worker parks as before.
+    /// </summary>
+    public int SpinBeforeParkIterations { get; init; } = 10;
+
     /// <summary>Priority for worker threads. Default <see cref="ThreadPriority.Normal"/>.</summary>
     public ThreadPriority ThreadPriority { get; init; } = ThreadPriority.Normal;
 
@@ -422,12 +435,40 @@ public sealed class JobDispatcher : JobDispatcherBase
     protected override void WorkerLoop(int slot, CancellationToken cancellationToken)
     {
         var idleWait = Math.Max(1, Options.IdleWaitMs);
+        var spins = Math.Max(0, Options.SpinBeforeParkIterations);
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (PumpReadyQueue() == 0)
-                System.WaitForWork(idleWait);
+            if (PumpReadyQueue() != 0)
+                continue;
+
+            if (SpinForWork(spins))
+                continue;
+
+            System.WaitForWork(idleWait);
         }
+    }
+
+    /// <summary>
+    /// Look for work for a few microseconds before parking. See
+    /// <see cref="JobDispatcherOptions.SpinBeforeParkIterations"/> for why this is worth doing.
+    /// </summary>
+    private bool SpinForWork(int iterations)
+    {
+        if (iterations == 0)
+            return false;
+
+        var spinner = new SpinWait();
+        for (var i = 0; i < iterations; i++)
+        {
+            // sleep1Threshold: -1 keeps this out of Thread.Sleep(1), whose 15 ms granularity on
+            // stock Windows is far longer than anything worth spinning for.
+            spinner.SpinOnce(sleep1Threshold: -1);
+            if (!System.ReadyQueueIsEmpty)
+                return true;
+        }
+
+        return false;
     }
 }
 

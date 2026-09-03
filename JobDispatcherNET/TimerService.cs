@@ -70,7 +70,12 @@ internal sealed class TimerService : IDisposable
 
     private readonly object _lock = new();
     private readonly PriorityQueue<TimerEntry, long> _queue = new();
-    private readonly List<TimerEntry> _dueBuffer = [];
+
+    // Two buffers, swapped rather than copied: collecting under the lock and dispatching outside it
+    // used to hand over a fresh array on every iteration that fired anything, which on a server
+    // arming a timer per attack is a steady stream of garbage for no reason.
+    private List<TimerEntry> _dueBuffer = [];
+    private List<TimerEntry> _dispatchBuffer = [];
     private readonly JobSystem _system;
     private readonly TimerPrecision _precision;
     private readonly int _spinThresholdMs;
@@ -186,13 +191,22 @@ internal sealed class TimerService : IDisposable
             if (Volatile.Read(ref _disposed) != 0)
                 return false;
 
+            // Only wake the timer thread when this entry actually changes when it next has
+            // something to do: the queue was empty (it is parked for a full MaxWaitMs) or this
+            // entry is due before the one it is already waiting for. Pulsing unconditionally woke
+            // it once per scheduled timer, which on a server arming a timer per attack or skill is
+            // tens of thousands of pointless wake-ups a second.
+            var wake = !_queue.TryPeek(out _, out var nextDue) || dueTick < nextDue;
+
             _queue.Enqueue(entry, dueTick);
             if (isNew)
             {
                 Interlocked.Increment(ref _pending);
                 entry.MarkArmed();      // it now holds a pending slot; Retire is what gives it back
             }
-            Monitor.Pulse(_lock);
+
+            if (wake)
+                Monitor.Pulse(_lock);
             return true;
         }
     }
@@ -266,7 +280,7 @@ internal sealed class TimerService : IDisposable
     private void LoopOnce()
     {
         long spinTarget = -1;
-        TimerEntry[]? due = null;
+        var due = false;
 
         lock (_lock)
         {
@@ -274,14 +288,15 @@ internal sealed class TimerService : IDisposable
 
             if (_dueBuffer.Count > 0)
             {
-                // Take the entries out under the lock. DispatchDue runs unlocked, and
-                // Dispose can call DiscardAll from another thread; handing over a private
-                // array means the two can never touch the same list at once.
-                due = _dueBuffer.ToArray();
+                // Move the entries out under the lock. DispatchDue runs unlocked, and Dispose can
+                // call DiscardAll from another thread; swapping the two buffers means the two can
+                // never touch the same list at once, and costs no allocation.
+                (_dueBuffer, _dispatchBuffer) = (_dispatchBuffer, _dueBuffer);
                 _dueBuffer.Clear();
+                due = true;
             }
 
-            if (due is null)
+            if (!due)
             {
                 if (_queue.Count == 0)
                 {
@@ -312,8 +327,11 @@ internal sealed class TimerService : IDisposable
             return;
         }
 
-        if (due is not null)
-            DispatchDue(due);
+        if (due)
+        {
+            DispatchDue(_dispatchBuffer);
+            _dispatchBuffer.Clear();    // drop the references; the entries may be long-lived
+        }
     }
 
     private void CollectDueLocked()
@@ -343,7 +361,7 @@ internal sealed class TimerService : IDisposable
         }
     }
 
-    private void DispatchDue(TimerEntry[] due)
+    private void DispatchDue(List<TimerEntry> due)
     {
         var now = CurrentTick;
         foreach (var entry in due)

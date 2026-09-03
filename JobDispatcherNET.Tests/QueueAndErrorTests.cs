@@ -287,16 +287,50 @@ public sealed class ErrorIsolationTests
 public sealed class PoolTests
 {
     [Fact]
-    public void JobsAreReturnedToThePoolAfterRunning()
+    public void RentingAndRecyclingOnOneThreadStopsAllocating()
     {
-        using var host = new TestSystem(workers: 1);
+        // The pool's whole job. Renting and recycling on the same thread is the LeaderFlush and
+        // actor-to-actor path, and it must not touch the shared pool — or allocate — at all.
+        using var host = new TestSystem(workers: 0);     // no workers: the caller flushes inline
         var actor = new NoopActor(host.Options());
 
-        for (var i = 0; i < 1_000; i++)
-            actor.Ping();
+        for (var i = 0; i < 1_000; i++)                  // warm this thread's local stack
+            Assert.True(actor.Ping());
 
-        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(10), "queue did not drain");
-        Assert.True(Job.PoolSize > 0, "nothing was pooled");
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 10_000; i++)
+            actor.Ping();
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 64 * 1024,
+            $"{allocated} bytes for 10,000 jobs; unpooled this path allocates about 320,000");
+    }
+
+    [Fact]
+    public void JobsRecycledOnAWorkerReachTheSharedPool()
+    {
+        // The asymmetric path: this thread only rents, the workers only recycle. They meet through
+        // the shared pool, in batches.
+        var original = Job.MaxPoolSize;
+        try
+        {
+            Job.ClearPool();
+
+            using var host = new TestSystem(workers: 2);
+            var actor = new NoopActor(host.Options(mode: ExecutionMode.Scheduled));
+
+            for (var i = 0; i < 50_000; i++)
+                Assert.True(actor.Ping());
+
+            TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(30),
+                "queue did not drain");
+            Assert.True(Job.PoolSize > 0, "the workers never handed a batch to the shared pool");
+        }
+        finally
+        {
+            Job.MaxPoolSize = original;
+            Job.ClearPool();
+        }
     }
 
     [Fact]
@@ -306,31 +340,69 @@ public sealed class PoolTests
         var actor = new BlockingActor(host.Options(maxQueue: 1, mode: ExecutionMode.Scheduled));
         actor.BlockAndWait();
 
-        var before = Job.PoolSize;
-        for (var i = 0; i < 500; i++)
-            actor.Enqueue();
+        for (var i = 0; i < 1_000; i++)
+            Assert.False(actor.Enqueue(), "the bound let a job through, so nothing was refused");
 
-        // The rejected jobs go back to the pool instead of being handed to the GC.
-        Assert.True(Job.PoolSize >= before, $"pool shrank from {before} to {Job.PoolSize}");
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 10_000; i++)
+            actor.Enqueue();
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        // A refused job is recycled rather than handed to the GC.
+        Assert.True(allocated < 64 * 1024,
+            $"{allocated} bytes for 10,000 refused jobs; unrecycled they cost about 320,000");
+
         actor.Release();
     }
 
     [Fact]
-    public void PoolIsCappedByMaxPoolSize()
+    public void TheSharedPoolIsCappedByMaxPoolSize()
     {
         var original = Job.MaxPoolSize;
         try
         {
             Job.ClearPool();
-            Job.MaxPoolSize = 8;
+            Job.MaxPoolSize = 64;
 
-            using var host = new TestSystem(workers: 1);
-            var actor = new NoopActor(host.Options());
-            for (var i = 0; i < 500; i++)
+            using var host = new TestSystem(workers: 2);
+            var actor = new NoopActor(host.Options(mode: ExecutionMode.Scheduled));
+            for (var i = 0; i < 50_000; i++)
                 actor.Ping();
 
-            TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(10), "queue did not drain");
-            Assert.True(Job.PoolSize <= 8, $"pool grew to {Job.PoolSize}, above the cap of 8");
+            TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(30),
+                "queue did not drain");
+            Assert.True(Job.PoolSize <= 64, $"shared pool grew to {Job.PoolSize}, above the cap of 64");
+        }
+        finally
+        {
+            Job.MaxPoolSize = original;
+            Job.ClearPool();
+        }
+    }
+
+    [Fact]
+    public void MaxPoolSizeZeroTurnsPoolingOff()
+    {
+        var original = Job.MaxPoolSize;
+        try
+        {
+            Job.MaxPoolSize = 0;
+            Job.ClearPool();
+
+            using var host = new TestSystem(workers: 0);
+            var actor = new NoopActor(host.Options());
+
+            for (var i = 0; i < 1_000; i++)
+                actor.Ping();
+
+            var before = GC.GetAllocatedBytesForCurrentThread();
+            for (var i = 0; i < 10_000; i++)
+                actor.Ping();
+            var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+            Assert.True(allocated > 100_000,
+                $"only {allocated} bytes for 10,000 jobs; pooling was supposed to be off");
+            Assert.Equal(0, Job.PoolSize);
         }
         finally
         {

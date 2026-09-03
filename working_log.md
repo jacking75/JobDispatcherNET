@@ -1,5 +1,14 @@
 # Working Log
 
+## 2026-09-03 16:13 KST - 리뷰 C1~C6 성능 개선 (C4는 측정 후 보류)
+
+- 먼저 리뷰의 측정 조건(8생산자×250k, 액터 1000개 / 링 64×16)을 재현하는 하니스를 만들어 기준선을 측정한 뒤 변경했다. 각 셀은 워밍업 후 7회 중앙값.
+- C1(필수): `Job`/`Job<TState>` 풀을 `ConcurrentBag`+공유 카운터에서 **스레드 로컬 스택 + 32개 배치 공유 교환**(`JobPool<T>`)으로 교체. 8워커 `Scheduled` 2.03→18.37 M/s, 1워커 3.67→11.90, `LeaderFlush` 12.43→29.29. 기준 코드는 워커를 늘리면 **느려졌는데**(3.67→2.03) 이제 빨라진다(11.90→18.37).
+- C2: `JobDispatcherOptions.SpinBeforeParkIterations`(기본 10) 추가 — park 전 짧은 스핀으로 `_waiters`를 0으로 유지해 생산자가 signal lock을 건너뛰게 함.
+- C3: `_readyDepth`를 `StripedCounter` 2개로. C5: 타이머 `Enqueue`가 필요할 때만 `Pulse`, `_dueBuffer`는 `ToArray` 대신 버퍼 2개 스왑. C6: `StripedCounter` 셀을 128바이트로 패딩.
+- C4(intrusive MPSC 액터 큐)는 **보류**. 별도 마이크로벤치에서 `ConcurrentQueue` 대비 1생산자 구간이 3회 중 2회 더 느렸고 런마다 부호가 뒤집힌다. 게다가 Vyukov 큐는 dequeue한 노드가 다음 센티널이 되어 `JobEntry.Execute()`의 자기 재활용 계약(public)을 깨야 한다. 측정으로 부호조차 확인되지 않는 이득에 ADR 0004 불변식이 걸린 큐를 재작성할 근거가 없다고 판단. 측정치·판단 근거를 `docs/benchmarks.md`에 기록.
+- 풀 의미 변경(`MaxPoolSize`=공유 풀 상한, `PoolSize`=공유 풀만)에 맞춰 풀 테스트 4개를 할당량 측정 기반으로 재작성 + 1개 추가. 100개 전부 통과(net8.0/net10.0).
+
 ## 2026-09-03 15:45 KST - 리뷰 B1~B6 수정 (남용 내성 · 취약점)
 
 - B1: `Sequencer<T>`에 `maxPending`(세션 백프레셔)과 `maxItemsPerDrain`(워커 독점 방지) 생성자 인자 추가. `PendingCount`를 `ConcurrentQueue.Count` 대신 전용 카운터로 바꾸고 `MaxPending`/`DroppedCount` 노출. 샘플 3곳(AdvancedMmorpgServer, PipelinesServer, 프로젝트 템플릿)과 README 예제도 상한을 걸고 거부를 처리하도록 수정.
