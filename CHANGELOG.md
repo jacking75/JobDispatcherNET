@@ -13,7 +13,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`await actor.DisposeAsync()` could wait forever.** The drain handshake had the disposer publish
+  its `TaskCompletionSource` with a release store and then read the job counter, while the thread
+  finishing the last job did the reverse. Store-load is the one reordering x64 still permits, so
+  both sides could miss each other: the last job read a null `_drainTcs` and signalled nobody. The
+  disposer now publishes with `Interlocked.Exchange`, the same full fence `Sequencer.Drain` already
+  used for its half of the identical pattern. A server that disposes session actors as connections
+  close — the last job retiring exactly as `DisposeAsync` is called — is where this window is real.
+- **An interleaved `await` continuation refused by the queue bound stranded the whole async job.**
+  The continuation of an `AsyncReentrancy.Interleaved` `await` comes back through the ordinary
+  admission path, so `MaxQueueSize`, a faulted actor or a closing shutdown gate could reject it. The
+  job then stopped mid-flight and the `Task` from `RunAsync`/`AskAsync` never completed — nor did
+  anything chained onto it. Continuations now bypass both the bound and the state checks: they are
+  the second half of work the actor already admitted, and there is no safe way to say no to them.
+  `AsyncExecutable.RemainingTaskCount` can consequently exceed `MaxQueueSize` by the number of jobs
+  currently awaiting; admission of genuinely new work is unchanged.
+- **Shutdown did not wait for async jobs parked on an `await`.** An interleaved job hands its queue
+  slot back at the `await`, so it appeared in neither `InFlightJobs` nor `ReadyQueueDepth` nor
+  `PendingTimerCount` — `DrainAsync` reported an idle system and `StopAsync` stopped the timers and
+  workers while a continuation was still on its way back onto the actor. `DrainAsync` now also waits
+  for `JobSystem.PendingAsyncJobs`, and `AsyncExecutable.DisposeAsync` for the actor's own
+  `PendingAsyncJobs`. The drain-timeout log gained an `async=…` field.
+
+### Added
+
+- **`JobSystem.PendingAsyncJobs`** and **`AsyncExecutable.PendingAsyncJobs`** — async jobs that have
+  started and are parked on an `await`. Part of the drain condition above, and the counter to look
+  at when a shutdown times out with everything else at zero.
+- **`AsyncExecutable.DisposeAsync(TimeSpan)`** and **`AsyncExecutable.DisposeAsync(CancellationToken)`**
+  — dispose with an upper bound on the drain wait, returning `false` rather than throwing when they
+  give up. Nothing drains an actor's queue once its workers are gone, so an actor disposed after
+  `StopAsync` needs a way out. The parameterless overload is unchanged and still waits forever.
 
 ## [0.10.0] - 2026-08-31
 

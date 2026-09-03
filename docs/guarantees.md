@@ -116,7 +116,7 @@ already `false`. The reasons, from `DropReason`:
 
 | Reason | Cause |
 |---|---|
-| `QueueFull` | The actor is at `JobOptions.MaxQueueSize`. |
+| `QueueFull` | The actor is at `JobOptions.MaxQueueSize`. (An interleaved `await` continuation is exempt — see [Async jobs](#async-jobs).) |
 | `ShuttingDown` | `JobSystem.AcceptingWork` is false (set by `StopAsync`, `Dispose`, or by you). |
 | `Disposed` | The actor's `DisposeAsync` has completed. |
 | `Faulted` | The actor tripped `MaxConsecutiveFailures`. |
@@ -164,9 +164,17 @@ public sealed class AccountActor : AsyncExecutable
 }
 ```
 
-If the actor refuses the continuation (it was disposed, or the system stopped mid-await), the library
-logs an error and the awaiting task never completes. Drain before you dispose — see
-[Shutdown](shutdown.md).
+**The continuation is never refused.** It is the second half of a job the actor already admitted, so
+turning it away would strand the async state machine and leave the task from `RunAsync`/`AskAsync`
+permanently incomplete. It therefore bypasses `MaxQueueSize` *and* the disposed / shutting-down /
+faulted checks, and runs whatever the actor's state. Two consequences worth knowing:
+
+- `RemainingTaskCount` can sit above `MaxQueueSize`, by the number of jobs currently awaiting.
+  Admission of genuinely new work still respects the bound.
+- Shutdown waits for these jobs. `JobSystem.PendingAsyncJobs` counts every async job parked on an
+  `await`, and both `DrainAsync` and `AsyncExecutable.DisposeAsync` block until it reaches zero — so
+  the workers are still there when the continuation lands. An `await` that never completes therefore
+  costs you the whole drain timeout; see [Shutdown](shutdown.md).
 
 ### `AsyncReentrancy.Exclusive`
 

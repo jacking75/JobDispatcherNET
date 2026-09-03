@@ -34,11 +34,19 @@ public async Task<bool> StopAsync(TimeSpan drainTimeout, bool refuseNewWork = fa
 ```
 
 **1. Drain, with the gate still open.** `DrainAsync` waits until `InFlightJobs == 0` **and**
-`ReadyQueueDepth == 0` **and** `PendingTimerCount == 0`, pulsing idle workers awake and re-checking
-every 2 ms. New work is *still accepted* during this phase, deliberately: a job that enqueues
-follow-up work — an actor telling its neighbours to despawn, a session flushing its last packet —
-completes normally instead of being cut off half-way. On timeout it logs the exact backlog
-(`in-flight=…, ready=…, timers=…`) and returns `false`.
+`ReadyQueueDepth == 0` **and** `PendingTimerCount == 0` **and** `PendingAsyncJobs == 0`, pulsing idle
+workers awake and re-checking every 2 ms. New work is *still accepted* during this phase,
+deliberately: a job that enqueues follow-up work — an actor telling its neighbours to despawn, a
+session flushing its last packet — completes normally instead of being cut off half-way. On timeout
+it logs the exact backlog (`in-flight=…, ready=…, timers=…, async=…`) and returns `false`.
+
+`PendingAsyncJobs` is the one that is not obvious. An `AsyncReentrancy.Interleaved` job parked on an
+`await` has handed its queue slot back, so it appears in none of the other three counters — the
+drain used to call such a system idle and stop the workers while a continuation was still on its way
+back onto the actor. It is counted from the moment `RunAsync`/`AskAsync` returns an unfinished task
+until that task completes. The corollary: a job awaiting something that never finishes (a socket
+read with no timeout, say) now burns the whole drain timeout instead of being silently abandoned,
+and `async=…` in the timeout line names it.
 
 **2. Close the gate.** `AcceptingWork = false`. Every actor on the system now refuses new jobs with
 `DropReason.ShuttingDown`; `DoAsync` returns `false`, `Ask`/`RunAsync` fault with
@@ -174,6 +182,20 @@ Three things to copy from it:
   drain waits on `PendingTimerCount` forever and burns the whole timeout.
 - **Then one call.** `_world.Stop()` itself just awaits `System.DrainAsync(5s)` to let the despawn
   cascade settle; `StopAsync` then does everything else.
+
+### Disposing an actor after the workers are gone
+
+`await actor.DisposeAsync()` waits for that actor's queue to drain, and nothing drains a queue once
+its workers have stopped — so disposing actors *after* `StopAsync` waits forever. Either dispose them
+while the pool is still up, or give the wait a bound:
+
+```csharp
+if (!await session.DisposeAsync(TimeSpan.FromSeconds(2)))
+    log.Warn($"{session.Name} still had {session.RemainingTaskCount} jobs queued");
+```
+
+`DisposeAsync(TimeSpan)` and `DisposeAsync(CancellationToken)` return `false` instead of throwing
+when they give up. The actor stops accepting work either way.
 
 ## Why the old four-step sequence is gone
 

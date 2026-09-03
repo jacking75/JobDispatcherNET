@@ -48,12 +48,16 @@ public abstract class AsyncExecutable : IAsyncDisposable
     private readonly ActorSynchronizationContext? _syncContext;
 
     private int _remainingTaskCount;
+    private int _pendingAsync;
     private int _consecutiveFailures;
     private int _maxObservedQueueDepth;
     private int _faulted;
     private int _completed;
     private int _suspendState;
-    private volatile TaskCompletionSource? _drainTcs;
+
+    // Not volatile: the drain handshake fences explicitly on both sides. See DisposeAsync()
+    // and SignalDrainedIfIdle().
+    private TaskCompletionSource? _drainTcs;
 
     /// <summary>Create an actor with default options on <see cref="JobSystem.Default"/>.</summary>
     protected AsyncExecutable() : this(JobOptions.Default) { }
@@ -84,8 +88,21 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// <summary>Queued plus in-flight jobs. Use for queue-depth monitoring.</summary>
     public int RemainingTaskCount => Volatile.Read(ref _remainingTaskCount);
 
+    /// <summary>
+    /// Async jobs that have started and are parked on an <c>await</c>.
+    ///
+    /// Under <see cref="AsyncReentrancy.Interleaved"/> such a job holds no queue slot — it is not
+    /// part of <see cref="RemainingTaskCount"/> — yet the actor is not finished with it. Shutdown
+    /// waits for this to reach zero as well.
+    /// </summary>
+    public int PendingAsyncJobs => Volatile.Read(ref _pendingAsync);
+
     /// <summary>Highest queue depth seen since construction.</summary>
     public int MaxObservedQueueDepth => Volatile.Read(ref _maxObservedQueueDepth);
+
+    /// <summary>Nothing queued, nothing in flight, and no async job parked on an await.</summary>
+    private bool IsIdle =>
+        Volatile.Read(ref _remainingTaskCount) == 0 && Volatile.Read(ref _pendingAsync) == 0;
 
     /// <summary>
     /// True once <see cref="JobOptions.MaxConsecutiveFailures"/> consecutive jobs threw.
@@ -324,6 +341,8 @@ public abstract class AsyncExecutable : IAsyncDisposable
         if (_reentrancy == AsyncReentrancy.Exclusive)
             BeginExclusiveSuspension();
 
+        BeginAsyncTracking();
+
         task.ContinueWith(
             static (t, s) =>
             {
@@ -331,6 +350,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 if (exclusive)
                     self.EndExclusiveSuspension();
                 Settle(t, completion);
+                self.EndAsyncTracking();
             },
             (this, tcs, _reentrancy == AsyncReentrancy.Exclusive),
             CancellationToken.None,
@@ -360,6 +380,8 @@ public abstract class AsyncExecutable : IAsyncDisposable
         if (_reentrancy == AsyncReentrancy.Exclusive)
             BeginExclusiveSuspension();
 
+        BeginAsyncTracking();
+
         task.ContinueWith(
             static (t, s) =>
             {
@@ -367,6 +389,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 if (exclusive)
                     self.EndExclusiveSuspension();
                 Settle(t, completion);
+                self.EndAsyncTracking();
             },
             (this, tcs, _reentrancy == AsyncReentrancy.Exclusive),
             CancellationToken.None,
@@ -386,6 +409,36 @@ public abstract class AsyncExecutable : IAsyncDisposable
         if (task.IsFaulted) tcs.TrySetException(task.Exception!.InnerExceptions);
         else if (task.IsCanceled) tcs.TrySetCanceled();
         else tcs.TrySetResult(task.Result);
+    }
+
+    /// <summary>
+    /// Register an async job that returned an unfinished task, i.e. one parked on an <c>await</c>.
+    ///
+    /// Under <see cref="AsyncReentrancy.Interleaved"/> such a job is invisible everywhere else: it
+    /// holds no queue slot, sits in no ready queue and has no timer pending, so a shutdown drain
+    /// used to see an idle system, stop the workers and leave the continuation with nothing to run
+    /// on. Both the actor and the system count it until its task completes.
+    /// </summary>
+    private void BeginAsyncTracking()
+    {
+        Interlocked.Increment(ref _pendingAsync);
+        _system.OnAsyncJobStarted();
+    }
+
+    /// <summary>
+    /// Runs on whichever thread completed the async job's task, after the caller's task has been
+    /// settled. The system counter is bumped first so <see cref="JobSystem.PendingAsyncJobs"/>,
+    /// which reads completed-then-started, can read high but never spuriously low.
+    /// </summary>
+    private void EndAsyncTracking()
+    {
+        _system.OnAsyncJobCompleted();
+
+        // Interlocked, then a re-read of both counters: one half of the Dekker handshake described
+        // on SignalDrainedIfIdle. The other half is the flushing thread's decrement of
+        // _remainingTaskCount, so exactly one of the two threads sees the actor fully idle.
+        if (Interlocked.Decrement(ref _pendingAsync) == 0)
+            SignalDrainedIfIdle();
     }
 
     /// <summary>
@@ -434,7 +487,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
         if (Interlocked.Decrement(ref _remainingTaskCount) == 0)
         {
-            SignalDrained();
+            SignalDrainedIfIdle();
             return;
         }
 
@@ -483,13 +536,13 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// left a window where the count claimed a job the queue did not have — a leader could then
     /// spin forever waiting for a job that was never written.
     /// </summary>
-    private bool Admit(JobEntry task, bool fromTimer)
+    private bool Admit(JobEntry task, bool fromTimer, bool bypassBound = false)
     {
         int current;
         while (true)
         {
             current = Volatile.Read(ref _remainingTaskCount);
-            if (_maxQueueSize != 0 && current >= _maxQueueSize)
+            if (!bypassBound && _maxQueueSize != 0 && current >= _maxQueueSize)
             {
                 task.Discard();
                 return Refuse(DropReason.QueueFull);
@@ -569,6 +622,28 @@ public abstract class AsyncExecutable : IAsyncDisposable
         }
         return Admit(task, fromTimer: false);
     }
+
+    /// <summary>
+    /// Entry point for the second half of an already-admitted async job: the continuation of an
+    /// <see cref="AsyncReentrancy.Interleaved"/> <c>await</c>.
+    ///
+    /// It deliberately skips both <see cref="TryReserve"/> and the queue bound. A continuation is
+    /// not new work, and refusing it strands the async state machine for good — the task handed
+    /// back by <c>RunAsync</c>/<c>AskAsync</c> would never complete and neither would anything
+    /// chained onto it. Since there is no safe way to say no, the actor does not ask: the
+    /// continuation runs whatever the queue depth and whatever the actor's state.
+    ///
+    /// The price is that <see cref="RemainingTaskCount"/> may exceed
+    /// <see cref="JobOptions.MaxQueueSize"/> by the number of jobs currently awaiting. Admission of
+    /// genuinely new work still respects the bound, so the overshoot is capped by how many async
+    /// jobs the bound let in to begin with.
+    /// </summary>
+    internal void AdmitContinuation(SendOrPostCallback callback, object? state) =>
+        Admit(
+            Job<(SendOrPostCallback Callback, object? State)>.Rent(
+                static t => t.Callback(t.State), (callback, state)),
+            fromTimer: false,
+            bypassBound: true);
 
     private void ScheduleOrFlush()
     {
@@ -650,7 +725,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                     _system.OnJobRetired();
                     if (Interlocked.Decrement(ref _remainingTaskCount) == 0)
                     {
-                        SignalDrained();
+                        SignalDrainedIfIdle();
                         return;
                     }
                     continue;
@@ -658,7 +733,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
                 if (remaining == 0)
                 {
-                    SignalDrained();
+                    SignalDrainedIfIdle();
                     return;
                 }
 
@@ -676,7 +751,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 // exit and could spin a core forever after a rejected write.
                 if (Volatile.Read(ref _remainingTaskCount) == 0)
                 {
-                    SignalDrained();
+                    SignalDrainedIfIdle();
                     return;
                 }
 
@@ -777,7 +852,23 @@ public abstract class AsyncExecutable : IAsyncDisposable
         _system.Logger.Error($"Unhandled error in actor '{Name}'", exception);
     }
 
-    private void SignalDrained() => _drainTcs?.TrySetResult();
+    /// <summary>
+    /// Complete a pending <see cref="DisposeAsync()"/> if the actor has gone fully idle.
+    ///
+    /// Every caller reaches here straight after an <c>Interlocked</c> decrement, which is a full
+    /// fence, so that decrement is globally visible before the counters below are re-read. That is
+    /// what makes the handshake with <see cref="DisposeAsync()"/> — which publishes
+    /// <see cref="_drainTcs"/> with <see cref="Interlocked.Exchange{T}"/> before re-reading the same
+    /// counters — sound. A release store followed by an acquire load is not enough on either side:
+    /// store-load is the one reordering x64 still allows, and losing that race left the disposer
+    /// waiting on a task nobody would ever complete.
+    /// </summary>
+    private void SignalDrainedIfIdle()
+    {
+        if (!IsIdle)
+            return;
+        Volatile.Read(ref _drainTcs)?.TrySetResult();
+    }
 
     // ── shutdown ────────────────────────────────────────────────────────────
 
@@ -785,21 +876,78 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// Wait for the queue to drain, then refuse further work. Signal-based, no polling.
     ///
     /// A dispatcher must still be running (or the caller must be the actor's leader) for the queue
-    /// to drain — disposing the dispatcher first leaves nothing to do the work.
+    /// to drain — disposing the dispatcher first leaves nothing to do the work, and this overload
+    /// then waits forever. Use <see cref="DisposeAsync(TimeSpan)"/> or
+    /// <see cref="DisposeAsync(CancellationToken)"/> when the caller cannot make that guarantee.
     /// </summary>
-    public virtual async ValueTask DisposeAsync()
+    public virtual async ValueTask DisposeAsync() =>
+        await DrainThenCompleteAsync(Timeout.InfiniteTimeSpan, CancellationToken.None).ConfigureAwait(false);
+
+    /// <summary>
+    /// <see cref="DisposeAsync()"/> with an upper bound on the wait. Nothing can finish an actor's
+    /// queued work once its workers are gone, so a caller disposing actors during or after shutdown
+    /// needs a way to stop waiting.
+    /// </summary>
+    /// <param name="timeout">
+    /// How long to wait for the drain. <see cref="Timeout.InfiniteTimeSpan"/> waits forever.
+    /// </param>
+    /// <returns><c>true</c> if the actor drained; <c>false</c> if the timeout expired first.</returns>
+    /// <remarks>
+    /// The actor stops accepting work either way. This overload does not route through an override
+    /// of <see cref="DisposeAsync()"/>.
+    /// </remarks>
+    public ValueTask<bool> DisposeAsync(TimeSpan timeout) =>
+        DrainThenCompleteAsync(timeout, CancellationToken.None);
+
+    /// <summary>
+    /// <see cref="DisposeAsync()"/> that gives up when <paramref name="cancellationToken"/> fires
+    /// rather than throwing. See <see cref="DisposeAsync(TimeSpan)"/>.
+    /// </summary>
+    /// <returns><c>true</c> if the actor drained; <c>false</c> if it was cancelled first.</returns>
+    public ValueTask<bool> DisposeAsync(CancellationToken cancellationToken) =>
+        DrainThenCompleteAsync(Timeout.InfiniteTimeSpan, cancellationToken);
+
+    private async ValueTask<bool> DrainThenCompleteAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _remainingTaskCount) > 0)
+        var drained = true;
+
+        if (!IsIdle)
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            _drainTcs = tcs;
 
-            if (Volatile.Read(ref _remainingTaskCount) > 0)
-                await tcs.Task.ConfigureAwait(false);
+            // Interlocked, not a plain or volatile store: this is one half of a Dekker handshake
+            // with SignalDrainedIfIdle, and a release store does not order against the loads that
+            // follow. Without the full fence the store can still sit in this core's store buffer
+            // while the thread finishing the last job reads a null _drainTcs, signals nobody, and
+            // leaves this await pending for the life of the process.
+            Interlocked.Exchange(ref _drainTcs, tcs);
+
+            if (!IsIdle)
+                drained = await AwaitDrainAsync(tcs.Task, timeout, cancellationToken).ConfigureAwait(false);
         }
 
         Volatile.Write(ref _completed, 1);
         GC.SuppressFinalize(this);
+        return drained;
+    }
+
+    private static async Task<bool> AwaitDrainAsync(Task drain, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (timeout == Timeout.InfiniteTimeSpan && !cancellationToken.CanBeCanceled)
+        {
+            await drain.ConfigureAwait(false);
+            return true;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (timeout != Timeout.InfiniteTimeSpan)
+            cts.CancelAfter(timeout < TimeSpan.Zero ? TimeSpan.Zero : timeout);
+
+        var abandoned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (cts.Token.Register(static s => ((TaskCompletionSource)s!).TrySetResult(), abandoned))
+        {
+            return ReferenceEquals(await Task.WhenAny(drain, abandoned.Task).ConfigureAwait(false), drain);
+        }
     }
 
     // ── process-wide compatibility surface ──────────────────────────────────
@@ -845,14 +993,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// </summary>
     private sealed class ActorSynchronizationContext(AsyncExecutable actor) : SynchronizationContext
     {
-        public override void Post(SendOrPostCallback d, object? state)
-        {
-            if (!actor.DoAsync(static t => t.Callback(t.State), (Callback: d, State: state)))
-            {
-                actor._system.Logger.Error(
-                    $"Actor '{actor.Name}' refused an async continuation; the awaiting task will never complete.");
-            }
-        }
+        public override void Post(SendOrPostCallback d, object? state) => actor.AdmitContinuation(d, state);
 
         public override void Send(SendOrPostCallback d, object? state)
         {

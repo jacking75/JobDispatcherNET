@@ -219,6 +219,94 @@ public sealed class ShutdownTests
         system.Dispose();
     }
 
+    [Fact]
+    public async Task DisposeAsyncNeverMissesTheDrainSignal()
+    {
+        // A1: the disposer publishes _drainTcs and then reads the job counter, while the worker
+        // decrements the counter and then reads _drainTcs. Without a full fence on the disposer's
+        // side the store-load reordering lets both sides miss each other and the await never ends.
+        using var host = new TestSystem(workers: 4);
+
+        var racers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            for (var round = 0; round < 500; round++)
+            {
+                var actor = new SlowActor(host.Options(mode: ExecutionMode.Scheduled));
+                Assert.True(actor.Work());
+
+                Assert.True(await actor.DisposeAsync(TimeSpan.FromSeconds(10)),
+                    $"round {round}: DisposeAsync did not observe the drain signal");
+            }
+        })).ToArray();
+
+        await Task.WhenAll(racers);
+    }
+
+    [Fact]
+    public async Task DisposeAsyncWithATimeoutGivesUpInsteadOfHanging()
+    {
+        using var host = new TestSystem(workers: 1);
+        var actor = new BlockingActor(host.Options(mode: ExecutionMode.Scheduled));
+        actor.BlockAndWait();
+
+        Assert.False(await actor.DisposeAsync(TimeSpan.FromMilliseconds(200)),
+            "DisposeAsync claimed a clean drain while a job was still running");
+        Assert.False(actor.Enqueue(), "a disposed actor must refuse new work");
+
+        actor.Release();
+        TestSystem.SpinWaitFor(() => actor.Done == 1, TimeSpan.FromSeconds(5),
+            "the blocked job never finished");
+    }
+
+    [Fact]
+    public async Task DrainWaitsForInterleavedAsyncJobsThatAreStillAwaiting()
+    {
+        // A3: an interleaved job parked on an await holds no queue slot, no ready-queue entry and
+        // no timer, so the drain used to report success and stop the workers under it.
+        using var host = new TestSystem(workers: 2);
+        var actor = new SlowActor(host.Options());
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = actor.RunAsync(async () => await gate.Task);
+
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the async job never reached its await");
+
+        Assert.Equal(1, host.System.PendingAsyncJobs);
+        Assert.Equal(1, actor.PendingAsyncJobs);
+        Assert.Equal(0, host.System.InFlightJobs);      // invisible to every other counter
+
+        Assert.False(await host.System.DrainAsync(TimeSpan.FromMilliseconds(300)),
+            "the drain reported success while an async job was still awaiting");
+
+        gate.SetResult();
+        await pending.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(await host.System.DrainAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, host.System.PendingAsyncJobs);
+    }
+
+    [Fact]
+    public async Task DisposeAsyncWaitsForAnAsyncJobThatIsStillAwaiting()
+    {
+        using var host = new TestSystem(workers: 2);
+        var actor = new SlowActor(host.Options());
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = actor.RunAsync(async () => await gate.Task);
+
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the async job never reached its await");
+
+        var dispose = actor.DisposeAsync(TimeSpan.FromSeconds(10)).AsTask();
+        await Task.Delay(100);
+        Assert.False(dispose.IsCompleted, "DisposeAsync returned while an async job was still awaiting");
+
+        gate.SetResult();
+        await pending.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(await dispose.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
     private sealed class SlowActor(JobOptions options) : AsyncExecutable(options)
     {
         private int _done;

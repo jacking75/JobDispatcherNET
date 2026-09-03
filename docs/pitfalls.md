@@ -276,7 +276,7 @@ the workers last. See [Shutdown](shutdown.md).
 ## 9. `StopAsync` always times out
 
 **Symptom.** `StopAsync` returns `false` every time and logs
-`drain timed out … (in-flight=0, ready=0, timers=12)`.
+`drain timed out … (in-flight=0, ready=0, timers=12, async=0)`.
 
 **Cause.** `DrainAsync` waits for `PendingTimerCount` to reach zero as well as for jobs. A live
 `DoAsyncEvery` handle counts as one pending timer *forever*, so the drain can never finish.
@@ -284,6 +284,12 @@ the workers last. See [Shutdown](shutdown.md).
 **Fix.** Cancel repeating timers as part of your shutdown — normally by despawning the entities that
 own them, since each `Despawn()` should cancel its own handles. The message names the culprit: a
 non-zero `timers=` with `in-flight=0` is always this.
+
+**The other shape of the same symptom** is `async=` non-zero with everything else at zero: an
+`AsyncReentrancy.Interleaved` job is parked on an `await` that never completes — a socket read or an
+HTTP call with no timeout is the usual one. The drain waits for it on purpose (stopping the workers
+underneath a pending continuation is worse), so the fix is to give the awaited operation a
+`CancellationToken` and cancel it before shutting down.
 
 ---
 

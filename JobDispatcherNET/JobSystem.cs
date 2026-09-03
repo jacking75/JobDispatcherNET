@@ -94,6 +94,8 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     private readonly object _signal = new();
     private readonly StripedCounter _admitted = new();
     private readonly StripedCounter _retired = new();
+    private readonly StripedCounter _asyncStarted = new();
+    private readonly StripedCounter _asyncCompleted = new();
     private readonly List<IDisposable> _dispatchers = [];
     private readonly object _dispatcherLock = new();
     private readonly long _startTimestamp = Stopwatch.GetTimestamp();
@@ -169,6 +171,26 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Async jobs that have started and are parked on an <c>await</c>.
+    ///
+    /// Under <see cref="AsyncReentrancy.Interleaved"/> an awaiting job releases its queue slot, so
+    /// it appears in neither <see cref="InFlightJobs"/> nor <see cref="ReadyQueueDepth"/> nor
+    /// <see cref="PendingTimerCount"/>. <see cref="DrainAsync"/> waits on this as well, otherwise a
+    /// shutdown could stop the workers while a continuation was still on its way back.
+    ///
+    /// Read in the same order as <see cref="InFlightJobs"/> — completed first — so the count can
+    /// read high but never spuriously low.
+    /// </summary>
+    public long PendingAsyncJobs
+    {
+        get
+        {
+            var completed = _asyncCompleted.Value;
+            return Math.Max(0, _asyncStarted.Value - completed);
+        }
+    }
+
     /// <summary>Monotonic milliseconds since this system was created.</summary>
     public long CurrentTick => (long)Stopwatch.GetElapsedTime(_startTimestamp).TotalMilliseconds;
 
@@ -192,6 +214,10 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
     internal void OnJobAdmitted() => _admitted.Increment();
 
     internal void OnJobRetired() => _retired.Increment();
+
+    internal void OnAsyncJobStarted() => _asyncStarted.Increment();
+
+    internal void OnAsyncJobCompleted() => _asyncCompleted.Increment();
 
     // ── ready queue ─────────────────────────────────────────────────────────
 
@@ -363,13 +389,14 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         var deadline = Stopwatch.GetTimestamp();
         var limit = timeout <= TimeSpan.Zero ? TimeSpan.Zero : timeout;
 
-        while (InFlightJobs > 0 || ReadyQueueDepth > 0 || PendingTimerCount > 0)
+        while (InFlightJobs > 0 || ReadyQueueDepth > 0 || PendingTimerCount > 0 || PendingAsyncJobs > 0)
         {
             if (Stopwatch.GetElapsedTime(deadline) >= limit)
             {
                 Logger.Warn(
                     $"JobSystem '{Name}' drain timed out after {limit.TotalMilliseconds:F0}ms " +
-                    $"(in-flight={InFlightJobs}, ready={ReadyQueueDepth}, timers={PendingTimerCount})");
+                    $"(in-flight={InFlightJobs}, ready={ReadyQueueDepth}, timers={PendingTimerCount}, " +
+                    $"async={PendingAsyncJobs})");
                 return false;
             }
 

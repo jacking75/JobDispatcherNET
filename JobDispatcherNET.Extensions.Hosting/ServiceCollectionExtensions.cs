@@ -235,7 +235,7 @@ public sealed class JobSystemHealthCheck : IHealthCheck
         var live = _system.LiveWorkerCount;
         var accepting = _system.AcceptingWork;
 
-        var data = new Dictionary<string, object>(6, StringComparer.Ordinal)
+        var data = new Dictionary<string, object>(7, StringComparer.Ordinal)
         {
             ["system"] = _system.Name,
             ["liveWorkers"] = live,
@@ -243,6 +243,7 @@ public sealed class JobSystemHealthCheck : IHealthCheck
             ["acceptingWork"] = accepting,
             ["readyQueueDepth"] = _system.ReadyQueueDepth,
             ["inFlightJobs"] = _system.InFlightJobs,
+            ["pendingAsyncJobs"] = _system.PendingAsyncJobs,
         };
 
         if (live == 0)

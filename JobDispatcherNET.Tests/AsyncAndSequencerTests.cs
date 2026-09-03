@@ -184,6 +184,68 @@ public sealed class AsyncJobTests
             "the actor stayed suspended after a failed async job");
     }
 
+    [Fact]
+    public async Task InterleavedContinuationIsNeverRefusedByQueueBound()
+    {
+        // A2: the continuation of an await re-enters the actor as an ordinary job. When the bound
+        // rejected it the async state machine stopped for good and RunAsync's task never completed.
+        using var host = new TestSystem(workers: 2);
+        var actor = new BlockingActor(host.Options(maxQueue: 1, mode: ExecutionMode.Scheduled));
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = actor.RunAsync(async () => await gate.Task);
+
+        // Parking on the await hands the queue slot back, so the actor looks idle again.
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the async job never reached its await");
+
+        actor.BlockAndWait();                                       // the one allowed slot is taken
+        Assert.False(actor.Enqueue(), "the queue bound was not in force");
+
+        gate.SetResult();                                           // continuation posted onto a full queue
+
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 2, TimeSpan.FromSeconds(5),
+            "the continuation was refused instead of being let past the bound");
+
+        actor.Release();
+        await pending.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task InterleavedContinuationRunsEvenAfterTheActorFaults()
+    {
+        using var host = new TestSystem(workers: 2);
+        var actor = new FaultingActor(new JobOptions
+        {
+            System = host.System,
+            Mode = ExecutionMode.Scheduled,
+            MaxConsecutiveFailures = 1,
+        });
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = actor.RunAsync(async () => await gate.Task);
+
+        TestSystem.SpinWaitFor(() => actor.RemainingTaskCount == 0, TimeSpan.FromSeconds(5),
+            "the async job never reached its await");
+
+        Assert.True(actor.Boom());
+        TestSystem.SpinWaitFor(() => actor.IsFaulted, TimeSpan.FromSeconds(5), "the actor never faulted");
+        Assert.False(actor.Boom(), "a faulted actor must still refuse new work");
+
+        gate.SetResult();
+        await pending.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    private sealed class FaultingActor(JobOptions options) : AsyncExecutable(options)
+    {
+        public bool Boom() => DoAsync(static () => throw new InvalidOperationException("boom"));
+
+        protected override void OnJobError(Exception exception)
+        {
+            // The failure is the point of the test; swallow it.
+        }
+    }
+
     private sealed class AsyncActor(JobOptions options) : AsyncExecutable(options)
     {
         private int _concurrent;

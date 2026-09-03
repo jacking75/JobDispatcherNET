@@ -1,5 +1,19 @@
 # Working Log
 
+## 2026-09-03 10:40 KST - 리뷰 A1·A2·A3 버그 수정 (드레인 핸드셰이크, async 연속 작업, 드레인 조건)
+
+- A1: `AsyncExecutable.DisposeAsync`의 드레인 핸드셰이크를 `Interlocked.Exchange`로 발행하도록 고쳐 store-load 재배치로 신호가 유실되던 경로를 차단. 상한을 줄 수 있는 `DisposeAsync(TimeSpan)`/`DisposeAsync(CancellationToken)` 오버로드 추가(실패 시 예외 대신 `false`).
+- A2: Interleaved `await` 연속 작업 전용 진입점 `AdmitContinuation`을 만들어 `MaxQueueSize`와 `TryReserve`(Disposed/ShuttingDown/Faulted)를 우회. 거부 시 `RunAsync`/`AskAsync` Task가 영구 미완료되던 hang 제거.
+- A3: `JobSystem.PendingAsyncJobs`/`AsyncExecutable.PendingAsyncJobs` 카운터를 추가해 `DrainAsync`·`DisposeAsync`가 await 중인 async 작업을 기다리게 함. 드레인 타임아웃 로그에 `async=` 추가.
+- 회귀 테스트 6개 추가(72개 전부 통과, net8.0/net10.0). 새 테스트가 옛 동작에서 실제로 실패하는 것까지 확인. `docs/{shutdown,pitfalls,guarantees,tuning}.md`와 CHANGELOG 갱신.
+
+## 2026-09-02 20:09 KST - 0.10.0 코어 라이브러리 리뷰: 버그·취약점·성능 개선 계획 문서화
+
+- `JobDispatcherNET/*.cs` 전체와 Hosting/Logging 확장을 검토해 `docs/review-0.10.0.md`에 정리. 저장소 코드는 변경하지 않음.
+- 버그 12건(A1 `DisposeAsync` Dekker 재배치로 드레인 신호 유실, A2 Interleaved 연속 작업이 `QueueFull`로 거부되어 Task 영구 미완료, A3 `DrainAsync`가 await 중 async 작업 미포함, A4 타이머 스레드 예외 가드 부재, A5 워커 재시작 백오프 오버플로로 프로세스 종료 가능, A6 발화 후 미실행 타이머 취소 불가 등)과 남용 내성 6건(B1 `Sequencer` 무제한 큐 등)을 심각도·구현 코드·테스트 계획과 함께 기록.
+- A2·A3·A6·A7은 스크래치패드 콘솔 재현 코드로 실제 동작 확인. 기존 테스트 66개는 모두 통과.
+- 성능은 측정 후 판단: `Job` 풀(`ConcurrentBag`+공유 카운터)이 워커 확장을 막고 있어 스레드 로컬 풀로 바꾸면 3~5배(예: 4워커 링 9.05→47.48 M/s). 이것만 "필수"로, 나머지(워커 스핀, 카운터 스트라이프, MPSC 큐 등)는 선택으로 분류.
+
 ## 2026-09-02 10:41 KST - 예제 프로젝트를 samples 디렉토리로 이동
 
 - ExampleSectorServer, ExampleMmorpgServer, ExampleConsoleApp, ExampleChatServer, AdvancedMmorpgTests, AdvancedMmorpgServer, AdvancedMmorpgClient 7개 프로젝트를 `samples/` 밑으로 이동 (`git mv`).

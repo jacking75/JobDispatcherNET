@@ -35,6 +35,12 @@ true — set false if the pool must keep the process alive), `MaxStackSize`.
 admission CAS guards). `null` means unbounded, which in a long-running server is an OOM vector: a
 producer faster than the actor will grow the queue until the process dies.
 
+One thing is exempt: the continuation of an `AsyncReentrancy.Interleaved` `await`, which belongs to a
+job the bound already admitted and would strand its caller's task if refused. `RemainingTaskCount`
+can therefore exceed the bound by the number of jobs currently awaiting — bounded in turn by how many
+async jobs the bound let in.
+
+
 Sizing it:
 
 1. Decide the worst latency you will tolerate for that actor: `L`.

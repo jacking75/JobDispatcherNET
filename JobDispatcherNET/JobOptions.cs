@@ -73,7 +73,14 @@ public sealed record JobOptions
     /// <summary>Optional name used in logs, metric tags and <c>ToString()</c>.</summary>
     public string? Name { get; init; }
 
-    /// <summary>Maximum number of jobs (queued + in flight). <c>null</c> means unbounded.</summary>
+    /// <summary>
+    /// Maximum number of jobs (queued + in flight). <c>null</c> means unbounded.
+    ///
+    /// The continuation of an <see cref="AsyncReentrancy.Interleaved"/> <c>await</c> is exempt: it
+    /// belongs to a job the bound already admitted, and refusing it would strand the awaiting task
+    /// forever. <see cref="AsyncExecutable.RemainingTaskCount"/> can therefore sit above this value
+    /// by the number of async jobs currently awaiting.
+    /// </summary>
     public int? MaxQueueSize { get; init; }
 
     /// <summary>What to do when the queue is full. Ignored when <see cref="MaxQueueSize"/> is <c>null</c>.</summary>
