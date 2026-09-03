@@ -83,6 +83,12 @@ session usually means disconnecting the client. `DroppedCount` counts what was r
 rest back to the ready queue instead of running the session dry, so one flooding client cannot hold
 a worker. Both default to `0`, which is unbounded, for compatibility.
 
+One consequence of leaving `maxPending` at `0`: with no bound to enforce there is no counter to keep,
+so `PendingCount` falls back to `ConcurrentQueue.Count`, which walks the queue's segments and is a
+snapshot approximation. That is the right trade — an unbounded sequencer used to pay a shared
+read-modify-write per item, raised by the producing IO thread and lowered by the consuming worker,
+purely to feed an observability property. A bounded sequencer keeps the exact counter it needs.
+
 ## `MaxJobsPerFlush` — fairness
 
 Default `int.MaxValue`: a leader drains the actor to empty before letting go. One actor receiving
@@ -124,6 +130,11 @@ into every single job, which is why throughput used to *fall* as workers were ad
   pool of the **non-generic** `Job` only. Per-thread stacks are not counted, so on a workload that
   rents and recycles on one thread it reads zero while the pool is working perfectly.
   `Job<TState>.PoolSize` is per state type and is not aggregated.
+- **`MaxPoolSize` is rounded up to a multiple of 32**, the batch the shared pool trades in — anything
+  from 1 to 32 means one batch. It used to be truncated, so any value below 32 allowed *zero*
+  batches and silently switched the shared pool off: same-thread rent/recycle kept working, while
+  every cross-thread path (`Scheduled` actors, timer firings) allocated a fresh job every time, with
+  no error and nothing in this page to explain it.
 - `MaxPoolSize = 0` turns pooling off entirely, local stacks included. Useful for measuring what the
   pool is buying you; not a production setting.
 - Rented jobs are recycled in a `finally`, so a throwing job still returns its entry, and a *refused*
@@ -156,6 +167,29 @@ everywhere else — actors only ever touched from inside other actors' jobs get 
 
 `Scheduled` falls back to an inline flush when `JobSystem.HasWorkers` is false, so it is not a
 guarantee on a system with no dispatcher. Start the dispatcher before you accept connections.
+
+"Worker producer" above means a worker of **this actor's own system**. In a process that isolates two
+systems — a game world and a background-IO pool, the split `JobSystem` exists for — a producer on
+system A's worker used to count as a worker producer for system B's actors too, and flushed them
+inline on A's thread. That is exactly the boundary `Scheduled` is there to hold, so the test is now
+system identity (`ThreadContext.CurrentSystem`) rather than "is any dispatcher's thread"
+(`ThreadContext.IsWorkerThread`). Nothing changes in a single-system process.
+
+## `FanOutToWorkers` — broadcasts
+
+Default `true`. When a job on a worker makes more than one idle actor ready, the first stays on the
+flushing thread and the rest go to the ready queue for other workers to pick up.
+
+Waking one actor from another queues it on a thread-local list, which is the right trade for a single
+hop: no wake-up, no ready-queue round trip, and the flush loop drains that list itself. But the list
+is thread-local, so no other worker can take from it — a zone actor broadcasting to a hundred player
+actors ran all hundred serially on the one thread while the rest of the pool sat idle, and
+`MaxJobsPerFlush` does not help because it bounds one actor's jobs, not the number of *actors* queued
+behind it.
+
+Set it to `false` per actor to keep the old behaviour where single-hop latency matters more than
+parallelism — an actor-to-actor pipeline whose stages are short, for instance. Measure with the
+`ActorRingThroughput` fixture, which parameterises exactly this.
 
 ## `EnableDetailedMetrics`
 
@@ -207,6 +241,19 @@ the slot is logged and restarted like any other.
 The restart log names the actor that was running when the thread died, so a rising `WorkerRestarts`
 is directly actionable.
 
+**The last worker is not given up on.** `KeepLastWorkerAlive` (default true) keeps restarting a slot
+past `MaxRestartsPerWorker` when no other worker is left on the system. The budget is a policy for
+"this slot is bad, the others can carry the load", and with nothing else running there is no load to
+carry: actors already on the ready queue cannot run at all, so their queues grow behind work that
+never happens and their `DisposeAsync` never returns — while brand-new actors flush inline and the
+system looks healthy. Every over-budget attempt is logged as an error. Set it to `false` for the old
+give-up behaviour.
+
+If nothing *is* going to replace the last worker — `KeepLastWorkerAlive = false`,
+`RestartFailedWorkers = false`, or a `JobDispatcher<T>` whose `IRunnable.Run` returned `false` — that
+thread drains whatever is left on the ready queue on its way out, so those actors finish rather than
+being stranded. An orderly `TryStop` skips this: abandoning the queue is the point of one.
+
 `TryStop(joinTimeout)` spends that timeout as **one budget across the whole pool**, not per thread,
 so a pool with several stuck workers gives up when you asked it to. It skips joining the calling
 thread when a job stops its own pool — that join could only ever time out. `TryStopAsync` is the same
@@ -226,11 +273,11 @@ one process stay distinguishable — group or filter on it.
 | `ActorsFaulted` | `jobdispatcher.actors.faulted` | Actors tripped `MaxConsecutiveFailures` and are now refusing everything. | Fix the cause, then `ClearFault()`. Until then every job to that actor is a `Faulted` drop. |
 | `ReadyQueueDepth` | `jobdispatcher.ready.depth` | Work is queued for workers faster than they take it. | Too few workers, or workers are blocked. Cross-check `LiveWorkers` and `jobdispatcher.job.duration`. |
 | `InFlightJobs` | `jobdispatcher.jobs.inflight` | Total admitted-but-not-finished work is growing across the whole system. | System-wide saturation. If `ReadyQueueDepth` is flat while this climbs, the backlog is inside a few deep actor queues — look at each actor's `MaxObservedQueueDepth`. |
-| `LiveWorkers` | `jobdispatcher.workers.live` | *Falling* below the configured count. | A slot exceeded `MaxRestartsPerWorker` and is permanently down; the log names it. Restart the process or raise the budget. |
+| `LiveWorkers` | `jobdispatcher.workers.live` | *Falling* below the configured count. | A slot exceeded `MaxRestartsPerWorker` and is permanently down; the log names it. Restart the process or raise the budget. Reaching **zero** with `ReadyQueueDepth` above zero is logged as an error of its own: those actors are stranded. |
 | `WorkerRestarts` | `jobdispatcher.worker.restarts` | Worker threads are dying. | An exception is escaping `IRunnable.Run`. The log line names the actor that was running. |
 | `PendingTimerJobs` | `jobdispatcher.timers.pending` | Timers are being scheduled faster than they fire, or handles are never cancelled. | Usually leaked `DoAsyncEvery` handles on despawned entities — this is also what makes `StopAsync` time out. |
 | `TimersDiscarded` | `jobdispatcher.timers.discarded` | Timers were dropped because the system was stopping, or because a repeating timer's actor had been disposed. | Expected at shutdown. At runtime it usually means a repeating timer outlived the actor that owned it — harmless now that it retires itself, but a sign of a handle nobody cancelled. |
-| `TimersFired` vs `TotalJobsExecuted` | — | Firings climb while executions do not. | The timer thread is dispatching but the actors are not draining — see `ReadyQueueDepth`. |
+| `TimersFired` vs `TotalJobsExecuted` | — | Firings climb while executions do not. | The timer thread is dispatching but the actors are not draining — see `ReadyQueueDepth`. `TimersFired` counts only firings the actor *accepted*, so a refused one shows in `TotalJobsDropped` instead and this comparison stays honest. |
 | `ActiveJobPoolSize` | `jobdispatcher.pool.size` | Pinned at `Job.MaxPoolSize`. | The pool is saturated and the overflow is going to the GC. Raise `MaxPoolSize` only if gen-0 pressure actually shows in a profile. |
 | `jobdispatcher.job.duration` (detailed) | histogram | p99 far above p50. | A few slow jobs are holding leaders. Set `MaxJobDuration` to get them named in the log. |
 | `jobdispatcher.timer.lag` (detailed) | histogram | Consistently ~15 ms on Windows. | That is the OS timer resolution, not a bug — see [Timers](timers.md#precision). |

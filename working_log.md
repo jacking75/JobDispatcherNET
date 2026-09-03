@@ -1,5 +1,26 @@
 # Working Log
 
+## 2026-09-04 02:12 KST - 후속 리뷰 구현: S1~S21 · S24 · S25 반영
+
+- `docs/review-followup-2026-09-03.md`의 25건 중 **23건을 구현**했다. 테스트 100 → 123개, net8.0/net10.0 · Debug/Release 전부 통과.
+- **S15/S16(회귀, 최우선)**: 드레인이 "요청한 흐름 자신"을 세지 않도록 `AsyncLocal<AsyncExecutable?>`로 async 작업 소유자를 전파. `DisposeAsync`는 자기 async 작업 1건(+Exclusive의 서스펜션 예약)을 면제하고, `DrainAsync`는 자기 시스템의 async 작업 1건을 뺀다. 문서의 1안(진단 예외)과 2안(`AsyncFlowOwner`)은 같은 상황에 다른 결과를 요구하므로 **2안을 기본으로 삼고, 2안이 구제 불가능한 경우(큐에 다른 작업이 남은 Exclusive 액터)에만 1안의 예외**를 남겼다. 같은 인프라로 S9(첫 await 이후 자기 Ask를 못 잡던 가드)도 함께 고쳤다.
+- **S1**: Hosting 확장이 게이트를 열어 둔 채 드레인하도록 되돌리고 `RefuseNewWorkOnShutdown` 옵션 신설. Hosting 패키지에 테스트가 하나도 없어서 생긴 문제라 통합 테스트 2개를 추가했다(기본/옵트인이 서로 다른 결과를 내는지 검증).
+- **S17**: `ObservedJobFailure` 마커 예외 + `Settle` 훅으로 `Ask`/`AskAsync`/`RunAsync` 실패를 메트릭·연속 실패 스트릭에 반영. `OnJobError`는 `RunAsync`만(관측자가 없을 수 있으므로), `Ask` 계열은 `ReportAwaitedFailures`로 옵트인.
+- **S18/S19/S20/S21**: 타이머 예약 시점 상한(`MaxPendingTimers` + `DropReason.TimerQueueFull` + 취소 엔트리 lazy purge), `Scheduled` 판정을 `CurrentSystem` 기준으로(시스템 격리), 마지막 워커는 예산을 넘겨도 재시작(`KeepLastWorkerAlive`) + 교체가 없으면 죽는 스레드가 레디 큐를 비우고 나감, 막힌 드레인의 `PulseAll`을 조건부 `Pulse`로.
+- **S2**: 액터 fan-out의 두 번째부터는 레디 큐로(`FanOutToWorkers`, 기본 true). 문서 권고대로 (a)안이며 액터 단위로 끌 수 있다.
+- **S3·S4·S5·S6·S7·S8·S10~S14·S24·S25**: 스핀의 `Sleep(1)` 제거, `async void` 추적(`OperationStarted/Completed`), `DisposeAsync` 동시 호출 공유 TCS, 풀 상한 배치 올림, 무제한 Sequencer의 공유 RMW 제거, 드레인 델리게이트 캐시, 예외 경로의 서스펜션 회수, `Task.WaitAny` 기반 `AskSync`, 서로게이트 안전 절단, 거부된 tick의 `TimersFired` 제외, `PoolSize` 음수 방지, CAS-Enqueue 사이 실패 시 카운터 복구, 타이머 폴백 경고 재무장.
+- **S22·S23은 코드를 바꾸지 않았다.** 문서가 "측정 후"로 적어 둔 항목이고 그 판단이 옳다 — 엔트리 풀링은 핸들 세대 번호가, thread-static 재구성은 풀 저장 구조 변경이 따라온다. 대신 판단 근거가 될 **벤치마크 하니스 4개**(`ActorRingThroughput`, `SequencerThroughput`, `TimerArmAndCancel`, `JobStateShape`)를 추가했다. S21은 결정적 자동 테스트를 만들 수 없어(프로세스 CPU 측정) 테스트 없이 반영.
+- 문서 6종(shutdown/pitfalls/guarantees/timers/tuning/benchmarks)과 CHANGELOG를 함께 갱신했다.
+
+## 2026-09-03 16:48 KST - 후속 리뷰: A·B·C 반영 이후 안정성·성능 재검토 (`docs/review-followup-2026-09-03.md`)
+
+- 코어 라이브러리 전체와 Hosting 확장을 처음부터 다시 읽어 `aa2483d` 기준으로 리뷰. 코드는 변경하지 않고 발견 14건(S1~S14)을 심각도·위치·재현·수정 코드·테스트 계획과 함께 문서화.
+- High 없음. Medium–High 2건: Hosting 확장이 `refuseNewWork: true`로 종료해 드레인 중 연쇄 작업이 `ShuttingDown`으로 버려지는 문제(S1), 액터→액터 fan-out이 스레드 로컬 `ExecuterQueue`에만 쌓여 워커 풀을 우회하는 설계 한계(S2, 링 벤치마크 평탄 곡선이 근거).
+- Medium: `Flush` 스핀의 `Thread.Sleep(1)` 승격(S3), `async void`/미대기 async 람다가 드레인에 안 보이는 A3의 사각지대(S4), `DisposeAsync` 동시 호출 시 첫 호출자 hang(S5). 나머지는 Medium–Low/Low.
+- 오늘 바꾼 경로의 불변식(드레인 Dekker, Exclusive 상태 머신+async 추적, 타이머 상태 머신, `JobPool` 단일 소유권, lifecycle lock, StopAsync 순서)은 다시 따라가 "문제 없음" 절에 근거와 함께 기록.
+- **2차 패스(2026-09-03 17:15 KST)**: "문제가 있다"는 전제로 다시 검토. 의심 5건을 콘솔 프로브로 전부 재현, 새 결함 3건 추가 — **S15(High, A3 회귀)** Interleaved async 작업 안에서 `await this.DisposeAsync()`가 영원히 hang(드레인이 호출자 자신의 `_pendingAsync`를 기다림), S16 async 작업 안 `await system.StopAsync()`가 타임아웃 전체 소모 후 `drained=false`, S17 `Ask`/`RunAsync` 실패가 `OnJobError`·`TotalJobsFailed`·`MaxConsecutiveFailures`를 우회하고 실패한 `Ask`가 스트릭을 리셋. 각각 재현 출력·원인·수정 코드·테스트를 문서에 추가하고 권장 순서를 S15 → S1 → S17로 조정.
+- **3차 패스(2026-09-03 21:32 KST)**: 앞 두 패스와 다른 종류를 노려 4건 프로브 전부 재현 — S18 `DoAsyncAfter`/`DoAsyncEvery`가 예약 시점에 `MaxQueueSize`를 안 봐 상한 4인 액터에 타이머 10,000개(세션당 무제한 메모리), S19 `Scheduled` 판정이 `IsWorkerThread`라 시스템 B 액터가 시스템 A 워커에서 실행(격리 누수), S20 마지막 워커 영구 정지 시 레디 큐의 액터가 영원히 좌초되는데 새 액터는 inline으로 멀쩡, S21 `DrainAsync`의 2ms `PulseAll`(오늘 A10(d))이 막힌 드레인 동안 8 워커에서 2초에 CPU 94ms. 관찰 4건(S22 타이머 락·할당, S23 공유 제네릭 thread-static 비용, S24 CAS-Enqueue 사이 OOM, S25 죽은 상태/영구 침묵 플래그) 추가. 총 25건.
+
 ## 2026-09-03 16:13 KST - 리뷰 C1~C6 성능 개선 (C4는 측정 후 보류)
 
 - 먼저 리뷰의 측정 조건(8생산자×250k, 액터 1000개 / 링 64×16)을 재현하는 하니스를 만들어 기준선을 측정한 뒤 변경했다. 각 셀은 워밍업 후 7회 중앙값.

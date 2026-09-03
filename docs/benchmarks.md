@@ -101,6 +101,21 @@ dequeue after that. Changing a public contract and rewriting the queue that ADR 
 invariant rests on, for a difference this measurement cannot even sign, is not a trade worth making.
 Revisit if a profile on real work shows the actor queue near the top.
 
+## Fixtures added by the follow-up review
+
+Four of the items in [`review-followup-2026-09-03.md`](review-followup-2026-09-03.md) are performance
+questions that a number should decide rather than an argument. These fixtures exist to produce those
+numbers; none of them has been run properly yet, so nothing here is published as a result.
+
+| Fixture | Item | Question |
+|---|---|---|
+| `ActorRingThroughput` | S2 | Does actor→actor fan-out scale with the pool? 64 independent rings across 1/4/8 workers, with `FanOutToWorkers` both ways. The ring row below is flat across worker counts, which is the symptom the fix targets — this fixture is what confirms or refutes it. |
+| `SequencerThroughput` | S7 | Cost per item through one sequencer, unbounded vs bounded. The bounded cell is the control and should not move. |
+| `TimerArmAndCancel` | S22 | The timer service's single lock and its unpooled entries. Read the curve across 1/4/8 arming threads for the lock, the allocation column for the entries. **No change has been made here** — pooling `TimerEntry` needs generation numbers on the handle to keep a stale `Cancel()` from cancelling somebody else's timer, and that is not worth doing on a hunch. |
+| `JobStateShape` | S23 | `DoAsync(static a => …, this)` against `DoAsync(static t => …, (Self: this, X: x))`. A reference-typed `TState` compiles to shared generic code, so the pool's `[ThreadStatic]` costs a generic dictionary lookup per access; a value-typed one is specialised. Both idioms are documented side by side, and the gap is the cost of picking the first. **No change made** — moving the thread-local storage out of the generic type is a real change to the pool and wants this measurement first. |
+
+The C1 numbers below were taken with the reference-typed idiom, so they already include the S23 cost.
+
 ## Scenarios
 
 | Scenario | Metric | Result |

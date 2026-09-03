@@ -101,6 +101,30 @@ A job that throws is caught inside the flush loop. Concretely:
 
 An exception thrown by `OnJobError` itself is caught and logged; it cannot take the worker down.
 
+### Failures of the request/response and async APIs
+
+`Ask`, `AskAsync` and `RunAsync` hand their exception to the caller through the returned task. That
+used to be *all* they did: the job looked like a success to the flush loop, so `TotalJobsFailed`
+never moved, `OnJobError` was never called, and — worst of it — the failure **reset** the
+consecutive-failure streak, so an actor with a failing `Ask` between its failing `DoAsync`s could
+never reach `IsFaulted`. Now:
+
+| API | returned task | `TotalJobsFailed` | streak | `OnJobError` |
+|---|---|---|---|---|
+| `DoAsync` | — | ✓ | ✓ | ✓ |
+| `RunAsync` | faulted | ✓ | ✓ | ✓ |
+| `Ask` / `AskAsync` | faulted | ✓ | ✓ | only with `JobOptions.ReportAwaitedFailures` |
+
+`RunAsync` reports to `OnJobError` because it returns no value and is commonly fire-and-forget: a
+failure it does not report is recorded nowhere at all. `Ask`/`AskAsync` do not, because their caller
+is by construction awaiting the exception and reporting it again would report it twice — set
+`ReportAwaitedFailures` if you would rather have both.
+
+One caveat on the streak for async jobs: the state-machine step that *starts* the job counts as a
+success when it returns its task, so a `RunAsync` whose failure arrives later contributes a success
+and then a failure. It is the price of counting the failure at all, and it only matters when
+`MaxConsecutiveFailures` is set very low.
+
 An exception escaping a `JobSystem.Post` action, or escaping a flush pulled off the ready queue, is
 caught in `JobSystem.DrainReady`, logged, and forwarded to `AsyncExecutable.OnError`.
 
@@ -134,6 +158,7 @@ already `false`. The reasons, from `DropReason`:
 | `ShuttingDown` | `JobSystem.AcceptingWork` is false (set by `StopAsync`, `Dispose`, or by you). |
 | `Disposed` | The actor's `DisposeAsync` has completed. |
 | `Faulted` | The actor tripped `MaxConsecutiveFailures`. |
+| `TimerQueueFull` | The actor already has `JobOptions.MaxPendingTimers` timers armed. Only from `DoAsyncAfter`/`DoAsyncEvery` — see [Timers](timers.md#bounding-armed-timers). |
 
 Every refusal increments `TotalJobsDropped`. With `DropPolicy.Reject` (the default) your
 `JobOptions.OnDropped(AsyncExecutable actor, DropReason reason)` callback also runs, on the producer's
@@ -189,6 +214,26 @@ faulted checks, and runs whatever the actor's state. Two consequences worth know
   `await`, and both `DrainAsync` and `AsyncExecutable.DisposeAsync` block until it reaches zero — so
   the workers are still there when the continuation lands. An `await` that never completes therefore
   costs you the whole drain timeout; see [Shutdown](shutdown.md).
+
+#### What the drain can and cannot see
+
+The counter is fed by `RunAsync`/`AskAsync`, which hand it a task to watch, and by the `async void`
+notifications the compiler sends through the actor's `SynchronizationContext`. It cannot see an async
+lambda nobody awaits:
+
+```csharp
+actor.RunAsync(() => SaveAsync());       // counted
+actor.DoAsync(() => HandleAsync());      // counted (async void)
+actor.DoAsync(() => _ = SaveAsync());    // NOT counted — nothing reports it
+```
+
+The third line's continuation still comes back onto the actor, past the bound and past the disposed
+check, but no drain waits for it: shutdown can stop the workers and dispose the actor with that
+continuation still on its way. Wrap it in `RunAsync`.
+
+A drain requested from inside one of the actor's own async jobs does not count that job — otherwise
+`await DisposeAsync()` inside `RunAsync` would wait for itself forever. See
+[Shutdown](shutdown.md#disposing-an-actor-from-inside-its-own-async-job).
 
 ### `AsyncReentrancy.Exclusive`
 

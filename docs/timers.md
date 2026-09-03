@@ -61,6 +61,40 @@ time, a `Cancel()` from inside one of its own jobs is committed before any queue
 turn, so **no tick runs after the despawn** — you do not need a `_despawned` flag as well
 (`TimerTests.CancellingARepeatingTimerDropsATickAlreadyQueuedOnTheActor`).
 
+## Bounding armed timers
+
+An armed timer holds no slot on the actor's queue — it takes one only when it fires — so
+`JobOptions.MaxQueueSize` does not bound it. A client that arms a cooldown timer per packet, the
+pattern this page recommends, could therefore grow the timer heap without limit against an actor with
+a queue bound of four: an entry plus its payload job for every one, and the bound only started
+dropping things thirty seconds later when they came due.
+
+`JobOptions.MaxPendingTimers` bounds them at the moment they are armed. It defaults to
+`MaxQueueSize`, so setting one number covers both, and `null` on an unbounded actor stays unbounded.
+
+```csharp
+new JobOptions
+{
+    MaxQueueSize = 256,
+    MaxPendingTimers = 32,      // separate budget; omit to follow MaxQueueSize
+    OnDropped = (actor, reason) =>
+    {
+        if (reason == DropReason.TimerQueueFull)
+            metrics.CooldownTimersRefused.Add(1);
+    },
+}
+```
+
+Over the bound, `DoAsyncAfter`/`DoAsyncEvery` return a handle that is already `IsPending == false`
+and report `DropReason.TimerQueueFull` through `OnDropped`
+(`TimerBoundAndIsolationTests.TimersRespectTheActorsBound`). A repeating timer counts as one for its
+whole life, the same rule `PendingTimerCount` uses; a one-shot gives its slot back when it fires, and
+a cancel gives it back immediately. `AsyncExecutable.PendingTimerCount` reports the current figure.
+
+Separately, cancelled entries stay on the heap until their due time (ADR 0003). Arm-and-cancel
+traffic therefore used to grow it without limit; the service now rebuilds the heap without its dead
+entries once they outnumber the live ones, which keeps it to a constant factor of the live count.
+
 ## `DoAsyncEvery` versus the self-rescheduling idiom
 
 The old idiom was a job that re-armed itself at the end:
@@ -183,7 +217,7 @@ the normal admission path:
 
 | Counter | Meaning |
 |---|---|
-| `TimersFired` | Firings dispatched to an actor (a repeating timer contributes one per tick). Counts the hand-off, so a firing later claimed by `Cancel()` is counted here and in `TimersCancelled`. |
+| `TimersFired` | Firings the owning actor **accepted** (a repeating timer contributes one per tick). Counts the hand-off, so a firing later claimed by `Cancel()` is counted here and in `TimersCancelled`. A firing the actor refused — full queue, faulted, disposed, system stopping — is *not* counted here; it is a `TotalJobsDropped`. |
 | `TimersCancelled` | `Cancel()` calls that kept a callback from running, whether or not it had already been dispatched. |
 | `TimersDiscarded` | Timers thrown away because the service was stopping, scheduled after it stopped, or — for a repeating timer — retired because its actor had been disposed. |
 | `PendingTimerJobs` / `JobSystem.PendingTimerCount` | Scheduled and not yet fired. Repeating timers count as 1 each. |

@@ -13,7 +13,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<!-- The items marked "follow-up review" come from docs/review-followup-2026-09-03.md, a second
+     pass over the library after the A/B/C review landed. Two of them are regressions that pass
+     introduced. -->
+
 ### Performance
+
+- **Actor-to-actor fan-out now uses the worker pool.** Waking an idle actor from inside a job queued
+  it on a *thread-local* list, so nothing else could take it: a zone actor broadcasting to a hundred
+  player actors ran all hundred serially on the one worker while the rest of the pool sat idle, and
+  `MaxJobsPerFlush` did not help because it bounds one actor's jobs rather than the number of actors
+  queued behind it. The first actor a flush makes ready still stays local — one hop, no wake-up — and
+  the rest go to the ready queue. `JobOptions.FanOutToWorkers = false` keeps the old behaviour per
+  actor. The `ActorRingThroughput` fixture parameterises exactly this comparison. (follow-up review,
+  S2)
+- **A blocked drain no longer wakes every idle worker 500 times a second.** The polling loop in
+  `DrainAsync` inherited `SignalAllWork` from the shutdown join, so for as long as a drain was stuck —
+  an uncancelled repeating timer, a 30-second drain timeout — it pulsed the whole pool every 2 ms. It
+  now pulses a single waiter, and only when the ready queue actually has something to take.
+  (follow-up review, S21 — introduced earlier in this same Unreleased block)
+- **An unbounded `Sequencer<T>` keeps no pending counter.** Adding `maxPending` gave every sequencer a
+  shared read-modify-write per item — raised by the producing IO thread, lowered by the consuming
+  worker — which is the cache-line ping-pong the job-pool change had just removed elsewhere. Only a
+  bounded sequencer needs exact accounting; an unbounded one now writes nothing, and its
+  `PendingCount` falls back to the queue's own count. (follow-up review, S7 — introduced earlier in
+  this same Unreleased block)
+- **The flush loop's spin no longer reaches `Thread.Sleep(1)`.** It waits for a producer caught
+  between its CAS and its enqueue — nanoseconds unless that producer was pre-empted — but
+  `SpinWait.SpinOnce()` starts mixing in a sleep from its twentieth call, which on stock Windows is a
+  15.6 ms timer tick. The leader ran nothing for that whole tick: not the actor's remaining jobs, and
+  not the other actors queued behind it on that thread. (follow-up review, S3)
+- **`Job.MaxPoolSize` below 32 no longer switches the shared pool off.** The cap was compared in whole
+  batches of 32 and truncated, so anything under 32 allowed zero batches: same-thread rent/recycle
+  kept working while every cross-thread path (`Scheduled` actors, timer firings) allocated a fresh job
+  every time, with no error and nothing in the documentation to explain it. The cap now rounds up —
+  1 to 32 all mean one batch. (follow-up review, S6)
+- **The timer heap drops cancelled entries once they outnumber the live ones.** A cancelled timer stays
+  on the heap until its due time, so arm-and-cancel traffic against a long delay grew it without
+  limit, and every insert is O(log n) under the one lock every actor's scheduling shares. (follow-up
+  review, S18)
+- Smaller: `Sequencer` caches its drain delegate instead of allocating one per scheduled drain (S8);
+  `AskSync` waits with `Task.WaitAny` rather than building a `ManualResetEvent` per slow call and
+  leaving it for the finalizer (S11); `ThreadContext.TickCount` is only refreshed when
+  `EnableDetailedMetrics` is on, since nothing in the library reads it (S25).
 
 - **The `Job` pool no longer serialises every thread on one cache line.** `ConcurrentBag` plus a
   shared `long` counter put three read-modify-writes on one process-wide line into every single job:
@@ -69,6 +111,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`await this.DisposeAsync()` inside an actor's own async job hung forever.** "Save, then retire me"
+  is a routine shape for a session actor, and once the drain started waiting for async jobs it was
+  waiting for the very job that was awaiting it — a cycle with no timeout on the parameterless
+  overload. The drain now excuses the async flow that requested it (its pending job, plus the queue
+  reservation an `Exclusive` actor's suspension holds), so it completes once everything *else* is
+  done. The one arrangement that cannot be rescued — an `Exclusive` actor doing this with other jobs
+  still queued, which genuinely cannot make progress — throws an `InvalidOperationException` naming
+  the problem instead of hanging. (follow-up review, S15 — a regression introduced earlier in this
+  same Unreleased block)
+- **`await system.StopAsync(t)` inside an async job spent the whole drain timeout and reported
+  failure.** Same cause as above at system scope: the drain counted the job that had asked for it.
+  `DrainAsync` now excludes its own caller's async job, and logs a warning suggesting the shutdown be
+  started from outside the job system. (follow-up review, S16 — same regression)
+- **Two concurrent `DisposeAsync` calls left the first one waiting forever.** The second overwrote the
+  first's `TaskCompletionSource` with `Interlocked.Exchange`, and only the one stored last was ever
+  signalled — a session closed by its socket and by an admin kick at the same moment is not a rare
+  thing on a real server. Later callers now join the wait with a `CompareExchange` instead of
+  replacing it. (follow-up review, S5)
+- **The Generic Host integration shut down with the gate closed first**, the opposite of the contract
+  `JobSystem.StopAsync` and `docs/shutdown.md` document — so on the library's own recommended wiring
+  every despawn cascade was refused at its first hop with `ShuttingDown`, and sequencer drains with
+  it. It now drains with the gate open; `JobDispatcherBuilderOptions.RefuseNewWorkOnShutdown` opts
+  back in. There were no tests over the Hosting package at all, which is how this got there; there
+  are now. (follow-up review, S1)
+- **Failures of `Ask`, `AskAsync` and `RunAsync` were invisible to every failure mechanism.** Their
+  exception goes to the caller through the returned task, and the job therefore looked like a success
+  to the flush loop: `TotalJobsFailed` never moved, `OnJobError` was never called, and the failure
+  *reset* the consecutive-failure streak — so an actor with a failing `Ask` between its failing
+  `DoAsync`s could never reach `IsFaulted`. A fire-and-forget `RunAsync` that threw was recorded
+  nowhere at all. All three now count towards `TotalJobsFailed` and the streak; `RunAsync` also calls
+  `OnJobError`, and `JobOptions.ReportAwaitedFailures` opts `Ask`/`AskAsync` in. (follow-up review,
+  S17)
+- **The `Exclusive` self-`Ask` guard stopped working at the first `await`.** It compared against the
+  thread-local "actor running here", which goes blank the moment a job awaits, so a job that awaited
+  anything and then asked itself walked straight past it into the deadlock the guard exists to
+  prevent. It now also follows the async flow. (follow-up review, S9)
+- **A drain could not see an `async void` called from a job.** An interleaved actor installs a
+  synchronization context around every job, so such a method resumes back onto the actor — but it
+  handed the drain no task, so shutdown could declare the system idle, stop the workers and let the
+  continuation resume against a disposed actor. The context now implements
+  `OperationStarted`/`OperationCompleted`, which the compiler's `async void` machinery calls. An async
+  lambda nobody awaits (`_ = SaveAsync()`) still cannot be seen by anything; the documentation says so
+  in both places. (follow-up review, S4)
+- **`ExecutionMode.Scheduled` did not respect the boundary between two job systems.** The test was
+  "is this any dispatcher's worker thread", so in a process that isolates a game world from a
+  background-IO pool, a producer on system A's worker flushed system B's `Scheduled` actor inline on
+  A's thread — precisely the boundary `Scheduled` exists to hold. It now asks whether the thread
+  belongs to *this actor's* system. No change in a single-system process. (follow-up review, S19)
+- **The last worker was abandoned like any other.** A slot that exceeded `MaxRestartsPerWorker` was
+  left permanently down, and when it was the only one left, every actor already on the ready queue
+  became unrunnable: posts queued behind work that would never happen and `DisposeAsync` never
+  returned, while brand-new actors flushed inline and made the system look healthy — a partial failure
+  nobody would notice. The last worker is now restarted past the budget
+  (`JobDispatcherOptions.KeepLastWorkerAlive`, default true, logging every over-budget attempt); a
+  last worker that really is going away drains the ready queue on its way out; and the live count
+  reaching zero with a non-empty ready queue is logged as an error. (follow-up review, S20)
+- **Armed timers ignored the actor's bound.** A timer holds no queue slot until it fires, so
+  `MaxQueueSize` did not bound it: a client arming a cooldown timer per packet grew the timer heap
+  without limit against an actor bounded at four, and the bound only started dropping things when they
+  came due — long after the memory had been spent. `JobOptions.MaxPendingTimers` (defaulting to
+  `MaxQueueSize`) bounds them at the moment they are armed, reporting the new
+  `DropReason.TimerQueueFull`. (follow-up review, S18)
+- **A timer firing the actor refused was still counted as fired.** `TimersFired` moved for firings
+  dropped as `QueueFull`, `Faulted` or `ShuttingDown`, which made the documented "`TimersFired`
+  climbing while `TotalJobsExecuted` does not" diagnosis point at the wrong thing entirely. It now
+  counts firings the actor accepted; a refusal is a `TotalJobsDropped`, as it always was. (follow-up
+  review, S13)
+- **An actor name could be truncated through a surrogate pair.** The 128-character cap could leave an
+  orphaned high surrogate, which a UTF-8 log encoder either replaces with U+FFFD or, configured
+  strictly, throws on — from inside the logger, on a worker thread. An emoji in a player nickname is
+  all it took. (follow-up review, S12)
+- Defensive, none reachable today but each a live wire for the next change: a job counted but never
+  written — an `OutOfMemoryException` from the queue's segment allocation between the admission CAS
+  and the enqueue — is now un-counted rather than left for a leader to spin on forever (S24); an
+  exception escaping the accounting *around* a job no longer strands an `Exclusive` suspension
+  reservation with nobody left to park for it (S10); `JobPool.PoolSize` cannot read negative when a
+  test helper's `Clear()` races a `Take()` (S14); and the one-shot timer-fallback warning is re-armed
+  when workers come back, so a restart backoff that briefly empties the pool no longer spends it (S25).
 - **`await actor.DisposeAsync()` could wait forever.** The drain handshake had the disposer publish
   its `TaskCompletionSource` with a release store and then read the job counter, while the thread
   finishing the last job did the reverse. Store-load is the one reordering x64 still permits, so
@@ -144,6 +264,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Timers are bounded by the actor's queue bound by default.** `JobOptions.MaxPendingTimers` falls
+  back to `MaxQueueSize`, so an actor that already sets a queue bound and arms more timers than that
+  at once starts seeing `DropReason.TimerQueueFull`. Set `MaxPendingTimers = 0` for the old unbounded
+  behaviour, or a number of its own. (follow-up review, S18)
+- **The Generic Host integration drains with the shutdown gate open**, which is what
+  `docs/shutdown.md` always described. Hosts that relied on the previous behaviour should set
+  `RefuseNewWorkOnShutdown = true`. (follow-up review, S1)
+- **`TimersFired` counts firings the actor accepted**, not hand-offs it refused. (follow-up review, S13)
+- **`ThreadContext.TickCount` is only refreshed while `EnableDetailedMetrics` is on.** It is a
+  diagnostic nothing in the library reads, and refreshing it cost a timestamp read per worker
+  iteration. (follow-up review, S25)
 - **`ITimerHandle.Cancel()` returns `true` in more cases.** It now means "the callback will not run",
   rather than "the timer had not been dispatched yet"; `false` is reserved for a callback that has
   already run or a handle already cancelled. Cancelling from inside one of the owner's own jobs is
@@ -196,6 +327,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`JobSystemOptions.MinTimerPeriod`** (default 1 ms) — floor for `DoAsyncEvery`.
 - **`JobDispatcherOptions.SpinBeforeParkIterations`** (default 10) — how long a worker looks for work
   before parking on the monitor.
+- **`JobOptions.MaxPendingTimers`** and **`DropReason.TimerQueueFull`** — a bound on timers armed and
+  not yet fired, which `MaxQueueSize` cannot cover because an armed timer holds no queue slot.
+  Defaults to `MaxQueueSize`. `AsyncExecutable.MaxPendingTimers` and
+  `AsyncExecutable.PendingTimerCount` report it. (follow-up review, S18)
+- **`JobOptions.FanOutToWorkers`** (default true) — hand the extra actors a job makes ready to the
+  worker pool rather than running them all on the flushing thread. (follow-up review, S2)
+- **`JobOptions.ReportAwaitedFailures`** (default false) — also route `Ask`/`AskAsync` failures
+  through `OnJobError`, on top of the metrics and streak they now always feed. (follow-up review, S17)
+- **`JobDispatcherOptions.KeepLastWorkerAlive`** (default true) — keep restarting a crashing worker
+  past `MaxRestartsPerWorker` while it is the only one left on the system. (follow-up review, S20)
+- **`JobDispatcherBuilderOptions.RefuseNewWorkOnShutdown`** (default false) — close the shutdown gate
+  before draining rather than after, in the Generic Host integration. (follow-up review, S1)
 
 ## [0.10.0] - 2026-08-31
 

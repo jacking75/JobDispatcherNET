@@ -293,6 +293,11 @@ HTTP call with no timeout is the usual one. The drain waits for it on purpose (s
 underneath a pending continuation is worse), so the fix is to give the awaited operation a
 `CancellationToken` and cancel it before shutting down.
 
+**A third shape** used to be self-inflicted: `await system.StopAsync(t)` from *inside* an async job
+counted that job among the ones it was waiting for, so every shutdown spent the full timeout and
+reported failure. The drain now excludes its own caller. Prefer starting the shutdown from outside
+the job system anyway — see [Shutdown](shutdown.md#starting-a-shutdown-from-inside-a-job).
+
 ---
 
 ## 10. A timer tick runs after the entity despawned
@@ -343,8 +348,46 @@ else until that job finishes. The job is waiting for a queue it has itself stopp
 `AsyncReentrancy.Interleaved`, whose queue keeps moving during an await. With
 `JobSystemOptions.DetectBlockingWaitOnWorker` on (the default in DEBUG builds) the library throws an
 `InvalidOperationException` at the `Ask` instead of letting you find out in production
-(`AsyncJobTests.AnExclusiveActorAskingItselfIsRefusedInsteadOfDeadlocking`). `RunAsync` on yourself
-has the same shape, but is not guarded — a fire-and-forget self-`RunAsync` is legitimate.
+(`AsyncJobTests.AnExclusiveActorAskingItselfIsRefusedInsteadOfDeadlocking`,
+`SelfDrainTests.SelfAskIsCaughtAfterTheFirstAwaitToo`). `RunAsync` on yourself has the same shape,
+but is not guarded — a fire-and-forget self-`RunAsync` is legitimate.
+
+The guard asks two questions, because for a while it only asked one. "Is this actor running on this
+thread" is thread-local and goes blank at the first `await`, so a job that awaited anything and *then*
+asked itself walked straight past it. It now also follows the async flow, so the self-`Ask` below is
+caught as well:
+
+```csharp
+RunAsync(async () =>
+{
+    await Task.Delay(1);        // the old guard stopped seeing the actor here
+    await Ask(() => 1);         // …and this hung silently
+});
+```
+
+---
+
+## 12a. `async void` inside a job
+
+**Symptom.** Shutdown reports a clean drain, the workers stop, and *then* a continuation runs — on a
+thread-pool thread, against an actor that has already been disposed.
+
+**Cause.** An interleaved actor installs a `SynchronizationContext` around every job, so an
+`async void` method a job calls resumes back on the actor. `RunAsync`/`AskAsync` hand the drain a
+task to wait on; an `async void` hands it nothing.
+
+**Fix.** The library now hooks `OperationStarted`/`OperationCompleted`, which the compiler's
+`async void` machinery calls, so a drain does wait for those
+(`SelfDrainTests.DrainWaitsForAsyncVoidContinuations`). What it still cannot see is an async lambda
+nobody awaits:
+
+```csharp
+actor.DoAsync(() => _ = SaveAsync());   // invisible to the drain — nothing reports it
+actor.RunAsync(() => SaveAsync());      // do this instead
+```
+
+`async void` also swallows its own exceptions, so `RunAsync` is the better shape regardless. Keep it
+for event-handler signatures that leave you no choice.
 
 ---
 

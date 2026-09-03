@@ -68,8 +68,47 @@ are what performs the drain.
 Pass it when external producers must be cut off *before* draining — a crash-stop, a health-check
 failure, or when the process is being killed and you only care about finishing what is already
 queued. The cost is that cascading work is refused too, so shutdown logic that posts jobs (despawn
-broadcasts, "player left" notices) will be dropped. For an orderly shutdown, leave it `false` and
+broadcasts, "player left" notices) will be dropped. `Sequencer` drains go the same way, because they
+are scheduled through `JobSystem.Post`, which sees the same gate — a session's final disconnect
+marker is exactly the kind of thing that gets lost. For an orderly shutdown, leave it `false` and
 stop your *external* input yourself first, as the sample below does.
+
+### With the Generic Host
+
+`AddJobDispatcher` registers a hosted service that calls `StopAsync(drainTimeout)` with the gate
+**open**, matching the contract above. Until the follow-up review it passed `refuseNewWork: true`,
+so the library's own recommended wiring did the opposite of what this page promised and every
+despawn cascade died at its first hop.
+
+```csharp
+services.AddJobDispatcher(o =>
+{
+    o.ShutdownDrainTimeout = TimeSpan.FromSeconds(30);
+    o.RefuseNewWorkOnShutdown = true;   // opt back in
+});
+```
+
+Leave `RefuseNewWorkOnShutdown` off unless work can still arrive from a source the host does not
+control: by the time the hosted service's `StopAsync` runs, the host has already stopped accepting
+connections, so there is nothing left to slam the door on.
+
+### Starting a shutdown from inside a job
+
+`StopAsync` and `DrainAsync` wait for every async job on the system, and an async job that awaits one
+of them is a job waiting for itself. The drain now excludes its own caller, so this no longer burns
+the whole timeout and reports a failed drain — but the tidier shape is to start it and let the job
+finish:
+
+```csharp
+admin.RunAsync(async () =>
+{
+    await BroadcastShutdownNoticeAsync();
+    _ = system.StopAsync(TimeSpan.FromSeconds(30));   // start it; do not await from in here
+});
+```
+
+Best of all, call it from outside the job system altogether — the host, a signal handler, a console
+loop.
 
 ### `DrainAsync` on its own
 
@@ -107,6 +146,29 @@ later `DoAsync` returns `false` with `DropReason.Disposed`
 Something must still be draining that actor while you await: with the dispatcher already gone and no
 leader running, the wait can only time out at whatever level you wrap it in. Retire actors **before**
 stopping the system, not after.
+
+Two callers may dispose the same actor at once — a session closed by its socket and by an admin kick
+in the same instant — and both waits complete.
+
+#### Disposing an actor from inside its own async job
+
+"Save, then retire me" is a routine shape, and it works:
+
+```csharp
+session.RunAsync(async () =>
+{
+    await SaveAsync();
+    await DisposeAsync();          // fine: the drain does not wait for its own caller
+});
+```
+
+The drain excuses the async job that asked for it, so it completes once everything *else* the actor
+had is done. The one arrangement that cannot work is an `AsyncReentrancy.Exclusive` actor doing this
+with other jobs still queued: an Exclusive actor runs nothing else until the async job returns, so
+the drain waits for jobs that are waiting for the drain. That throws an `InvalidOperationException`
+naming the problem rather than hanging (under `JobSystemOptions.DetectBlockingWaitOnWorker`, on in
+DEBUG builds). Start the dispose without awaiting it — `_ = DisposeAsync();` — and let the job
+return.
 
 ### `TryStop` on a dispatcher
 
