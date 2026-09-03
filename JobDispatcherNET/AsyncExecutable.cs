@@ -37,23 +37,45 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
     private static Action<Exception>? _globalOnError;
 
+    /// <summary>
+    /// The actor whose async job the current asynchronous flow belongs to, or <c>null</c>.
+    ///
+    /// <para>Unlike <see cref="ThreadContext.CurrentExecuter"/> — a <c>[ThreadStatic]</c> that goes
+    /// blank the moment a job hits its first <c>await</c> — this rides the <see cref="ExecutionContext"/>
+    /// and so survives every continuation of the job that set it. It is what lets a drain tell
+    /// "somebody else is waiting on this actor" from "the caller *is* the work being waited for".</para>
+    ///
+    /// <para>Written only on the async-job path: an <see cref="AsyncLocal{T}"/> store copies the
+    /// execution context, which is not a cost the synchronous <c>DoAsync</c> path should pay.</para>
+    /// </summary>
+    private static readonly AsyncLocal<AsyncExecutable?> AsyncFlowOwnerSlot = new();
+
     private readonly ConcurrentQueue<JobEntry> _queue = new();
     private readonly JobSystem _system;
     private readonly JobOptions _options;
     private readonly int _maxQueueSize;
+    private readonly int _maxPendingTimers;
     private readonly ExecutionMode _mode;
     private readonly int _maxJobsPerFlush;
     private readonly int _maxConsecutiveFailures;
     private readonly AsyncReentrancy _reentrancy;
+    private readonly bool _fanOutToWorkers;
+    private readonly bool _reportAwaitedFailures;
     private readonly ActorSynchronizationContext? _syncContext;
 
     private int _remainingTaskCount;
     private int _pendingAsync;
+    private int _pendingTimers;
     private int _consecutiveFailures;
     private int _maxObservedQueueDepth;
     private int _faulted;
     private int _completed;
     private int _suspendState;
+
+    // Work the pending drain is not waiting for because the caller that asked for the drain *is*
+    // that work. Raised with a full fence before the counters are read; see DrainThenCompleteAsync.
+    private int _drainExcusedTasks;
+    private int _drainExcusedAsync;
 
     // Not volatile: the drain handshake fences explicitly on both sides. See DisposeAsync()
     // and SignalDrainedIfIdle().
@@ -73,10 +95,20 @@ public abstract class AsyncExecutable : IAsyncDisposable
         // configured, which is where an unbounded queue usually turns into an OOM.
         var bound = options.MaxQueueSize ?? _system.Options.DefaultMaxQueueSize;
         _maxQueueSize = bound is int max && max > 0 ? max : 0;
+
+        // Timers sit outside the queue until they fire, so without a bound of their own a client
+        // that arms one per packet grows the timer heap without limit however small the queue
+        // bound is. Defaulting to the queue bound keeps a single number in the common case.
+        _maxPendingTimers = options.MaxPendingTimers is int timerMax
+            ? (timerMax > 0 ? timerMax : 0)
+            : _maxQueueSize;
+
         _mode = options.Mode;
         _maxJobsPerFlush = options.MaxJobsPerFlush > 0 ? options.MaxJobsPerFlush : int.MaxValue;
         _maxConsecutiveFailures = Math.Max(0, options.MaxConsecutiveFailures);
         _reentrancy = options.AsyncReentrancy;
+        _fanOutToWorkers = options.FanOutToWorkers;
+        _reportAwaitedFailures = options.ReportAwaitedFailures;
         Name = SanitizeName(options.Name ?? GetType().Name);
 
         if (_reentrancy == AsyncReentrancy.Interleaved)
@@ -96,6 +128,16 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public int? MaxQueueSize => _maxQueueSize == 0 ? null : _maxQueueSize;
 
     /// <summary>
+    /// The bound on armed-but-not-yet-fired timers actually in force:
+    /// <see cref="JobOptions.MaxPendingTimers"/> if the actor set one, otherwise
+    /// <see cref="MaxQueueSize"/>. <c>null</c> is unbounded.
+    /// </summary>
+    public int? MaxPendingTimers => _maxPendingTimers == 0 ? null : _maxPendingTimers;
+
+    /// <summary>Timers armed on this actor that have not yet fired or been cancelled.</summary>
+    public int PendingTimerCount => Volatile.Read(ref _pendingTimers);
+
+    /// <summary>
     /// Names go straight into log lines, and a server that names actors after player-supplied
     /// nicknames would otherwise let a newline in a nickname forge a whole log entry. Control
     /// characters become <c>?</c> and the name is capped at 128 characters, which is more than
@@ -105,7 +147,15 @@ public abstract class AsyncExecutable : IAsyncDisposable
     {
         const int maxLength = 128;
 
-        var capped = name.Length <= maxLength ? name : name[..maxLength];
+        // Cut one char earlier when the cap would split a surrogate pair. An orphaned surrogate is
+        // not valid UTF-16, and a UTF-8 log encoder either replaces it with U+FFFD or, when it was
+        // configured to be strict, throws — from inside the logger, on a worker thread. Emoji in a
+        // player nickname is all it takes.
+        var cut = name.Length > maxLength && char.IsHighSurrogate(name[maxLength - 1])
+            ? maxLength - 1
+            : maxLength;
+
+        var capped = name.Length <= maxLength ? name : name[..cut];
 
         char[]? scrubbed = null;
         for (var i = 0; i < capped.Length; i++)
@@ -140,6 +190,19 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// <summary>Nothing queued, nothing in flight, and no async job parked on an await.</summary>
     private bool IsIdle =>
         Volatile.Read(ref _remainingTaskCount) == 0 && Volatile.Read(ref _pendingAsync) == 0;
+
+    /// <summary>
+    /// Idle as far as a pending drain is concerned.
+    ///
+    /// <para>Identical to <see cref="IsIdle"/> unless the drain was requested from inside one of
+    /// this actor's own async jobs, in which case that job is excused: a drain that waited for its
+    /// own caller would wait forever, because the caller is waiting for the drain. The excuse is
+    /// published with a full fence before either counter is read, so a thread on its way to
+    /// <see cref="SignalDrainedIfIdle"/> cannot act on a stale zero.</para>
+    /// </summary>
+    private bool IsDrainSatisfied =>
+        Volatile.Read(ref _remainingTaskCount) <= Volatile.Read(ref _drainExcusedTasks)
+        && Volatile.Read(ref _pendingAsync) <= Volatile.Read(ref _drainExcusedAsync);
 
     /// <summary>
     /// True once <see cref="JobOptions.MaxConsecutiveFailures"/> consecutive jobs threw.
@@ -192,7 +255,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public ITimerHandle DoAsyncAfter(TimeSpan delay, Action action)
     {
         ArgumentNullException.ThrowIfNull(action);
-        if (!TryReserve(out var reason))
+        if (!TryReserve(out var reason) || !TryReserveTimer(ref reason))
         {
             Refuse(reason);
             return CancelledTimer.Instance;
@@ -204,7 +267,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public ITimerHandle DoAsyncAfter<TState>(TimeSpan delay, Action<TState> action, TState state)
     {
         ArgumentNullException.ThrowIfNull(action);
-        if (!TryReserve(out var reason))
+        if (!TryReserve(out var reason) || !TryReserveTimer(ref reason))
         {
             Refuse(reason);
             return CancelledTimer.Instance;
@@ -223,13 +286,57 @@ public abstract class AsyncExecutable : IAsyncDisposable
     public ITimerHandle DoAsyncEvery(TimeSpan period, Action action, TimeSpan? initialDelay = null)
     {
         ArgumentNullException.ThrowIfNull(action);
-        if (!TryReserve(out var reason))
+        if (!TryReserve(out var reason) || !TryReserveTimer(ref reason))
         {
             Refuse(reason);
             return CancelledTimer.Instance;
         }
-        return _system.Timers.ScheduleRepeating(this, period, initialDelay ?? period, action);
+
+        try
+        {
+            return _system.Timers.ScheduleRepeating(this, period, initialDelay ?? period, action);
+        }
+        catch
+        {
+            // ScheduleRepeating validates the period and throws, so the slot claimed above would
+            // otherwise leak one per rejected call — and a period comes from configuration or, worse,
+            // from client input.
+            OnTimerRetired();
+            throw;
+        }
     }
+
+    /// <summary>
+    /// Claim one slot under <see cref="MaxPendingTimers"/>. A CAS rather than increment-then-check,
+    /// for the same reason <see cref="Admit"/> uses one: two producers that both incremented past
+    /// the bound would each have to undo it, and by then the count has already lied.
+    /// </summary>
+    private bool TryReserveTimer(ref DropReason reason)
+    {
+        if (_maxPendingTimers == 0)
+        {
+            Interlocked.Increment(ref _pendingTimers);
+            return true;
+        }
+
+        while (true)
+        {
+            var current = Volatile.Read(ref _pendingTimers);
+            if (current >= _maxPendingTimers)
+            {
+                reason = DropReason.TimerQueueFull;
+                return false;
+            }
+            if (Interlocked.CompareExchange(ref _pendingTimers, current + 1, current) == current)
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Give a timer slot back. Called by the timer entry's state machine, from whichever transition
+    /// out of <c>New</c>/<c>Armed</c> wins — so a cancel racing a firing can never release twice.
+    /// </summary>
+    internal void OnTimerRetired() => Interlocked.Decrement(ref _pendingTimers);
 
     /// <summary>
     /// Queue a job and report why it was refused. Used by the request/response and async entry
@@ -266,7 +373,15 @@ public abstract class AsyncExecutable : IAsyncDisposable
             static t =>
             {
                 try { t.Tcs.TrySetResult(t.Func()); }
-                catch (Exception ex) { t.Tcs.TrySetException(ex); }
+                catch (Exception ex)
+                {
+                    t.Tcs.TrySetException(ex);
+
+                    // Rethrow as the marker so the flusher counts the failure. Swallowing it here is
+                    // what used to make a failing Ask look like a success: TotalJobsFailed never
+                    // moved, and the consecutive-failure streak was *reset* by it.
+                    throw new ObservedJobFailure(ex, report: false);
+                }
             },
             (Tcs: tcs, Func: func),
             out var reason);
@@ -287,7 +402,11 @@ public abstract class AsyncExecutable : IAsyncDisposable
             static t =>
             {
                 try { t.Tcs.TrySetResult(t.Func(t.State)); }
-                catch (Exception ex) { t.Tcs.TrySetException(ex); }
+                catch (Exception ex)
+                {
+                    t.Tcs.TrySetException(ex);
+                    throw new ObservedJobFailure(ex, report: false);
+                }
             },
             (Tcs: tcs, Func: func, State: state),
             out var reason);
@@ -310,12 +429,16 @@ public abstract class AsyncExecutable : IAsyncDisposable
         JobDiagnostics.GuardBlockingWait(_system, nameof(AskSync));
         var task = Ask(func);
 
-        // Waiting on the handle rather than Task.Wait: Wait rethrows a failed task's exception
-        // wrapped in an AggregateException, so the caller saw that instead of the exception the job
-        // actually threw and never reached the GetResult below. GetAwaiter().GetResult() rethrows
-        // the original, stack trace intact. The handle is allocated lazily and only on the slow
-        // path, which for a blocking API is not worth optimising away.
-        if (!task.IsCompleted && !((IAsyncResult)task).AsyncWaitHandle.WaitOne(timeout))
+        // WaitAny rather than Task.Wait: Wait rethrows a failed task's exception wrapped in an
+        // AggregateException, so the caller saw that instead of the exception the job actually threw
+        // and never reached the GetResult below. WaitAny reports only *which* task finished, leaving
+        // GetAwaiter().GetResult() to rethrow the original with its stack trace intact.
+        //
+        // And rather than IAsyncResult.AsyncWaitHandle, which the earlier fix used: touching that
+        // property builds a ManualResetEvent, attaches it to the task, and leaves it for the
+        // finalizer. A health probe calling AskSync a few times a second against a slow actor piled
+        // up one kernel handle per call.
+        if (!task.IsCompleted && Task.WaitAny([task], timeout) < 0)
             throw new TimeoutException($"Actor '{Name}' did not answer within {timeout.TotalMilliseconds:F0}ms.");
 
         return task.GetAwaiter().GetResult();
@@ -386,8 +509,17 @@ public abstract class AsyncExecutable : IAsyncDisposable
             return;
         if (!_system.Options.DetectBlockingWaitOnWorker)
             return;
-        if (!ReferenceEquals(ThreadContext.CurrentExecuter, this))
+
+        // Two questions, because neither alone covers the whole job. CurrentExecuter answers "is
+        // this actor running right now on this thread", which goes blank at the first await — an
+        // async job that awaits anything and *then* asks itself used to slip straight past the
+        // guard. AsyncFlowOwner rides the execution context and so still names the actor in every
+        // continuation of its own async job.
+        if (!ReferenceEquals(ThreadContext.CurrentExecuter, this)
+            && !ReferenceEquals(AsyncFlowOwnerSlot.Value, this))
+        {
             return;
+        }
 
         throw new InvalidOperationException(
             $"Actor '{Name}' called {apiName} on itself from inside one of its own jobs. With " +
@@ -399,7 +531,13 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
     private void StartAsyncJob(Func<Task> fn, TaskCompletionSource tcs)
     {
+        // RunAsync has no result, so it is routinely called fire-and-forget: a failure it does not
+        // report is a failure recorded nowhere at all. Ask/AskAsync hand theirs to a waiting caller.
+        const bool report = true;
+
         Task task;
+        var previousOwner = AsyncFlowOwnerSlot.Value;
+        AsyncFlowOwnerSlot.Value = this;
         try
         {
             task = fn() ?? Task.CompletedTask;
@@ -407,12 +545,29 @@ public abstract class AsyncExecutable : IAsyncDisposable
         catch (Exception ex)
         {
             tcs.TrySetException(ex);
-            return;
+            throw new ObservedJobFailure(ex, report);
+        }
+        finally
+        {
+            // Restore rather than clear: an async job started from inside another one would
+            // otherwise blank out its parent's ownership for the rest of the parent's flow. The
+            // context the continuations of fn() captured already holds `this` and is unaffected.
+            AsyncFlowOwnerSlot.Value = previousOwner;
         }
 
         if (task.IsCompleted)
         {
-            Settle(task, tcs);
+            // A body that faults without ever awaiting — `async () => throw` — finishes inside this
+            // job, so its failure has to leave through the marker like the synchronous throw above.
+            // Settling it here instead would let ExecuteJob's success path reset the streak the
+            // failure had just incremented.
+            if (task.IsFaulted)
+            {
+                tcs.TrySetException(task.Exception!.InnerExceptions);
+                throw new ObservedJobFailure(task.Exception!.GetBaseException(), report);
+            }
+
+            Settle(task, tcs, this, report);
             return;
         }
 
@@ -427,7 +582,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 var (self, completion, exclusive) = ((AsyncExecutable, TaskCompletionSource, bool))s!;
                 if (exclusive)
                     self.EndExclusiveSuspension();
-                Settle(t, completion);
+                Settle(t, completion, self, report);
                 self.EndAsyncTracking();
             },
             (this, tcs, _reentrancy == AsyncReentrancy.Exclusive),
@@ -438,7 +593,13 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
     private void StartAsyncJob<TResult>(Func<Task<TResult>> fn, TaskCompletionSource<TResult> tcs)
     {
+        // AskAsync's caller awaits the result and therefore sees the exception; reporting it to
+        // OnJobError as well would report it twice. JobOptions.ReportAwaitedFailures opts in.
+        var report = _reportAwaitedFailures;
+
         Task<TResult> task;
+        var previousOwner = AsyncFlowOwnerSlot.Value;
+        AsyncFlowOwnerSlot.Value = this;
         try
         {
             task = fn() ?? Task.FromResult<TResult>(default!);
@@ -446,12 +607,24 @@ public abstract class AsyncExecutable : IAsyncDisposable
         catch (Exception ex)
         {
             tcs.TrySetException(ex);
-            return;
+            throw new ObservedJobFailure(ex, report);
+        }
+        finally
+        {
+            AsyncFlowOwnerSlot.Value = previousOwner;
         }
 
         if (task.IsCompleted)
         {
-            Settle(task, tcs);
+            // See the other overload: a body that faults before its first await must report through
+            // the marker, or ExecuteJob's success path resets the streak it just incremented.
+            if (task.IsFaulted)
+            {
+                tcs.TrySetException(task.Exception!.InnerExceptions);
+                throw new ObservedJobFailure(task.Exception!.GetBaseException(), report);
+            }
+
+            Settle(task, tcs, this, report);
             return;
         }
 
@@ -463,30 +636,58 @@ public abstract class AsyncExecutable : IAsyncDisposable
         task.ContinueWith(
             static (t, s) =>
             {
-                var (self, completion, exclusive) = ((AsyncExecutable, TaskCompletionSource<TResult>, bool))s!;
+                var (self, completion, exclusive, reportFailure) =
+                    ((AsyncExecutable, TaskCompletionSource<TResult>, bool, bool))s!;
                 if (exclusive)
                     self.EndExclusiveSuspension();
-                Settle(t, completion);
+                Settle(t, completion, self, reportFailure);
                 self.EndAsyncTracking();
             },
-            (this, tcs, _reentrancy == AsyncReentrancy.Exclusive),
+            (this, tcs, _reentrancy == AsyncReentrancy.Exclusive, report),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
     }
 
-    private static void Settle(Task task, TaskCompletionSource tcs)
+    private static void Settle(Task task, TaskCompletionSource tcs, AsyncExecutable self, bool report)
     {
-        if (task.IsFaulted) tcs.TrySetException(task.Exception!.InnerExceptions);
+        if (task.IsFaulted)
+        {
+            tcs.TrySetException(task.Exception!.InnerExceptions);
+            self.NoteAsyncFailure(task.Exception!.GetBaseException(), report);
+        }
         else if (task.IsCanceled) tcs.TrySetCanceled();
         else tcs.TrySetResult();
     }
 
-    private static void Settle<TResult>(Task<TResult> task, TaskCompletionSource<TResult> tcs)
+    private static void Settle<TResult>(Task<TResult> task, TaskCompletionSource<TResult> tcs,
+        AsyncExecutable self, bool report)
     {
-        if (task.IsFaulted) tcs.TrySetException(task.Exception!.InnerExceptions);
+        if (task.IsFaulted)
+        {
+            tcs.TrySetException(task.Exception!.InnerExceptions);
+            self.NoteAsyncFailure(task.Exception!.GetBaseException(), report);
+        }
         else if (task.IsCanceled) tcs.TrySetCanceled();
         else tcs.TrySetResult(task.Result);
+    }
+
+    /// <summary>
+    /// Account for an async job that came back faulted. Runs on whichever thread completed the
+    /// task, so everything it touches is interlocked — the same rule
+    /// <see cref="HandleJobFailure"/> already followed.
+    ///
+    /// <para><see cref="JobMetrics.OnExecuted"/> is deliberately not bumped: the state-machine step
+    /// that started this job was already counted as executed when the flusher ran it.</para>
+    /// </summary>
+    private void NoteAsyncFailure(Exception ex, bool report)
+    {
+        _system.Metrics.OnFailed();
+
+        if (report || _reportAwaitedFailures)
+            HandleJobFailure(ex);
+        else
+            TrackFailureStreak();
     }
 
     /// <summary>
@@ -642,7 +843,22 @@ public abstract class AsyncExecutable : IAsyncDisposable
         }
 
         _system.OnJobAdmitted();
-        _queue.Enqueue(task);
+
+        try
+        {
+            _queue.Enqueue(task);
+        }
+        catch
+        {
+            // ADR 0004 in reverse. The CAS above claimed a slot, so if the write fails — a segment
+            // allocation hitting OutOfMemory is the only realistic way — the counter claims a job
+            // the queue does not have, and whoever holds leadership spins for it forever. Give the
+            // slot back; if the count is still non-zero a real leader owns the rest.
+            _system.OnJobRetired();
+            Interlocked.Decrement(ref _remainingTaskCount);
+            task.Discard();
+            throw;
+        }
 
         if (current != 0)
             return true;    // somebody else already owns the flush
@@ -662,7 +878,14 @@ public abstract class AsyncExecutable : IAsyncDisposable
             return true;
         }
 
-        if (_mode == ExecutionMode.Scheduled && !ThreadContext.IsWorkerThread && _system.HasWorkers)
+        // "One of *our* workers", not "a worker of some job system". IsWorkerThread is true on every
+        // dispatcher's threads, so in a process that isolates two systems — a game world and a
+        // background-IO pool, the split JobSystem's own documentation recommends — a producer running
+        // on system A's worker used to flush system B's Scheduled actor inline, on A's thread. That
+        // is precisely the boundary Scheduled exists to hold. With one system the two tests agree.
+        if (_mode == ExecutionMode.Scheduled
+            && !ReferenceEquals(ThreadContext.CurrentSystem, _system)
+            && _system.HasWorkers)
         {
             _system.Schedule(this);
             return true;
@@ -670,7 +893,17 @@ public abstract class AsyncExecutable : IAsyncDisposable
 
         if (ThreadContext.CurrentExecuter is not null)
         {
-            // Already flushing another actor on this thread — queue up instead of recursing.
+            // Already flushing another actor on this thread. The first actor a flush makes ready
+            // stays here — one hop, no wake-up, and the queue below is drained by this same loop.
+            // Any further one goes to the pool instead: this list is thread-local, so nothing can be
+            // stolen from it, and a zone actor broadcasting to a hundred players otherwise ran all
+            // hundred on this one thread while the other seven workers sat idle.
+            if (_fanOutToWorkers && _system.HasWorkers && ThreadContext.ExecuterQueue.Count > 0)
+            {
+                _system.Schedule(this);
+                return true;
+            }
+
             ThreadContext.ExecuterQueue.Enqueue(this);
             return true;
         }
@@ -827,6 +1060,23 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 {
                     ExecuteJob(job);
                 }
+                catch
+                {
+                    // ExecuteJob catches everything the job itself can throw, so getting here means
+                    // the accounting around it failed. If it threw *past* a BeginExclusiveSuspension
+                    // the reservation is standing with nobody left to park for it: the flusher is
+                    // leaving with the exception, and when the async job finally ends,
+                    // EndExclusiveSuspension wins the Pending→Completed race and returns believing a
+                    // flusher will clean up. Nobody would, and the actor never drains again. Take the
+                    // suspension down here, while this thread still owns leadership.
+                    if (Interlocked.CompareExchange(ref _suspendState, SuspendNone, SuspendPending) == SuspendPending)
+                    {
+                        _system.OnJobRetired();
+                        Interlocked.Decrement(ref _remainingTaskCount);
+                    }
+
+                    throw;
+                }
                 finally
                 {
                     // In a finally so the accounting survives an exception from ExecuteJob itself
@@ -889,7 +1139,13 @@ public abstract class AsyncExecutable : IAsyncDisposable
                 }
                 else
                 {
-                    spinner.SpinOnce();
+                    // Never Sleep(1) here. What this waits for is a producer caught between its CAS
+                    // and its enqueue — nanoseconds, unless it was pre-empted. SpinOnce() starts
+                    // mixing in Thread.Sleep(1) from its twentieth call, and on stock Windows that
+                    // is a 15.6 ms timer tick during which this leader runs nothing: not this
+                    // actor's remaining jobs, and not the other actors queued behind it on this
+                    // thread. sleep1Threshold: -1 keeps the back-off at Yield/Sleep(0).
+                    spinner.SpinOnce(sleep1Threshold: -1);
                 }
             }
         }
@@ -912,6 +1168,21 @@ public abstract class AsyncExecutable : IAsyncDisposable
             _system.Metrics.OnExecuted();
             if (_maxConsecutiveFailures > 0)
                 Volatile.Write(ref _consecutiveFailures, 0);
+        }
+        catch (ObservedJobFailure observed)
+        {
+            // A request/response job whose exception is already on its way to a waiting caller. It
+            // still counts — as a failure, and against the streak. Swallowing it inside the job was
+            // what let a failing Ask read as a success and reset the streak, so an actor with a
+            // failing Ask between its failing DoAsyncs never reached MaxConsecutiveFailures.
+            _system.Metrics.OnExecuted();
+            _system.Metrics.OnFailed();
+
+            var cause = observed.InnerException!;
+            if (observed.Report || _reportAwaitedFailures)
+                HandleJobFailure(cause);
+            else
+                TrackFailureStreak();
         }
         catch (Exception ex)
         {
@@ -949,6 +1220,16 @@ public abstract class AsyncExecutable : IAsyncDisposable
             _system.Logger.Error($"OnJobError for '{Name}' threw", inner);
         }
 
+        TrackFailureStreak();
+    }
+
+    /// <summary>
+    /// The <see cref="JobOptions.MaxConsecutiveFailures"/> half of failure handling, split out so
+    /// that a failure already reported to a waiting caller can still count towards the streak
+    /// without being reported twice.
+    /// </summary>
+    private void TrackFailureStreak()
+    {
         if (_maxConsecutiveFailures <= 0)
             return;
 
@@ -991,7 +1272,7 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// </summary>
     private void SignalDrainedIfIdle()
     {
-        if (!IsIdle)
+        if (!IsDrainSatisfied)
             return;
         Volatile.Read(ref _drainTcs)?.TrySetResult();
     }
@@ -1037,24 +1318,88 @@ public abstract class AsyncExecutable : IAsyncDisposable
     {
         var drained = true;
 
-        if (!IsIdle)
+        // "Save, then dispose me" is a routine shape for a session actor, and the caller is then one
+        // of this actor's own async jobs. Counting that job would make the drain wait for the very
+        // work that is waiting for the drain, so excuse exactly the caller: one pending async job,
+        // plus — on an Exclusive actor — the queue slot its suspension holds.
+        if (ReferenceEquals(AsyncFlowOwnerSlot.Value, this))
+            ExcuseCallersOwnAsyncJob();
+
+        if (!IsDrainSatisfied)
         {
-            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            GuardSelfDisposeDeadlock();
 
-            // Interlocked, not a plain or volatile store: this is one half of a Dekker handshake
-            // with SignalDrainedIfIdle, and a release store does not order against the loads that
-            // follow. Without the full fence the store can still sit in this core's store buffer
-            // while the thread finishing the last job reads a null _drainTcs, signals nobody, and
-            // leaves this await pending for the life of the process.
-            Interlocked.Exchange(ref _drainTcs, tcs);
+            var tcs = Volatile.Read(ref _drainTcs);
+            if (tcs is null)
+            {
+                // CompareExchange, not Exchange: a second concurrent DisposeAsync must join the wait
+                // rather than replace it. Only the TCS stored here is ever signalled, so overwriting
+                // it left the first caller — a session closed by its socket and by an admin kick at
+                // the same time — awaiting a task nobody would complete.
+                //
+                // Either way this is one half of a Dekker handshake with SignalDrainedIfIdle, and
+                // both CAS forms are full fences: a release store does not order against the loads
+                // that follow, so the store could otherwise still sit in this core's store buffer
+                // while the thread finishing the last job reads a null _drainTcs and signals nobody.
+                var fresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                tcs = Interlocked.CompareExchange(ref _drainTcs, fresh, null) ?? fresh;
+            }
+            else
+            {
+                // Somebody already published one. The fence the store would have given us is still
+                // needed for the re-read below, and a bare barrier is the cheapest way to get it.
+                Interlocked.MemoryBarrier();
+            }
 
-            if (!IsIdle)
+            if (!IsDrainSatisfied)
                 drained = await AwaitDrainAsync(tcs.Task, timeout, cancellationToken).ConfigureAwait(false);
         }
 
         Volatile.Write(ref _completed, 1);
         GC.SuppressFinalize(this);
         return drained;
+    }
+
+    /// <summary>
+    /// Publish the drain excuse for a caller that is one of this actor's own async jobs.
+    /// <see cref="Interlocked.Exchange(ref int, int)"/> for the full fence: the excuse has to be
+    /// visible before this thread reads the counters, and before any thread on its way into
+    /// <see cref="SignalDrainedIfIdle"/> reads them.
+    /// </summary>
+    private void ExcuseCallersOwnAsyncJob()
+    {
+        // Under Interleaved the awaiting job holds no queue slot, so only _pendingAsync needs the
+        // excuse. Under Exclusive it also holds the suspension reservation that keeps the actor from
+        // running anything else.
+        Interlocked.Exchange(ref _drainExcusedTasks, _reentrancy == AsyncReentrancy.Exclusive ? 1 : 0);
+        Interlocked.Exchange(ref _drainExcusedAsync, 1);
+    }
+
+    /// <summary>
+    /// Turn the one self-dispose that cannot be rescued into an exception instead of a silent hang.
+    ///
+    /// <para>An <see cref="AsyncReentrancy.Exclusive"/> actor runs nothing else until its async job
+    /// finishes. If that job awaits its own <c>DisposeAsync</c> while other work is still queued,
+    /// the drain waits for jobs the actor will not run until the job that is waiting for the drain
+    /// returns. Excusing the caller cannot help — the queue is genuinely not going to move.</para>
+    /// </summary>
+    private void GuardSelfDisposeDeadlock()
+    {
+        if (_reentrancy != AsyncReentrancy.Exclusive)
+            return;
+        if (!_system.Options.DetectBlockingWaitOnWorker)
+            return;
+        if (!ReferenceEquals(AsyncFlowOwnerSlot.Value, this))
+            return;
+
+        throw new InvalidOperationException(
+            $"Actor '{Name}' awaited its own DisposeAsync from inside one of its async jobs while " +
+            $"{RemainingTaskCount - 1} other job(s) were still queued. With " +
+            $"{nameof(AsyncReentrancy)}.{nameof(AsyncReentrancy.Exclusive)} the actor runs nothing " +
+            "else until that job returns, so the drain waits for the job and the job waits for the " +
+            "drain. Start the dispose without awaiting it (`_ = DisposeAsync();`) and let the job " +
+            "return, or dispose the actor from outside its own jobs. Set " +
+            $"{nameof(JobSystemOptions)}.{nameof(JobSystemOptions.DetectBlockingWaitOnWorker)} = false to disable this check.");
     }
 
     private static async Task<bool> AwaitDrainAsync(Task drain, TimeSpan timeout, CancellationToken cancellationToken)
@@ -1106,6 +1451,25 @@ public abstract class AsyncExecutable : IAsyncDisposable
         set => JobSystem.Default.AcceptingWork = value;
     }
 
+    /// <summary>
+    /// The actor whose async job the calling flow belongs to, or <c>null</c> off that path.
+    /// Read by <see cref="JobSystem.DrainAsync"/>, which must not wait on its own caller.
+    /// </summary>
+    internal static AsyncExecutable? AsyncFlowOwner => AsyncFlowOwnerSlot.Value;
+
+    /// <summary>
+    /// A job failure whose exception has already been handed to a waiting caller. It still counts
+    /// towards <see cref="JobMetrics.TotalJobsFailed"/> and the
+    /// <see cref="JobOptions.MaxConsecutiveFailures"/> streak; <see cref="Report"/> says whether
+    /// <see cref="OnJobError"/> should be told about it as well.
+    /// </summary>
+    private sealed class ObservedJobFailure(Exception inner, bool report)
+        : Exception(inner.Message, inner)
+    {
+        /// <summary>Whether the actor's error hook should also see this failure.</summary>
+        public bool Report { get; } = report;
+    }
+
     private sealed class CancelledTimer : ITimerHandle
     {
         public static readonly CancelledTimer Instance = new();
@@ -1119,6 +1483,23 @@ public abstract class AsyncExecutable : IAsyncDisposable
     /// </summary>
     private sealed class ActorSynchronizationContext(AsyncExecutable actor) : SynchronizationContext
     {
+        /// <summary>
+        /// Called by <c>AsyncVoidMethodBuilder</c> when an <c>async void</c> method starts under this
+        /// context — which, on an Interleaved actor, is any <c>async void</c> a job calls. Without
+        /// this the method's continuations came back onto the actor through
+        /// <see cref="AdmitContinuation"/> while no counter anywhere knew they were coming, so a
+        /// drain could declare the system idle, stop the workers, and let the continuation resume on
+        /// a thread-pool thread against an actor that had already been disposed.
+        ///
+        /// <para>An async lambda nobody awaits (<c>_ = SaveAsync();</c>) is built by
+        /// <c>AsyncTaskMethodBuilder</c>, which sends no such notification. Nothing here can see
+        /// that one — wrap it in <c>RunAsync</c>.</para>
+        /// </summary>
+        public override void OperationStarted() => actor.BeginAsyncTracking();
+
+        /// <inheritdoc cref="OperationStarted" />
+        public override void OperationCompleted() => actor.EndAsyncTracking();
+
         public override void Post(SendOrPostCallback d, object? state) => actor.AdmitContinuation(d, state);
 
         public override void Send(SendOrPostCallback d, object? state)

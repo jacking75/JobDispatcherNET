@@ -373,6 +373,11 @@ public sealed class ConcurrencyReviewTests
             RestartBackoff = TimeSpan.FromMilliseconds(1),
             MaxRestartBackoff = TimeSpan.FromMilliseconds(5),
             RestartCountResetAfter = TimeSpan.Zero,
+
+            // This pool has one worker, so it is also the system's last, and the default is now to
+            // keep restarting it rather than strand whatever is on the ready queue (S20). Opt out:
+            // what this case is about is the budget being honoured without the backoff overflowing.
+            KeepLastWorkerAlive = false,
         });
         _ = dispatcher.RunWorkerThreadsAsync();
 

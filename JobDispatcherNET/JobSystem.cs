@@ -398,9 +398,35 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
 
     // ── worker registration ─────────────────────────────────────────────────
 
-    internal void RegisterWorker() => Interlocked.Increment(ref _liveWorkers);
+    internal void RegisterWorker()
+    {
+        if (Interlocked.Increment(ref _liveWorkers) != 1)
+            return;
 
-    internal void UnregisterWorker() => Interlocked.Decrement(ref _liveWorkers);
+        // Arm the timer-fallback warning again. It is a once-per-process latch, and a restart
+        // backoff that briefly empties the pool used to spend it: a system genuinely deployed
+        // without a dispatcher afterwards would then never say so.
+        Volatile.Write(ref _timerFallbackWarned, 0);
+    }
+
+    internal void UnregisterWorker()
+    {
+        if (Interlocked.Decrement(ref _liveWorkers) != 0)
+            return;
+
+        // Actors already on the ready queue are the ones with no way out: their counters say a
+        // leader exists, so further posts only pile up behind them and their DisposeAsync never
+        // returns. Meanwhile brand-new actors run inline and the system looks healthy, which makes
+        // this exactly the kind of partial failure nobody notices. Say it out loud.
+        var stranded = ReadyQueueDepth;
+        if (stranded > 0)
+        {
+            Logger.Error(
+                $"JobSystem '{Name}' has no worker threads left and {stranded} ready item(s) have nobody " +
+                "to run them. Actors already queued there are stranded — new posts will queue behind them " +
+                "and their DisposeAsync will not complete.");
+        }
+    }
 
     internal void AttachDispatcher(IDisposable dispatcher)
     {
@@ -472,7 +498,21 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
         var deadline = Stopwatch.GetTimestamp();
         var limit = timeout <= TimeSpan.Zero ? TimeSpan.Zero : timeout;
 
-        while (InFlightJobs > 0 || ReadyQueueDepth > 0 || PendingTimerCount > 0 || PendingAsyncJobs > 0)
+        // If the caller is itself one of this system's async jobs — an admin command actor asking
+        // the process to stop, say — then it is one of the jobs this loop is counting, and waiting
+        // for it would burn the whole timeout and report a failed drain every single shutdown. Its
+        // own job does not count against it; everything else still does.
+        var self = AsyncExecutable.AsyncFlowOwner is { } owner && ReferenceEquals(owner.System, this) ? 1 : 0;
+
+        if (self != 0 && Options.DetectBlockingWaitOnWorker)
+        {
+            Logger.Warn(
+                $"JobSystem '{Name}' is being drained from inside one of its own async jobs. The drain " +
+                "excludes that job, but shutdown is better started from outside the system (the host, a " +
+                "signal handler, a console loop) — or with `_ = system.StopAsync(...)` so the job can return.");
+        }
+
+        while (InFlightJobs > 0 || ReadyQueueDepth > 0 || PendingTimerCount > 0 || PendingAsyncJobs > self)
         {
             if (Stopwatch.GetElapsedTime(deadline) >= limit)
             {
@@ -483,7 +523,13 @@ public sealed class JobSystem : IDisposable, IAsyncDisposable
                 return false;
             }
 
-            SignalAllWork();
+            // Pulse one waiter, and only when there is actually something to take. This used to be
+            // SignalAllWork, which is right for the shutdown join but wrong here: a drain that is
+            // blocked — an uncancelled repeating timer, a long drain timeout — then woke every idle
+            // worker 500 times a second for as long as it stayed blocked.
+            if (ReadyQueueDepth > 0)
+                SignalWork();
+
             await Task.Delay(2).ConfigureAwait(false);
         }
 

@@ -37,6 +37,21 @@ public sealed class JobDispatcherBuilderOptions
     /// before stopping the workers anyway. Default 30 seconds.
     /// </summary>
     public TimeSpan ShutdownDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Close the job system's shutdown gate <em>before</em> draining rather than after.
+    /// Off by default.
+    /// </summary>
+    /// <remarks>
+    /// The library's shutdown contract is "drain with the gate open", so that a job which enqueues
+    /// follow-up work — a world actor telling every session to despawn — completes the whole
+    /// cascade. Closing the gate first turns the first hop of that cascade into a
+    /// <see cref="DropReason.ShuttingDown"/> refusal, and takes the sequencer drains with it. By the
+    /// time this runs the host has already stopped accepting connections, so there is nothing left
+    /// to slam the door on. Turn it on only when work can still arrive from a source the host does
+    /// not control.
+    /// </remarks>
+    public bool RefuseNewWorkOnShutdown { get; set; }
 }
 
 /// <summary>
@@ -127,6 +142,7 @@ public sealed class JobSystemHostedService : IHostedService
     private readonly JobSystem _system;
     private readonly JobDispatcher _dispatcher;
     private readonly TimeSpan _drainTimeout;
+    private readonly bool _refuseNewWork;
     private Task? _workers;
 
     /// <summary>Create the hosted service.</summary>
@@ -143,6 +159,7 @@ public sealed class JobSystemHostedService : IHostedService
         _system = system;
         _dispatcher = dispatcher;
         _drainTimeout = options.Value.ShutdownDrainTimeout;
+        _refuseNewWork = options.Value.RefuseNewWorkOnShutdown;
     }
 
     /// <summary>
@@ -161,12 +178,17 @@ public sealed class JobSystemHostedService : IHostedService
 
     /// <summary>
     /// Drain in-flight work, then stop the timer thread and the workers.
+    ///
+    /// <para>The drain runs with the shutdown gate still open, so work a draining job enqueues —
+    /// the despawn cascade a world actor kicks off — still runs. Set
+    /// <see cref="JobDispatcherBuilderOptions.RefuseNewWorkOnShutdown"/> to close the gate first
+    /// instead.</para>
     /// </summary>
     /// <param name="cancellationToken">Host shutdown cancellation, used only for the final worker join.</param>
     /// <returns>A task that completes once the workers have stopped or the drain timeout expired.</returns>
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        var drained = await _system.StopAsync(_drainTimeout, refuseNewWork: true).ConfigureAwait(false);
+        var drained = await _system.StopAsync(_drainTimeout, _refuseNewWork).ConfigureAwait(false);
 
         if (drained)
         {

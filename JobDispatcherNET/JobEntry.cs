@@ -51,8 +51,30 @@ internal static class JobPool<T> where T : class
     /// <summary>Cap on the shared pool. <c>0</c> or less disables pooling entirely.</summary>
     public static int MaxPoolSize { get; set; } = 16 * 1024;
 
+    /// <summary>
+    /// <see cref="MaxPoolSize"/> in whole batches, rounded up.
+    ///
+    /// <para>Rounded up rather than down because the shared pool trades in batches and nothing
+    /// smaller. Truncating meant any cap below <see cref="BatchSize"/> allowed zero batches, so the
+    /// shared pool was silently switched off — with no error and nothing in the documentation about
+    /// it — and every cross-thread rent (a <see cref="ExecutionMode.Scheduled"/> actor, a timer)
+    /// allocated. <c>MaxPoolSize = 8</c> used to mean "pool eight".</para>
+    /// </summary>
+    private static long SharedCapInBatches
+    {
+        get
+        {
+            long max = MaxPoolSize;
+            return max <= 0 ? 0 : Math.Max(1, (max + BatchSize - 1) / BatchSize);
+        }
+    }
+
     /// <summary>Instances parked in the shared pool. Per-thread stacks are not counted.</summary>
-    public static long SharedSize => (long)Volatile.Read(ref _sharedBatchCount) * BatchSize;
+    /// <remarks>
+    /// Clamped at zero: <see cref="Clear"/> racing a <see cref="Take"/> can leave the batch count
+    /// momentarily negative, and a negative pool size is a confusing thing for a test to assert on.
+    /// </remarks>
+    public static long SharedSize => Math.Max(0, (long)Volatile.Read(ref _sharedBatchCount) * BatchSize);
 
     /// <summary>Take an instance, or <c>null</c> if neither pool has one.</summary>
     public static T? Take()
@@ -100,7 +122,7 @@ internal static class JobPool<T> where T : class
             // Claim the slot with the increment and give it back if it was not there, rather than
             // checking first: two threads overflowing at once would both see room for the last
             // batch and the cap would drift upward by a batch per racing thread.
-            if (Interlocked.Increment(ref _sharedBatchCount) * (long)BatchSize <= MaxPoolSize)
+            if (Interlocked.Increment(ref _sharedBatchCount) <= SharedCapInBatches)
             {
                 var batch = new T[BatchSize];
                 Array.Copy(local, LocalCapacity - BatchSize, batch, 0, BatchSize);
@@ -149,6 +171,9 @@ public sealed class Job : JobEntry
     ///
     /// Each thread also keeps a small local stack of its own, which this does not cover — see
     /// <see cref="PoolSize"/>.
+    ///
+    /// <para>Rounded up to a multiple of 32, the batch the shared pool trades in: any value from
+    /// 1 to 32 means one batch.</para>
     /// </summary>
     public static int MaxPoolSize
     {
@@ -211,7 +236,10 @@ public sealed class Job : JobEntry
 /// </summary>
 public sealed class Job<TState> : JobEntry
 {
-    /// <summary>Cap on the shared pool for this state type. <c>0</c> disables pooling.</summary>
+    /// <summary>
+    /// Cap on the shared pool for this state type. <c>0</c> disables pooling.
+    /// Rounded up to a multiple of 32, the batch the shared pool trades in.
+    /// </summary>
     public static int MaxPoolSize
     {
         get => JobPool<Job<TState>>.MaxPoolSize;

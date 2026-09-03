@@ -26,12 +26,14 @@ public sealed class Sequencer<T>
     private readonly ConcurrentQueue<T> _queue = new();
     private readonly Action<T> _handler;
     private readonly Func<Action, bool> _scheduleDrain;
+    private readonly Action _drainAction;
     private readonly Action<Exception>? _onError;
     private readonly int _maxPending;
     private readonly int _maxItemsPerDrain;
 
     // Kept by hand rather than read from the queue: ConcurrentQueue.Count walks its segments and
-    // can spin, which is the wrong shape for a check on every inbound packet.
+    // can spin, which is the wrong shape for a check on every inbound packet. Only maintained when
+    // there is a bound to enforce — see TryReserveSlot.
     private int _pending;
     private long _dropped;
     private int _drainScheduled;
@@ -92,6 +94,11 @@ public sealed class Sequencer<T>
         _onError = onError;
         _maxPending = maxPending;
         _maxItemsPerDrain = maxItemsPerDrain;
+
+        // Cached, because a method group converted at the call site allocates a fresh delegate each
+        // time. A drain is scheduled whenever the queue goes from empty to non-empty, so on a server
+        // with thousands of sessions doing that a few times a second it is a steady gen0 drip.
+        _drainAction = Drain;
     }
 
     private static Func<Action, bool> Wrap(Action<Action> scheduleDrain)
@@ -111,10 +118,14 @@ public sealed class Sequencer<T>
     }
 
     /// <summary>
-    /// Items accepted and not yet handled. Counted before the item reaches the queue and released
-    /// after the handler returns, so it reads high rather than low — which is what a bound needs.
+    /// Items accepted and not yet handled.
+    ///
+    /// <para>With a bound in force this is a counter, incremented before the item reaches the queue
+    /// and released after the handler returns, so it reads high rather than low — which is what a
+    /// bound needs. An unbounded sequencer keeps no counter and this falls back to the queue's own
+    /// count, which is a snapshot approximation and walks the queue's segments to produce it.</para>
     /// </summary>
-    public int PendingCount => Volatile.Read(ref _pending);
+    public int PendingCount => _maxPending == 0 ? _queue.Count : Volatile.Read(ref _pending);
 
     /// <summary>The <c>maxPending</c> bound this sequencer was built with. <c>0</c> is unbounded.</summary>
     public int MaxPending => _maxPending;
@@ -156,7 +167,10 @@ public sealed class Sequencer<T>
     {
         if (_maxPending == 0)
         {
-            Interlocked.Increment(ref _pending);
+            // Nothing to claim, so nothing to write. Counting here put a shared read-modify-write on
+            // one line into every item — raised by the producing IO thread, lowered by the worker
+            // that handles it, one cache line ping-pong per session on top of the queue's own CAS.
+            // A bounded sequencer needs that accounting to be exact; an unbounded one does not.
             return true;
         }
 
@@ -181,7 +195,7 @@ public sealed class Sequencer<T>
         bool scheduled;
         try
         {
-            scheduled = _scheduleDrain(Drain);
+            scheduled = _scheduleDrain(_drainAction);
         }
         catch
         {
@@ -231,8 +245,9 @@ public sealed class Sequencer<T>
                 {
                     // In a finally because _onError is user code and can throw: leaking a slot on
                     // that path would shrink a bounded sequencer a little on every handler failure
-                    // until it refused everything.
-                    Interlocked.Decrement(ref _pending);
+                    // until it refused everything. Unbounded sequencers claim no slot to release.
+                    if (_maxPending != 0)
+                        Interlocked.Decrement(ref _pending);
                 }
 
                 // Fairness, mirroring MaxJobsPerFlush: hand the rest back rather than letting one
@@ -297,7 +312,8 @@ public sealed class Sequencer<T>
         var discarded = 0;
         while (_queue.TryDequeue(out _))
         {
-            Interlocked.Decrement(ref _pending);
+            if (_maxPending != 0)
+                Interlocked.Decrement(ref _pending);
             discarded++;
         }
 

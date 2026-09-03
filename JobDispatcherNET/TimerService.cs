@@ -120,6 +120,7 @@ internal sealed class TimerService : IDisposable
         if (Volatile.Read(ref _disposed) != 0)
         {
             job.Discard();
+            owner.OnTimerRetired();     // the caller reserved a slot before getting here
             _system.Metrics.OnTimerDiscarded();
             return CancelledHandle.Instance;
         }
@@ -148,6 +149,7 @@ internal sealed class TimerService : IDisposable
 
         if (Volatile.Read(ref _disposed) != 0)
         {
+            owner.OnTimerRetired();
             _system.Metrics.OnTimerDiscarded();
             return CancelledHandle.Instance;
         }
@@ -205,10 +207,39 @@ internal sealed class TimerService : IDisposable
                 entry.MarkArmed();      // it now holds a pending slot; Retire is what gives it back
             }
 
+            PurgeCancelledLocked();
+
             if (wake)
                 Monitor.Pulse(_lock);
             return true;
         }
+    }
+
+    /// <summary>
+    /// Rebuild the queue without its cancelled entries, once the dead ones outnumber the live.
+    ///
+    /// <para>A cancelled timer stays on the heap until its due time (ADR 0003) — cheap when a timer
+    /// is cancelled now and then, unbounded when a client arms and cancels a cooldown per packet
+    /// against a 30-second delay. Since <see cref="PriorityQueue{TElement,TPriority}.Enqueue"/> is
+    /// O(log n) under this one lock, letting the heap grow slows down every other actor's
+    /// scheduling too. The doubling test makes the rebuild amortised O(1) per entry.</para>
+    /// </summary>
+    private void PurgeCancelledLocked()
+    {
+        const int floor = 64;   // below this the whole heap is cheaper than the check is worth
+
+        var live = Interlocked.Read(ref _pending);
+        if (_queue.Count < floor || _queue.Count <= 2 * live)
+            return;
+
+        var keep = new List<(TimerEntry Element, long Priority)>(_queue.Count);
+        while (_queue.TryDequeue(out var entry, out var due))
+        {
+            if (!entry.IsCancelled)
+                keep.Add((entry, due));
+        }
+
+        _queue.EnqueueRange(keep);
     }
 
     /// <summary>Account for a timer reaching its terminal state.</summary>
@@ -392,10 +423,15 @@ internal sealed class TimerService : IDisposable
 
         if (entry.Repeating)
         {
-            _system.Metrics.OnTimerFired();
-
-            if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out var refusal)
-                && refusal == DropReason.Disposed)
+            // Counted only once the actor takes it. A tick refused for a full queue or a stopping
+            // system is already counted as a dropped job, and counting it as fired too made the
+            // documented "TimersFired climbing while TotalJobsExecuted does not" diagnosis point at
+            // the wrong thing entirely.
+            if (_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out var refusal))
+            {
+                _system.Metrics.OnTimerFired();
+            }
+            else if (refusal == DropReason.Disposed)
             {
                 // The owner is gone for good, so re-arming can only fire into a closed door once a
                 // period: a drop counted every tick, and a pending timer that never goes away, which
@@ -423,9 +459,12 @@ internal sealed class TimerService : IDisposable
             return;
 
         Interlocked.Decrement(ref _pending);
-        _system.Metrics.OnTimerFired();
 
-        if (!_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out _))
+        if (_system.DispatchTimerJob(entry.Owner, entry.RentTickJob(), out _))
+        {
+            _system.Metrics.OnTimerFired();
+        }
+        else
         {
             // The actor refused the job (full, faulted, disposed, or the system is stopping), so
             // the callback will never run. Retire the handle silently: the refusal is already
@@ -528,8 +567,16 @@ internal sealed class TimerService : IDisposable
         /// Claim a one-shot for firing. A repeating entry stays <c>Armed</c> across ticks — it is
         /// re-queued immediately and holds its single pending slot until it is retired.
         /// </summary>
-        internal bool TryBeginFiring() =>
-            Interlocked.CompareExchange(ref _state, Fired, Armed) == Armed;
+        internal bool TryBeginFiring()
+        {
+            if (Interlocked.CompareExchange(ref _state, Fired, Armed) != Armed)
+                return false;
+
+            // The owner's timer slot goes back at the same moment the service's does: from here the
+            // job is on the actor's queue, where the queue bound governs it.
+            Owner.OnTimerRetired();
+            return true;
+        }
 
         /// <summary>
         /// The job handed to the owning actor. It carries the entry rather than the user callback
@@ -574,6 +621,13 @@ internal sealed class TimerService : IDisposable
                 // Armed is the only state that still owns a slot in PendingCount: New never took
                 // one, and a one-shot in Fired gave its own back when the timer thread dispatched it.
                 _service.OnRetired(releaseSlot: state == Armed, retirement);
+
+                // The owner's bound counts from the moment the caller asked for the timer, so New
+                // holds one of those even though it holds no PendingCount slot — an entry that never
+                // reached the queue (the service was disposed mid-schedule) must still give it back.
+                if (state is New or Armed)
+                    Owner.OnTimerRetired();
+
                 Interlocked.Exchange(ref _job, null)?.Discard();
                 return true;
             }

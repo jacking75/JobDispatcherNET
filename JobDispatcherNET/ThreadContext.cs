@@ -29,7 +29,11 @@ public static class ThreadContext
     /// </summary>
     public static Queue<AsyncExecutable> ExecuterQueue => _executerQueue ??= new Queue<AsyncExecutable>();
 
-    /// <summary>Monotonic milliseconds owned by the job system, refreshed once per worker tick.</summary>
+    /// <summary>
+    /// Monotonic milliseconds owned by the job system, refreshed once per worker iteration while
+    /// <see cref="JobSystemOptions.EnableDetailedMetrics"/> is on and left alone otherwise.
+    /// Diagnostic only — nothing in the library reads it, and refreshing it costs a timestamp read.
+    /// </summary>
     public static long TickCount
     {
         get => _tickCount;
@@ -37,8 +41,10 @@ public static class ThreadContext
     }
 
     /// <summary>
-    /// True on threads created by a <see cref="JobDispatcher"/> / <see cref="JobDispatcher{T}"/>.
-    /// <see cref="ExecutionMode.Scheduled"/> actors hand work to the system when this is false.
+    /// True on threads created by <em>any</em> <see cref="JobDispatcher"/> /
+    /// <see cref="JobDispatcher{T}"/> in the process, whichever system it serves. Use
+    /// <see cref="CurrentSystem"/> when the question is "one of <em>my</em> workers?" — which is what
+    /// <see cref="ExecutionMode.Scheduled"/> asks before handing an actor to its own pool.
     /// </summary>
     public static bool IsWorkerThread
     {
@@ -46,7 +52,11 @@ public static class ThreadContext
         internal set => _isWorkerThread = value;
     }
 
-    /// <summary>The job system that owns this worker thread, or <c>null</c> off-worker.</summary>
+    /// <summary>
+    /// The job system that owns this thread — a worker or the timer thread — or <c>null</c>
+    /// elsewhere. This, not <see cref="IsWorkerThread"/>, is what decides whether an
+    /// <see cref="ExecutionMode.Scheduled"/> actor may be flushed inline.
+    /// </summary>
     public static JobSystem? CurrentSystem
     {
         get => _currentSystem;

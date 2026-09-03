@@ -24,6 +24,13 @@ public enum DropReason
 
     /// <summary>The actor tripped <see cref="JobOptions.MaxConsecutiveFailures"/> and is faulted.</summary>
     Faulted,
+
+    /// <summary>
+    /// The actor already has <see cref="JobOptions.MaxPendingTimers"/> timers armed, so
+    /// <see cref="AsyncExecutable.DoAsyncAfter(TimeSpan, Action)"/> /
+    /// <see cref="AsyncExecutable.DoAsyncEvery"/> refused to arm another.
+    /// </summary>
+    TimerQueueFull,
 }
 
 /// <summary>Where an actor's jobs run when the first job arrives on an idle actor.</summary>
@@ -83,6 +90,18 @@ public sealed record JobOptions
     /// </summary>
     public int? MaxQueueSize { get; init; }
 
+    /// <summary>
+    /// Most timers this actor may have armed at once. <c>null</c> (the default) follows
+    /// <see cref="MaxQueueSize"/>, and is unbounded when that is.
+    ///
+    /// <para>A timer holds no queue slot until it fires, so <see cref="MaxQueueSize"/> alone does
+    /// not bound it: a client that arms a cooldown timer per packet grows the timer heap — an entry
+    /// plus its payload job each time — for as long as it keeps sending, and the queue bound only
+    /// starts dropping things once they come due. Refusals are reported as
+    /// <see cref="DropReason.TimerQueueFull"/>. A repeating timer counts as one for its whole life.</para>
+    /// </summary>
+    public int? MaxPendingTimers { get; init; }
+
     /// <summary>What to do when the queue is full. Ignored when <see cref="MaxQueueSize"/> is <c>null</c>.</summary>
     public DropPolicy DropPolicy { get; init; } = DropPolicy.Reject;
 
@@ -94,6 +113,33 @@ public sealed record JobOptions
 
     /// <summary>Which thread runs this actor's jobs. See <see cref="ExecutionMode"/>.</summary>
     public ExecutionMode Mode { get; init; } = ExecutionMode.LeaderFlush;
+
+    /// <summary>
+    /// When a job on a worker makes more than one idle actor ready, hand the extras to the worker
+    /// pool instead of running them all on the flushing thread. Default <c>true</c>.
+    ///
+    /// <para>Waking one actor from another queues it on a thread-local list, which is the right
+    /// trade for a single hop: no wake-up, no ready-queue round trip. But that list is thread-local,
+    /// so no other worker can take from it — a zone actor broadcasting to a hundred player actors
+    /// ran all hundred on the one worker while the rest of the pool sat idle. The first actor a
+    /// flush makes ready still stays local; the rest go to the pool.</para>
+    ///
+    /// <para>Set it to <c>false</c> to keep the pre-fix behaviour on a workload where the extra hop
+    /// costs more than the parallelism buys.</para>
+    /// </summary>
+    public bool FanOutToWorkers { get; init; } = true;
+
+    /// <summary>
+    /// Also report failures of <c>Ask</c> / <c>AskAsync</c> through
+    /// <see cref="AsyncExecutable.OnJobError"/>. Default <c>false</c>.
+    ///
+    /// <para>Their exception already reaches the caller through the returned task, so calling the
+    /// actor's error hook as well reports it twice. <c>RunAsync</c> is not covered by this flag: it
+    /// returns no value, is commonly fire-and-forget, and staying silent there means the failure is
+    /// recorded nowhere at all. Metrics and the <see cref="MaxConsecutiveFailures"/> streak see every
+    /// failure either way.</para>
+    /// </summary>
+    public bool ReportAwaitedFailures { get; init; }
 
     /// <summary>
     /// Fairness cap: after this many jobs the flushing thread yields the actor back to the

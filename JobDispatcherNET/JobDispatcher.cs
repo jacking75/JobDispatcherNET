@@ -16,6 +16,18 @@ public sealed record JobDispatcherOptions
     /// <summary>Restarts allowed per worker slot before it is left down. Default 5.</summary>
     public int MaxRestartsPerWorker { get; init; } = 5;
 
+    /// <summary>
+    /// Keep restarting a crashing worker past <see cref="MaxRestartsPerWorker"/> when it is the last
+    /// one left on the system. Default true.
+    ///
+    /// <para>The restart budget is a policy for "this slot is bad, the others can carry the load".
+    /// With no other worker there is no load-carrying left to do: actors already on the ready queue
+    /// have no way to run, so their queues grow and their <c>DisposeAsync</c> never returns, while
+    /// new actors flush inline and make the system look healthy. Retrying at
+    /// <see cref="MaxRestartBackoff"/> and logging every attempt is strictly better than that.</para>
+    /// </summary>
+    public bool KeepLastWorkerAlive { get; init; } = true;
+
     /// <summary>Base delay between restarts; doubles with each attempt. Default 1s.</summary>
     public TimeSpan RestartBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
@@ -243,8 +255,47 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
                 return;
         }
 
+        DrainStrandedReadyQueue();
+
         if (Interlocked.Increment(ref _completedWorkers) == WorkerCount)
             _allWorkersDone?.TrySetResult();
+    }
+
+    /// <summary>
+    /// Last thing a worker does when nothing is going to replace it: if it was the system's last
+    /// worker, run out whatever is still on the ready queue.
+    ///
+    /// <para>Those actors cannot recover on their own. Their counters say a leader exists, so every
+    /// later post queues behind work that will never run and their <c>DisposeAsync</c> never
+    /// completes — while new actors flush inline and the system looks fine. This thread is dying
+    /// anyway, so it is the one thread that can still finish them.</para>
+    ///
+    /// <para>Skipped for an orderly stop: abandoning the queue is the whole point of one, and
+    /// draining here would hold up shutdown.</para>
+    /// </summary>
+    private void DrainStrandedReadyQueue()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _cts.IsCancellationRequested)
+            return;
+        if (System.HasWorkers)
+            return;
+
+        try
+        {
+            System.Logger.Warn(
+                $"Worker slot on '{System.Name}' is the last one leaving; draining the ready queue " +
+                $"({System.ReadyQueueDepth} item(s)) on the way out.");
+
+            while (!_cts.IsCancellationRequested && System.DrainReady(Options.MaxReadyDrainPerTick) != 0)
+            {
+            }
+        }
+        catch (Exception ex)
+        {
+            // Outside the worker's own try/catch, on a thread nobody owns: an escape here ends the
+            // process, which is a far worse outcome than a ready queue left where it was.
+            System.Logger.Error("Draining the ready queue on the last worker's exit failed", ex);
+        }
     }
 
     private bool TryRestart(int slot)
@@ -259,9 +310,19 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
         var attempts = Interlocked.Increment(ref _restartCounts[slot]);
         if (attempts > Options.MaxRestartsPerWorker)
         {
+            // UnregisterWorker has already run for this slot, so a live count of zero means this
+            // thread is the last worker the *system* has — including any second dispatcher's.
+            if (!Options.KeepLastWorkerAlive || System.LiveWorkerCount != 0)
+            {
+                System.Logger.Error(
+                    $"Worker slot #{slot} exceeded max restarts ({Options.MaxRestartsPerWorker}) — permanently down");
+                return false;
+            }
+
             System.Logger.Error(
-                $"Worker slot #{slot} exceeded max restarts ({Options.MaxRestartsPerWorker}) — permanently down");
-            return false;
+                $"Worker slot #{slot} is the last worker on '{System.Name}'; restarting past the budget " +
+                $"(attempt {attempts}) because actors already on the ready queue have no other way to run. " +
+                $"Set {nameof(JobDispatcherOptions)}.{nameof(JobDispatcherOptions.KeepLastWorkerAlive)} = false to give up instead.");
         }
 
         System.Metrics.OnWorkerRestart();
@@ -319,7 +380,11 @@ public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
     /// </summary>
     protected int PumpReadyQueue()
     {
-        ThreadContext.TickCount = System.CurrentTick;
+        // Diagnostic only — nothing in the library reads it — and it costs a Stopwatch read per
+        // worker iteration, so it rides with the rest of the detailed metrics.
+        if (System.Options.EnableDetailedMetrics)
+            ThreadContext.TickCount = System.CurrentTick;
+
         return System.DrainReady(Options.MaxReadyDrainPerTick);
     }
 
