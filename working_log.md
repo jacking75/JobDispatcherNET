@@ -1,5 +1,11 @@
 # Working Log
 
+## 2026-09-04 10:38 KST - 개발 중 사용한 리뷰 문서 정리
+
+- 코드 리뷰 작업 중 임시로 작성했던 `docs/review-0.10.0.md`, `docs/review-followup-2026-09-03.md`를 삭제했다. 두 문서 모두 리뷰 계획/추적용이었고 내용은 이미 코드에 반영되어 `CHANGELOG.md`와 `docs/` 내 정식 문서(예: `docs/benchmarks.md`)에 남아 있어 별도 보관이 불필요했다.
+- `docs/benchmarks.md`에서 삭제된 문서를 가리키던 링크를 일반 텍스트 설명으로 교체해 깨진 링크를 없앴다.
+- `docs/README.md` 색인에는 애초에 두 문서가 포함되어 있지 않아 추가 수정은 필요 없었다.
+
 ## 2026-09-04 02:12 KST - 후속 리뷰 구현: S1~S21 · S24 · S25 반영
 
 - `docs/review-followup-2026-09-03.md`의 25건 중 **23건을 구현**했다. 테스트 100 → 123개, net8.0/net10.0 · Debug/Release 전부 통과.

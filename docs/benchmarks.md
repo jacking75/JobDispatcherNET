@@ -103,9 +103,9 @@ Revisit if a profile on real work shows the actor queue near the top.
 
 ## Fixtures added by the follow-up review
 
-Four of the items in [`review-followup-2026-09-03.md`](review-followup-2026-09-03.md) are performance
-questions that a number should decide rather than an argument. These fixtures exist to produce those
-numbers; none of them has been run properly yet, so nothing here is published as a result.
+Four items from the second-pass follow-up review were performance questions that a number should
+decide rather than an argument. These fixtures exist to produce those numbers; none of them has been
+run properly yet, so nothing here is published as a result.
 
 | Fixture | Item | Question |
 |---|---|---|
