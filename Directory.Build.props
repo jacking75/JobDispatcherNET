@@ -11,7 +11,7 @@
 
   <!-- Version is centralized here. Bump for a release, then pack and push manually (no CI). -->
   <PropertyGroup>
-    <VersionPrefix>0.10.0</VersionPrefix>
+    <VersionPrefix>0.11.0</VersionPrefix>
     <Authors>jacking75</Authors>
     <Company>jacking75</Company>
     <Product>JobDispatcherNET</Product>

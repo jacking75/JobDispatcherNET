@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<!-- The items marked "follow-up review" come from docs/review-followup-2026-09-03.md, a second
-     pass over the library after the A/B/C review landed. Two of them are regressions that pass
-     introduced. -->
+## [0.11.0] - 2026-09-04
+
+<!-- The items marked "follow-up review" come from a second pass over the library after the A/B/C
+     review landed. Two of them are regressions that pass introduced. -->
 
 ### Performance
 

@@ -1,5 +1,12 @@
 # Working Log
 
+## 2026-09-04 10:46 KST - NuGet 버전 0.11.0으로 상향
+
+- `Directory.Build.props`의 `VersionPrefix`를 `0.10.0` → `0.11.0`으로 올렸다. 모든 팩키지(`JobDispatcherNET`, `Extensions.Hosting`, `Extensions.Logging`, `Templates`)가 이 값을 공유하므로 한 곳만 수정하면 된다.
+- `CHANGELOG.md`의 `[Unreleased]` 절 내용을 `[0.11.0] - 2026-09-04`로 확정하고 그 위에 새 빈 `[Unreleased]` 절을 추가했다(Keep a Changelog 관례).
+- `templates/README.md`의 로컬 테스트 예시 nupkg 파일명을 `0.11.0`으로 맞췄다.
+- 코어 라이브러리를 Release로 빌드해 경고/오류 0개 확인.
+
 ## 2026-09-04 10:38 KST - 개발 중 사용한 리뷰 문서 정리
 
 - 코드 리뷰 작업 중 임시로 작성했던 `docs/review-0.10.0.md`, `docs/review-followup-2026-09-03.md`를 삭제했다. 두 문서 모두 리뷰 계획/추적용이었고 내용은 이미 코드에 반영되어 `CHANGELOG.md`와 `docs/` 내 정식 문서(예: `docs/benchmarks.md`)에 남아 있어 별도 보관이 불필요했다.

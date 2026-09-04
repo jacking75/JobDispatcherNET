@@ -16,7 +16,7 @@ dedicated worker pool, bounded actor queues with a drop callback, per-session or
 
 ```bash
 dotnet pack templates/JobDispatcherNET.Templates.csproj -o ./nupkg
-dotnet new install ./nupkg/JobDispatcherNET.Templates.0.10.0.nupkg
+dotnet new install ./nupkg/JobDispatcherNET.Templates.0.11.0.nupkg
 dotnet new jobdispatcher-server -n Scratch -o /tmp/scratch
 dotnet new uninstall JobDispatcherNET.Templates
 ```
