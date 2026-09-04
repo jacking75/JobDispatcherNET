@@ -1,5 +1,11 @@
 # Working Log
 
+## 2026-09-04 11:58 KST - 0.11.0 릴리스 문서 점검
+
+- 0.11.0 배포(pack/nuget push/태그 `v0.11.0`) 이후 문서 전반에 버전 관련 갱신 누락이 있는지 점검했다.
+- `CHANGELOG.md` 하단의 비교 링크가 갱신되지 않아 `[Unreleased]`가 여전히 `v0.10.0...HEAD`를 가리키고 있었다. `v0.11.0...HEAD`로 고치고 `[0.11.0]: compare/v0.10.0...v0.11.0` 링크를 추가했다.
+- README, docs/, Book, samples 등 나머지 마크다운에는 버전 하드코딩이 없어 추가 수정이 필요 없었다.
+
 ## 2026-09-04 10:46 KST - NuGet 버전 0.11.0으로 상향
 
 - `Directory.Build.props`의 `VersionPrefix`를 `0.10.0` → `0.11.0`으로 올렸다. 모든 팩키지(`JobDispatcherNET`, `Extensions.Hosting`, `Extensions.Logging`, `Templates`)가 이 값을 공유하므로 한 곳만 수정하면 된다.

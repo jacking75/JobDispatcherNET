@@ -546,5 +546,6 @@ release. They are listed first because they were introduced by the v2.1 work rat
 - `ThreadContext.Timer`. Timers are no longer thread-affine, so there is nothing per-thread
   to expose.
 
-[Unreleased]: https://github.com/jacking75/JobDispatcherNET/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/jacking75/JobDispatcherNET/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/jacking75/JobDispatcherNET/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jacking75/JobDispatcherNET/releases/tag/v0.10.0
