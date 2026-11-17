@@ -184,7 +184,7 @@ services.AddJobDispatcher(o => o.WorkerCount = 8);
 | [Pitfalls](docs/pitfalls.md) | The mistakes this model turns into hangs |
 | [ADRs](docs/adr/README.md) | Why the design is the way it is |
 | [Benchmarks](docs/benchmarks.md) | How to reproduce the numbers |
-| [Book (Korean, 13 chapters)](Book/README.md) | Full walkthrough from first principles |
+| [Book (Korean, 7 chapters)](Book/README.md) | Full walkthrough from first principles |
 
 ---
 

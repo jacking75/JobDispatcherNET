@@ -1,525 +1,1009 @@
-# Chapter 05: 타이머 서비스와 ThreadContext — 지연·주기 실행
+# 제5장: 콘솔과 채팅 서버 예제 분석
 
-## 5.1 타이머는 어디에서 살아야 하나?
+ExampleConsoleApp으로 작업 등록, 타이머와 워커 사용법을 익힌 뒤 ExampleChatServer로 확장한다. 콘솔의 단일 Actor에서 채팅 서버의 ChatServer·Room·User 협업까지 단계적으로 따라간다.
 
-`DoAsyncAfter(5초, ...)`를 호출하면 누군가는 5초를 세고 있어야 합니다. 그 "누군가"를 어디에
-두느냐가 이 장의 전부입니다. 선택지는 셋입니다.
+## 5.1 ExampleConsoleApp — 프로젝트 구조
 
 ```
-① 예약한 스레드마다 하나씩 둔다        ← v1 / v2.0 이 택했던 방식
-   장점: 락 없음, ThreadLocal 로 간단
-   단점: 그 스레드가 죽으면 타이머도 같이 죽는다 ★
-
-② ThreadPool 타이머(System.Threading.Timer)를 쓴다
-   장점: 만들기 쉽다
-   단점: 콜백이 ThreadPool 스레드에서 실행 → actor 코드가 워커 밖으로 샌다
-         ThreadPool 이 포화되면 게임 틱이 밀린다
-
-③ JobSystem 마다 전용 타이머 스레드를 하나 둔다     ← 지금 방식
-   장점: 소유자가 명확하고, 워커가 죽어도 타이머는 산다
-        발화는 actor 큐로 넘기므로 실행은 여전히 워커에서
-   단점: 스레드 1개를 상시 점유 (대신 대기 중에는 CPU 0%)
+ExampleConsoleApp/
+├── Program.cs              ← 세 가지 예제를 실행하는 진입점
+├── TestObject.cs           ← 가장 기본적인 AsyncExecutable 구현
+├── TestWorkerThread.cs     ← IRunnable 구현
+├── DataProcessor.cs        ← Actor 스타일 심화 예제
+└── ProcessingService.cs    ← DataProcessor를 래핑하는 서비스
 ```
 
-①의 단점이 실제 장애로 이어진 것이 P0-2 결함입니다. 워커가 예외로 죽어 supervisor 가
-재기동하면, **그 워커 스레드에서 예약해 둔 타이머가 전부 사라졌습니다.** NPC AI tick 체인,
-부활 타이머, AOI 재동기화가 조용히 영구 정지하고, 메트릭에도 잡히지 않았습니다.
+이 프로젝트는 세 가지 예제를 순서대로 실행합니다:
 
-그래서 v2.1 은 ③으로 바꿨습니다.
+```
+main() 실행
+    │
+    ├── BasicExampleAsync()       ← 예제 1: DoAsync/DoAsyncAfter 기본
+    │
+    ├── WorkerThreadExampleAsync() ← 예제 2: IRunnable + JobDispatcher
+    │
+    └── AdvancedExampleAsync()    ← 예제 3: Actor 스타일 DataProcessor
+```
 
 ---
 
-## 5.2 TimerService — 시스템당 전용 스레드 1개
-
-```
-JobSystem "game"
-   ├─ 워커 스레드 8개        (JobWorker-game-0 ~ 7)
-   ├─ 타이머 스레드 1개      (JobTimer-game)         ← 이 장의 주인공
-   ├─ ready 큐
-   └─ 메트릭
-```
-
-`TimerService`는 `internal` 클래스입니다. 사용자가 직접 만들거나 참조하지 않고,
-`DoAsyncAfter` / `DoAsyncEvery` 를 통해서만 씁니다. 내부는 아주 단순합니다:
+## 5.2 TestObject — 가장 단순한 Actor
 
 ```csharp
-internal sealed class TimerService : IDisposable
+public class TestObject : AsyncExecutable
 {
-    private const int MaxWaitMs = 1000;
+    private int _testCount;  // lock 없이 안전하게 쓸 수 있는 필드
 
-    private readonly object _lock = new();
-    private readonly PriorityQueue<TimerEntry, long> _queue = new();   // 만료 시각 최소 힙
-    private readonly List<TimerEntry> _dueBuffer = [];
-    private readonly Thread _thread;   // "JobTimer-{system.Name}", AboveNormal, IsBackground
-    private long _pending;
-}
-```
-
-핵심 루프는 "가장 빨리 만료될 항목까지 자고, 깨어나서 만료된 것을 꺼내 던진다"입니다.
-
-```csharp
-while (살아있는 동안)
-{
-    lock (_lock)
+    public void TestFunc0()
     {
-        CollectDueLocked();               // 만료된 항목을 _dueBuffer 로
+        Interlocked.Increment(ref _testCount);
+    }
 
-        if (_dueBuffer.Count == 0)
+    public void TestFunc1(int b)
+    {
+        Interlocked.Add(ref _testCount, b);
+    }
+
+    public void TestFunc2(double a, int b)
+    {
+        Interlocked.Add(ref _testCount, b);
+
+        // Actor 내부에서 자기 자신에게 다시 DoAsync!
+        // → 새 작업이 현재 큐에 추가됨 (직렬 실행 보장)
+        if (a < 50.0)
         {
-            if (_queue.Count == 0)
-            {
-                Monitor.Wait(_lock, MaxWaitMs);   // 예약이 하나도 없음 → 최대 1초 대기
-                continue;
-            }
-
-            _queue.TryPeek(out _, out var nextDue);
-            var remaining = nextDue - CurrentTick;
-            if (remaining <= 0) continue;
-
-            Monitor.Wait(_lock, (int)Math.Min(remaining, MaxWaitMs));  // 다음 만료까지 대기
-            continue;
+            DoAsync(() => TestFunc1(b));
         }
     }
 
-    DispatchDue();                        // 락 밖에서 발화
-}
-```
-
-`PeriodicTimer(1ms)` 를 돌리지 않는 것이 포인트입니다. **예약이 없으면 이 스레드는 완전히
-잠들어 있고, 새 예약이 들어오면 `Monitor.Pulse`로 깨어납니다.** 워커 8개면 ThreadPool 에
-1ms 주기 태스크가 8개 돌던 예전 구조와 비교됩니다.
-
-`PriorityQueue`를 쓰는 이유는 그대로입니다:
-
-```
-일반 Queue:            PriorityQueue (최소 힙):
-
-[A: 500ms]             [B: 100ms] ← 맨 앞 (가장 빨리 만료)
-[B: 100ms]             [C: 200ms]
-[C: 200ms]             [A: 500ms]
-
-순서대로 꺼내면         만료 시각 순으로 꺼냄
-B를 빨리 처리 못함      → "다음 만료까지 잔다" 가 가능해짐
-```
-
----
-
-## 5.3 예약에서 실행까지
-
-```csharp
-// AsyncExecutable
-public ITimerHandle DoAsyncAfter(TimeSpan delay, Action action)
-{
-    ArgumentNullException.ThrowIfNull(action);
-
-    if (!TryReserve(out var reason))       // 셧다운/Dispose/faulted 면 예약 자체를 거부
+    public void TestFuncForTimer(int b)
     {
-        Refuse(reason);
-        return CancelledTimer.Instance;    // Cancel() == false, IsPending == false
+        // 50% 확률로 재귀적 타이머 예약
+        if (Random.Shared.Next(2) == 0)
+        {
+            DoAsyncAfter(TimeSpan.FromSeconds(1), () => TestFuncForTimer(-b));
+        }
     }
 
-    return _system.Timers.Schedule(this, delay, Job.Rent(action));
+    public int GetTestCount() => _testCount;
 }
 ```
 
-발화 경로는 다음과 같습니다:
+> `TestFuncForTimer` 는 "자기 자신을 다시 예약"하는 옛 패턴을 일부러 남겨 둔 예제입니다.
+> 실제 주기 작업에는 `DoAsyncEvery` 를 쓰세요 (3.5) — 예외에 강하고 취소가 쉽습니다.
+> `DoAsyncAfter` 는 이제 `ITimerHandle` 을 반환하므로, 위처럼 반환값을 버리면 나중에
+> 취소할 방법이 없다는 점도 기억해 두세요.
 
-```mermaid
-sequenceDiagram
-    participant App as 앱 코드
-    participant AE as AsyncExecutable
-    participant TS as TimerService(시스템당 1개)
-    participant RQ as JobSystem ready 큐
-    participant W as 워커 스레드
+잠깐! `_testCount`에 `Interlocked.Add`를 쓰고 있습니다. Actor 내부에서 실행되는데 왜 Interlocked을 쓸까요?
 
-    App->>AE: DoAsyncAfter(5s, action)
-    AE->>TS: Schedule(this, 5s, job)
-    Note over TS: PriorityQueue 에 저장<br/>(dueTick = now+5000ms)
-    TS-->>App: ITimerHandle (취소 가능)
-
-    Note over TS: 다음 만료까지 Monitor.Wait
-    TS->>TS: 5초 후 만료
-    TS->>AE: DoTaskFromTimer(job)
-    Note over AE: Admit(job, fromTimer: true)
-    AE->>RQ: system.Schedule(actor)
-    W->>RQ: DrainReady()
-    W->>AE: FlushAsLeader()
-    AE->>AE: action() 실행 (워커 스레드에서!)
 ```
+설명:
+─────────────────────────────────────────────────────────
+TestObject는 AsyncExecutable을 상속하므로 내부 메서드들은
+항상 직렬 실행됩니다.
 
-여기서 중요한 것은 **타이머 스레드가 사용자 코드를 직접 실행하지 않는다**는 점입니다.
-타이머 스레드는 `actor.DoTaskFromTimer(job)` 만 호출하고, 그 안의 `Admit(..., fromTimer: true)`이
-actor 를 ready 큐에 올립니다. 실행은 워커에서 일어납니다. 타이머 스레드가 느린 콜백에 붙들려
-다음 만료를 놓치는 일이 없습니다.
+하지만 GetTestCount()는 외부 스레드에서 직접 호출될 수 있습니다!
+  TestObject._testCount를 읽기 위해 직접 호출하면
+  → 읽기와 쓰기가 동시에 발생 가능
 
-만료 시각이 지난 뒤 실제로 발화하기까지 걸린 시간(lag)은
-`EnableDetailedMetrics` 를 켜면 히스토그램으로 기록됩니다 (`jobdispatcher.timer.lag`).
+완전한 Actor 모델이라면 GetTestCount()도 큐를 통해야 합니다.
+이 예제는 간단함을 위해 Interlocked를 사용한 것입니다.
+
+실제 서버에서는 GetSnapshot() 패턴을 쓰는 것이 더 안전합니다!
+─────────────────────────────────────────────────────────
+```
 
 ---
 
-## 5.4 취소 — ITimerHandle
+## 5.3 예제 1: BasicExampleAsync
 
 ```csharp
-public interface ITimerHandle
+static async Task BasicExampleAsync()
 {
-    /// 발화 전이면 취소하고 true. 이미 발화했거나 이미 취소됐으면 false.
-    /// 주기 타이머는 이후 모든 발화가 멈춘다.
-    bool Cancel();
+    Console.WriteLine("Basic Example:");
 
-    /// 아직 한 번 이상 발화할 예정인가
-    bool IsPending { get; }
+    await using var testObject = new TestObject();
+
+    // ① 즉시 실행 — 큐에 넣고 이 스레드(Main)에서 바로 Flush!
+    testObject.DoAsync(() => testObject.TestFunc0());
+    testObject.DoAsync(() => testObject.TestFunc1(5));
+    testObject.DoAsync(() => testObject.TestFunc2(25, 10));
+
+    // ② 500ms 후 실행 — 시스템의 타이머 스레드에 예약
+    testObject.DoAsyncAfter(TimeSpan.FromMilliseconds(500),
+        () => testObject.TestFunc1(15));
+
+    // ③ 500ms + 처리 시간을 기다림
+    await Task.Delay(1000);
+
+    Console.WriteLine($"Test count: {testObject.GetTestCount()}");
 }
 ```
 
-취소는 "폐기된 객체를 타이머가 붙들고 있는" 문제를 없앱니다.
+실행 순서 추적:
 
-```csharp
-// ❌ 예전 방식 — 취소가 없으니 플래그로 무시했다
-private volatile bool _despawned;
+```
+DoAsync(TestFunc0)
+    → CAS 0→1  — 내가 첫 번째, 즉 leader!
+    → 큐에 넣기
+    → Flush 시작 (Main 스레드에서)
+        TestFunc0 실행  (_testCount += 1)          ← +1
+        Decrement(count=0)  — 큐 비었음 → return
 
-private void RespawnTick()
-{
-    if (_despawned) return;   // 발화는 하되 아무것도 안 함
-    ...
-}
-// → 타이머가 actor 참조를 계속 붙들고 있어 GC 도 지연되고,
-//   셧다운 시 "남은 타이머"가 계속 발화해 드레인이 끝나지 않는다
+DoAsync(TestFunc1(5))
+    → CAS 0→1  — 또 첫 번째!
+    → Flush 시작
+        TestFunc1(5) 실행  (_testCount += 5)       ← +5
+        Decrement(count=0)  — return
 
-// ✅ 지금 방식 — 진짜로 취소한다
-private ITimerHandle? _respawnTimer;
+DoAsync(TestFunc2(25, 10))
+    → CAS 0→1
+    → Flush 시작
+        TestFunc2(25, 10) 실행
+            Interlocked.Add(10)                    ← +10
+            a(25) < 50.0 → DoAsync(TestFunc1(10))
+                → CAS 1→2  ← 이미 leader 가 있으므로 큐에만 넣기
+        Decrement(count=1)  — 아직 작업 있음
+        TestFunc1(10) 실행  (_testCount += 10)     ← +10
+        Decrement(count=0)  — return
 
-private void ProcessReceiveDamage(...)
-{
-    if (!_npc.IsAlive)
-        _respawnTimer = DoAsyncAfter(TimeSpan.FromSeconds(8), static a => a.Respawn(), this);
-}
+DoAsyncAfter(500ms, TestFunc1(15))
+    → 타이머 스레드(JobTimer-default)의 PriorityQueue 에 예약
+    → 500ms 후 만료 → testObject 의 큐로 투입
+    → 이 프로세스에는 워커가 없다 → 타이머 스레드가 그 자리에서 Flush
+       (Warn 로그 1회: "JobSystem 'default' has no worker threads ...")
+        TestFunc1(15) 실행  (_testCount += 15)     ← +15
 
-private void ProcessDespawn()
-{
-    _despawned = true;
-    _tickTimer?.Cancel();
-    _respawnTimer?.Cancel();   // ← 예약을 실제로 없앤다
-}
+최종: _testCount = 1 + 5 + 10 + 10 + 15 = 41
+출력:  Test count: 41
 ```
 
-취소된 타이머의 `Job`은 `Discard()`로 풀에 반납되고(4.9), `TimersCancelled` 카운터가 올라갑니다.
+### ⚠️ v2.0 에서는 여기서 26 이 나왔습니다
+
+이 예제는 P0-3 결함의 재현 코드이기도 합니다.
+
+```
+v2.0 출력:  Test count: 26      ( = 1 + 5 + 10 + 10 )
+v2.1 출력:  Test count: 41      ( = 26 + 15 )
+```
+
+만료된 타이머 작업이 워커만 드레인하는 큐로 들어갔는데, 이 예제에는 `JobDispatcher` 가
+없습니다. 그래서 `TestFunc1(15)` 이 **영원히 실행되지 않았고**, 경고도 없었습니다.
+"디스패처 없이도 지연 실행이 정상 트리거된다"는 예전 설명은 v1 시절의 동작이었고,
+v2.0 에서는 사실이 아니었습니다.
+
+지금은 워커가 없으면 타이머 스레드가 직접 flush 합니다. 다시 "디스패처 없이도 동작"하지만,
+**그 경우 콜백이 워커가 아니라 타이머 스레드에서 실행된다**는 조건이 붙습니다. 그래서 첫
+발화 때 경고를 한 번 남깁니다. 실제 서버라면 `JobDispatcher` 를 띄우세요.
 
 ---
 
-## 5.5 DoAsyncEvery — 주기 실행
+## 5.4 TestWorkerThread — IRunnable 구현
 
 ```csharp
-public ITimerHandle DoAsyncEvery(
-    TimeSpan period,              // 반복 간격 (양수여야 함)
-    Action action,
-    TimeSpan? initialDelay = null // 첫 발화까지의 지연. 생략하면 period 와 같다
-);
-```
+public class TestWorkerThread : IRunnable
+{
+    private readonly List<TestObject> _testObjects = new();
+    private const int TestObjectCount = 10;
 
-이 API 가 대체하는 것이 **"작업이 끝나면서 자기 자신을 다시 예약"하는 자기복제 패턴**입니다.
-그 패턴에는 두 가지 문제가 있었습니다.
-
-```
-문제 1 — 예외 한 번에 체인이 끊긴다
-    private void Tick()
+    public TestWorkerThread()
     {
-        DoWork();                              // ← 여기서 예외!
-        DoAsyncAfter(_interval, Tick);         // ← 이 줄에 도달하지 못함
+        // 이 워커가 소유할 10개의 TestObject 생성
+        for (int i = 0; i < TestObjectCount; i++)
+        {
+            _testObjects.Add(new TestObject());
+        }
     }
-    로그 한 줄 남기고 그 NPC 는 영원히 멈춘다. 재무장할 방법도 없다.
 
-문제 2 — 드리프트(drift)
-    "작업이 끝난 시점" 부터 다시 200ms 를 세므로,
-    작업이 5ms 걸리면 실제 주기는 205ms 가 된다. 1시간이면 1분 이상 밀린다.
-```
-
-`DoAsyncEvery`는 둘 다 해결합니다.
-
-```csharp
-// TimerService.DispatchDue — 주기 항목 재무장
-_system.Metrics.OnTimerFired();
-_system.DispatchTimerJob(entry.Owner, Job.Rent(action));   // 발화는 actor 큐로
-
-// 드리프트 방지: "끝난 시각"이 아니라 "예정 시각"에 period 를 더한다.
-// 단, 과거로는 예약하지 않는다 (밀렸을 때 폭주 방지).
-var next = entry.DueTick + ToMillis(entry.Period);
-if (next <= now) next = now + ToMillis(entry.Period);
-Enqueue(entry, next, isNew: false);
-```
-
-발화와 재무장이 **타이머 스레드에서** 일어나므로, actor 큐 안에서 콜백이 예외를 던져도
-다음 틱은 정상적으로 옵니다. 정지는 핸들을 `Cancel()` 하는 것 하나뿐입니다.
-
-```csharp
-// AdvancedMmorpgServer/NpcActor.cs
-private void ProcessStart()
-{
-    if (_despawned) return;
-
-    // 첫 틱만 0~interval 사이로 흩어서 50마리가 같은 ms 에 몰리지 않게 한다
-    var jitter = TimeSpan.FromMilliseconds(
-        Random.Shared.Next(0, Math.Max(1, (int)_tickInterval.TotalMilliseconds)));
-
-    _tickTimer = DoAsyncEvery(_tickInterval, Tick, jitter);
-}
-```
-
-```
-t=0     DoAsyncEvery(200ms, Tick, jitter=73ms)
-t=73    Tick()
-t=273   Tick()
-t=473   Tick()  ← 여기서 예외가 나도
-t=673   Tick()  ← 다음 틱은 온다
-...
-        _tickTimer.Cancel()  → 종료
-```
-
-> 주기 타이머는 살아 있는 동안 `PendingTimerCount` 에 **1** 로만 계수됩니다. 발화할 때마다
-> 카운트가 올라가 내려오지 않던 버그(그래서 `DrainAsync`/`StopAsync` 가 항상 타임아웃까지
-> 기다리던 문제)는 2.1 에서 고쳐졌습니다.
-
----
-
-## 5.6 TimerPrecision — 정확도와 OS 해상도
-
-```csharp
-public enum TimerPrecision
-{
-    /// 만료 시각까지 잔다. CPU 0%. 정확도는 OS 타이머 해상도에 좌우된다.
-    Coarse,   // 기본값
-
-    /// 만료 직전까지 자고 그다음부터 스핀. 서브 밀리초 정확도, 대신 CPU 를 잠깐 태운다.
-    High,
-}
-```
-
-```csharp
-var system = new JobSystem(new JobSystemOptions
-{
-    Name = "game",
-    TimerPrecision = TimerPrecision.High,
-    TimerSpinThresholdMs = 16,          // 만료 16ms 전부터 스핀 시작
-    RaiseSystemTimerResolution = false, // 아래 설명 참조
-});
-```
-
-**반드시 알아야 할 OS 제약이 있습니다.**
-
-```
-Monitor.Wait / Thread.Sleep 의 실제 해상도
-──────────────────────────────────────────────────────────
-Windows (기본):  약 15.6ms   ← "10ms 뒤"를 부탁해도 15.6ms 뒤에 깨어날 수 있다
-Windows (다른 프로세스가 timeBeginPeriod 를 올린 경우): 1ms
-Linux:           약 1ms
-──────────────────────────────────────────────────────────
-
-즉 Coarse 모드에서 200ms 틱은 충분히 정확하지만, 5ms 틱은 정확하지 않습니다.
-```
-
-Windows 에서 이 해상도 자체를 1ms 로 올리는 opt-in 옵션이 `RaiseSystemTimerResolution` 입니다.
-`timeBeginPeriod(1)` 을 호출하는 것으로, **프로세스 전역이 아니라 시스템 전역에 영향을 주고
-전력 소비를 올립니다.** 측정으로 필요성을 확인한 뒤에만 켜세요. 기본값은 꺼짐입니다.
-
-```
-튜닝 순서 권장
-1) Coarse 로 시작한다. 대부분의 서버 틱(50~200ms)에는 이걸로 충분하다.
-2) EnableDetailedMetrics 로 jobdispatcher.timer.lag 히스토그램을 본다.
-3) p99 lag 이 목표를 넘으면 → TimerPrecision.High
-4) 그래도 부족하고 Windows 라면 → RaiseSystemTimerResolution = true (전력 비용 감수)
-```
-
----
-
-## 5.7 워커가 없을 때 — P0-3 과 폴백
-
-`AsyncExecutable` 하나만 만들어 쓰는 가장 단순한 사용법에서는 `JobDispatcher` 가 없습니다.
-이때 타이머가 발화하면 넘겨줄 워커가 없습니다.
-
-```csharp
-// AsyncExecutable.Admit, fromTimer 경로
-if (fromTimer)
-{
-    if (_system.HasWorkers)
+    public bool Run(CancellationToken cancellationToken)
     {
-        _system.Schedule(this);        // 정상 경로: 워커에게 넘긴다
+        if (cancellationToken.IsCancellationRequested)
+            return false;
+
+        int after = Random.Shared.Next(2000);  // 0~2000ms
+
+        if (after > 1000)  // 절반 확률
+        {
+            // 랜덤 TestObject들에 작업 보내기
+            int i1 = Random.Shared.Next(TestObjectCount);
+            int i2 = Random.Shared.Next(TestObjectCount);
+            int i3 = Random.Shared.Next(TestObjectCount);
+            int i4 = Random.Shared.Next(TestObjectCount);
+
+            _testObjects[i1].DoAsync(() => _testObjects[i1].TestFunc0());
+            _testObjects[i2].DoAsync(() =>
+                _testObjects[i2].TestFunc2(Random.Shared.Next(100), 2));
+            _testObjects[i3].DoAsync(() => _testObjects[i3].TestFunc1(1));
+
+            // 지연 실행도 테스트
+            _testObjects[i4].DoAsyncAfter(
+                TimeSpan.FromMilliseconds(after),
+                () => _testObjects[i4].TestFuncForTimer(after));
+        }
+
+        // 카운트가 5000을 넘으면 강제 종료 (조기 종료 테스트)
+        if (_testObjects[Random.Shared.Next(TestObjectCount)].GetTestCount() > 5000)
+        {
+            Console.WriteLine($"Thread {Environment.CurrentManagedThreadId} end by force");
+            return false;  // ← false 반환으로 이 워커 종료
+        }
+
+        Thread.Sleep(1);  // CPU 양보
         return true;
     }
 
-    // 디스패처가 하나도 없다. 조용히 사라지게 두는 대신(v2.0 동작)
-    // 이 자리(타이머 스레드)에서 실행하고, 그 사실을 한 번만 알린다.
-    _system.WarnTimerFallbackOnce();
-    RunFlushLoop();
-    return true;
-}
-```
-
-로그는 딱 한 번만 나옵니다:
-
-```
-[JobDispatcherNET][Warn] JobSystem 'default' has no worker threads, so timer callbacks run
-on the timer thread. Start a JobDispatcher to move them onto dedicated workers.
-```
-
-> **v2.0 에서는 이랬다 (P0-3)**
-> 만료된 타이머 작업은 `TimerDispatchQueue` 라는 전역 큐에 들어갔고, **그 큐를 드레인하는 것은
-> 워커의 `Run` 루프뿐이었습니다.** 워커가 없는 프로세스에서는 `DoAsyncAfter` 가 아무것도 하지
-> 않고, 경고조차 없었습니다. 9장의 `ExampleConsoleApp` 이 `Test count: 41` 대신 `26` 을 찍던
-> 원인이 바로 이것입니다. 예전 문서에 있던 *"디스패처 없이도 지연 실행이 정상 트리거된다"* 는
-> 서술은 v1 시절의 동작을 그대로 옮긴 것이었고, v2.0 에서는 사실이 아니었습니다.
-> 지금은 다시 사실이 되었습니다 — 단, 워커가 없으면 콜백이 타이머 스레드에서 돈다는 조건과
-> 함께입니다.
-
----
-
-## 5.8 ThreadContext — 남아 있는 것들
-
-`ThreadContext`는 여전히 존재하지만, 이제 타이머와는 무관합니다. `[ThreadStatic]` 필드
-네 개뿐입니다 (`ThreadLocal<T>` 보다 hot path 에서 쌉니다).
-
-```csharp
-public static class ThreadContext
-{
-    /// 이 스레드가 지금 flush 중인 actor. null 이면 actor 작업 밖.
-    public static AsyncExecutable? CurrentExecuter { get; internal set; }
-
-    /// 이 스레드가 다른 actor 를 flush 하는 동안 leader 가 된 actor 들의 대기열.
-    /// 가장 바깥 flush 루프가 드레인하므로 중첩 디스패치가 재귀하지 않는다.
-    public static Queue<AsyncExecutable> ExecuterQueue { get; }
-
-    /// JobSystem 기준 단조 증가 ms. 워커가 틱마다 갱신한다.
-    public static long TickCount { get; set; }
-
-    /// JobDispatcher 가 만든 스레드인가. ExecutionMode.Scheduled 판정에 쓰인다.
-    public static bool IsWorkerThread { get; internal set; }
-
-    /// 이 워커 스레드를 소유한 JobSystem (워커 밖에서는 null).
-    public static JobSystem? CurrentSystem { get; internal set; }
-}
-```
-
-`ThreadContext.Timer` 는 **없습니다.** 스레드마다 타이머를 갖는 설계 자체가 사라졌기 때문입니다.
-
-`TickCount` 는 워커 루프가 매 반복마다 갱신합니다:
-
-```csharp
-// JobDispatcherBase.PumpReadyQueue
-protected int PumpReadyQueue()
-{
-    ThreadContext.TickCount = System.CurrentTick;
-    return System.DrainReady(Options.MaxReadyDrainPerTick);
-}
-```
-
-`IRunnable` 안에서 락 없는 주기 작업을 만들 때 유용합니다:
-
-```csharp
-public bool Run(CancellationToken cancellationToken)
-{
-    long now = ThreadContext.TickCount;   // 이 스레드만의 값 → 락 불필요
-    if (now - _lastHeartbeatTick >= 5000)
+    public void Dispose()
     {
-        _lastHeartbeatTick = now;
-        Console.WriteLine($"Worker alive — tick={now}ms");
+        // TestObject들을 비동기로 Dispose (큐 drain 대기)
+        foreach (var testObject in _testObjects)
+        {
+            testObject.DisposeAsync().AsTask().Wait();
+        }
     }
-    return true;
 }
 ```
 
 ---
 
-## 5.9 v2.0 에서는 이랬다 — 사라진 세 가지
-
-예전 코드를 본 적이 있다면 다음 세 타입을 기억할 겁니다. **셋 다 지금은 없거나 no-op 입니다.**
-
-```
-TimerQueue           스레드마다 하나씩 있던 PriorityQueue + PeriodicTimer(1ms).
-  (제거됨)           - 예약한 스레드가 소유자였다 → 그 스레드가 죽으면 타이머도 죽었다 (P0-2)
-                     - 워커 8개 + IO 스레드 N개면 ThreadPool 에 1ms 주기 태스크가 그만큼 돌았다
-
-TimerDispatchQueue   만료된 작업을 워커에게 넘기던 전역 큐.
-  (제거됨)           - 워커의 Run 루프만 드레인했다 → 워커가 없으면 영원히 발화 안 함 (P0-3)
-
-TimerRegistry        모든 TimerQueue 를 WeakReference 로 추적하던 레지스트리.
-  ([Obsolete],       - 종료 시 DisposeAll() 로 일괄 정리하는 용도였다
-   전부 no-op)       - JobSystem 이 타이머 스레드를 소유하고 함께 Dispose 하므로 할 일이 없다
-```
+## 5.5 예제 2: WorkerThreadExampleAsync
 
 ```csharp
-// 예전 코드는 그대로 컴파일되지만 아무 일도 하지 않는다
-TimerRegistry.DisposeAll();     // no-op
-
-// 대신
-await system.StopAsync(TimeSpan.FromSeconds(10));   // 타이머 스레드도 여기서 정리된다
-```
-
-바꾼 이유를 한 줄로 요약하면: **타이머의 수명은 "예약한 스레드"가 아니라 "작업이 속한
-시스템"에 묶여야 하기 때문입니다.**
-
----
-
-## 5.10 셧다운과 남은 타이머
-
-`JobSystem.StopAsync` / `Dispose` 는 타이머 스레드를 정지시키고, 아직 발화하지 않은 예약을
-모두 폐기합니다.
-
-```csharp
-// TimerService.DiscardAll (Dispose 경로)
-while (_queue.Count > 0)
+static async Task WorkerThreadExampleAsync()
 {
-    var entry = _queue.Dequeue();
-    if (entry.IsCancelled) continue;
-    entry.DiscardJob();                        // Job 은 풀로
-    Interlocked.Decrement(ref _pending);
-    _system.Metrics.OnTimerDiscarded();        // ★ 버려진 개수가 메트릭에 남는다
+    Console.WriteLine("Worker Thread Example:");
+
+    // 4개의 전용 OS 스레드로 TestWorkerThread 실행
+    await using var dispatcher = new JobDispatcher<TestWorkerThread>(4);
+
+    // 스레드 시작 + 모든 완료를 기다리는 Task 반환
+    var dispatcherTask = Task.Run(async () =>
+        await dispatcher.RunWorkerThreadsAsync());
+
+    // 5초 동안 실행
+    Console.WriteLine("Running worker threads for 5 seconds...");
+    await Task.Delay(TimeSpan.FromSeconds(5));
+
+    // 종료 신호 + 스레드 Join
+    Console.WriteLine("Stopping worker threads...");
+    await dispatcher.DisposeAsync();
+
+    Console.WriteLine("All workers have completed");
 }
 ```
 
+4개 워커 스레드의 동작:
+
 ```
-셧다운 시 확인할 것
+JobWorker-0 (OS Thread A):
+    TestWorkerThread-0 생성
+    Run() 반복:
+      → TestObject 0~9에 랜덤으로 DoAsync/DoAsyncAfter
+      → 카운트 체크 → 5000 초과하면 false 반환
+      → Dispose: TestObject들 drain 대기
+
+JobWorker-1 (OS Thread B):
+    TestWorkerThread-1 생성
+    Run() 반복: (독립적으로!)
+
+JobWorker-2 (OS Thread C): ...
+JobWorker-3 (OS Thread D): ...
+
+★ 같은 TestObject에 여러 워커가 DoAsync를 보낼 수 있음
+  → 입장 CAS 가 leader 를 단 하나로 정한다 → 동시 실행 없음
+  → 어떤 워커가 Flush하든 "한 번에 하나씩"이 보장된다
+    (단, 서로 다른 producer 중 누가 먼저 넣는지는 보장되지 않는다 — 4장 Sequencer)
+```
+
+---
+
+## 5.6 DataProcessor — Actor 스타일 심화
+
+```csharp
+public class DataProcessor : AsyncExecutable
+{
+    // lock이 단 하나도 없는 컬렉션!
+    private readonly Dictionary<string, int> _processedItems = new();
+
+    // 외부 진입점: 큐에 넣기만
+    public void ProcessItem(string itemId, int priority)
+    {
+        Console.WriteLine($"[Thread {Environment.CurrentManagedThreadId}] " +
+                          $"Processing {itemId} priority={priority}");
+
+        Thread.Sleep(100 * (1 + Random.Shared.Next(5)));  // 처리 시뮬레이션
+
+        // ★ lock 없이 안전하게 딕셔너리 갱신!
+        if (_processedItems.TryGetValue(itemId, out var count))
+            _processedItems[itemId] = count + 1;
+        else
+            _processedItems[itemId] = 1;
+
+        // 우선순위에 따라 자기 자신에게 후속 작업 예약
+        if (priority > 5)
+            DoAsync(() => HighPriorityFollowUp(itemId));    // 즉시
+        else if (priority > 2)
+            DoAsyncAfter(TimeSpan.FromMilliseconds(500),
+                () => MediumPriorityFollowUp(itemId));      // 500ms 후
+    }
+
+    private void HighPriorityFollowUp(string itemId) { ... }
+    private void MediumPriorityFollowUp(string itemId) { ... }
+
+    // ★ 중요: 읽기도 큐를 통과!
+    public Task<Dictionary<string, int>> GetProcessingStatsAsync()
+    {
+        var tcs = new TaskCompletionSource<Dictionary<string, int>>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        DoAsync(() => tcs.SetResult(new Dictionary<string, int>(_processedItems)));
+
+        return tcs.Task;
+    }
+}
+```
+
+> **지금은 `Ask` 한 줄이면 됩니다.**
+> ```csharp
+> public Task<Dictionary<string, int>> GetProcessingStatsAsync()
+>     => Ask(() => new Dictionary<string, int>(_processedItems));
+> ```
+> `Ask` 는 위와 똑같이 큐를 통과시키면서, 핸들러가 예외를 던지면 Task 를 실패시키고,
+> 큐에 들어가지 못하면 `JobRejectedException` 으로 실패시킵니다. 손으로 만든
+> `TaskCompletionSource` 는 거부됐을 때 영원히 완료되지 않는다는 함정이 있습니다.
+
+왜 GetProcessingStatsAsync에서 큐를 사용하나요?
+
+```
+잘못된 방법 (직접 읽기):
 ──────────────────────────────────────────────────────────
-TimersDiscarded 가 크다  → 종료 시점에 아직 살아 있던 예약이 많다는 뜻.
-                          NPC tick / 부활 타이머를 Despawn 에서 Cancel 하고 있는지 확인.
-                          (AdvancedMmorpgServer 의 GameWorld.Stop 이 하는 일이 정확히 이것)
+// 이렇게 하면:
+public Dictionary<string, int> GetStats()
+    => new Dictionary<string, int>(_processedItems);
+
+외부 스레드에서 호출:
+  Thread-External: new Dict(_processedItems)  ← 복사 시작
+  DataProcessor 큐: ProcessItem() 실행 중
+    → _processedItems 수정!
+  Thread-External: 복사 진행 중 ← 중간 상태 읽기!
+
+올바른 방법 (큐를 통해 읽기):
+──────────────────────────────────────────────────────────
+DoAsync(() => tcs.SetResult(new Dict(_processedItems)))
+
+→ ProcessItem이 모두 처리된 후에 읽기 실행
+→ 일관된 스냅샷 보장!
+→ 큐 순서에 따른 happens-before 일관성
 ```
 
-셧다운 전에 타이머 체인을 정리해 두면 `DrainAsync` 가 실제로 "할 일 없음" 상태에 도달할 수
-있습니다. 정리하지 않으면 주기 타이머가 계속 새 작업을 만들어내므로 드레인이 타임아웃까지
-갑니다.
+---
+
+## 5.7 예제 3: AdvancedExampleAsync
 
 ```csharp
-// AdvancedMmorpgServer/GameWorld.Stop
-_isStopping = true;
-
-DoAsync(static w =>
+static async Task AdvancedExampleAsync()
 {
-    foreach (var s in w._sessions.Values) s.Close();
-    foreach (var na in w._npcs.Values)    na.Despawn();   // 내부에서 tick 타이머 Cancel
-    foreach (var pa in w._players.Values) pa.Despawn();   // 내부에서 resync 타이머 Cancel
-}, this);
+    await using var processingService = new ProcessingService();
 
-// 예전의 Thread.Sleep(200) 대신 실제 정적 상태를 기다린다
-System.DrainAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    processingService.Start();
+
+    // 5초 동안 실행
+    await Task.Delay(TimeSpan.FromSeconds(5));
+
+    // 통계 조회 — 큐를 통과하므로 안전!
+    var stats = await processingService.Processor.GetProcessingStatsAsync();
+
+    Console.WriteLine("\nProcessing Statistics:");
+    Console.WriteLine($"Total unique items: {stats.Count}");
+    Console.WriteLine($"Total operations: {stats.Values.Sum()}");
+
+    foreach (var item in stats.OrderByDescending(x => x.Value))
+        Console.WriteLine($"{item.Key}: {item.Value}회");
+}
+```
+
+ProcessingService의 역할:
+
+```csharp
+public class ProcessingService : IAsyncDisposable
+{
+    private readonly DataProcessor _processor = new();
+
+    public void Start()
+    {
+        // 별도 Task에서 작업을 DataProcessor에 보냄
+        _processingTask = Task.Run(async () =>
+        {
+            for (int i = 0; i < _itemCount && !token.IsCancellationRequested; i++)
+            {
+                string item = _items[Random.Shared.Next(_items.Count)];
+                int priority = Random.Shared.Next(1, 10);
+
+                // ★ DoAsync로 DataProcessor 큐에 넣기
+                _processor.DoAsync(() => _processor.ProcessItem(item, priority));
+
+                await Task.Delay(Random.Shared.Next(10, 50), token);
+            }
+        }, token);
+    }
+}
 ```
 
 ---
 
-## 5.11 정리
+## 5.8 우선순위 후속 작업 다이어그램
 
-```
-이번 장에서 배운 것
-──────────────────────────────────────────────
-✓ 타이머는 JobSystem 이 소유한 전용 스레드 1개가 관리한다
-   (PriorityQueue + Monitor.Wait, 예약이 없으면 CPU 0%)
-✓ 발화는 actor 큐 → ready 큐 → 워커. 타이머 스레드는 사용자 코드를 돌리지 않는다
-✓ DoAsyncAfter / DoAsyncEvery 는 ITimerHandle 을 돌려준다 → Cancel() 가능
-✓ DoAsyncEvery = 드리프트 없는 주기 실행 + 예외에 강한 체인
-✓ TimerPrecision(Coarse/High)과 OS 해상도(Windows 기본 15.6ms) 이해
-✓ 워커가 없으면 타이머 스레드에서 실행 + 1회 경고 (P0-3 수정)
-✓ ThreadContext 에는 이제 Timer 가 없다
-   (CurrentExecuter / ExecuterQueue / TickCount / IsWorkerThread / CurrentSystem)
-✓ TimerQueue·TimerDispatchQueue 는 제거, TimerRegistry 는 no-op
+```mermaid
+sequenceDiagram
+    participant PS as ProcessingService
+    participant DP as DataProcessor(Actor)
+    participant H as HighPriFollowUp
+    participant M as MedPriFollowUp
+
+    PS->>DP: DoAsync(ProcessItem("A", priority=8))
+    Note over DP: ProcessItem 실행
+    DP->>DP: DoAsync(HighPriorityFollowUp("A"))
+    Note over DP: HighPriorityFollowUp 실행
+
+    PS->>DP: DoAsync(ProcessItem("B", priority=3))
+    Note over DP: ProcessItem 실행
+    DP->>DP: DoAsyncAfter(500ms, MedPriFollowUp("B"))
+    Note over DP: (500ms 후)
+    DP->>DP: MedPriorityFollowUp("B") 실행
 ```
 
 ---
 
-*[← Chapter 04](./chapter04.md) | [→ Chapter 06: JobDispatcher와 IRunnable](./chapter06.md)*
+## 5.9 ExampleConsoleApp — 핵심 학습 포인트 정리
+
+```
+BasicExample에서:
+✓ DoAsync는 즉시 Flush를 돌려 같은 스레드(Main)에서 처리
+✓ DoAsyncAfter는 시스템의 타이머 스레드에 예약된다
+✓ 워커가 없으면 타이머 콜백이 타이머 스레드에서 실행된다 (경고 1회)
+✓ Actor 내부에서 DoAsync 호출 시 기존 Flush에 합류
+✓ 기대 출력은 41 — 26 이 나온다면 v2.0 이하다 (P0-3)
+
+WorkerThreadExample에서:
+✓ IRunnable + JobDispatcher<T> = 전용 OS 스레드
+✓ 여러 워커가 같은 Actor에 DoAsync → 입장 CAS 가 직렬 실행을 보장
+✓ Run()이 false 반환 → 해당 워커만 종료 (다른 워커 유지)
+✓ 자체 루프가 필요 없다면 비제네릭 JobDispatcher 가 더 낫다 (3.13)
+
+AdvancedExample에서:
+✓ 읽기도 큐를 통과 → 일관된 스냅샷
+✓ 결과 회수는 손수 만든 TaskCompletionSource 대신 Ask 로
+✓ 자기 자신에게 후속 작업 예약 가능
+```
+
+---
+
+콘솔 예제로 기본 API와 워커 사용법을 확인했다. 이제 여러 Actor가 협업하는 채팅 서버에서 같은 원리를 적용한다.
+
+## 5.10 ExampleChatServer — 프로젝트 구조
+
+```
+ExampleChatServer/
+├── Program.cs           ← 시뮬레이션 실행
+├── ChatServer.cs        ← 최상위 서버 Actor
+├── ChatWorker.cs        ← IRunnable 워커
+├── Room.cs              ← 방 Actor
+├── User.cs              ← 사용자 Actor
+├── Defines.cs           ← 메시지 타입, 레코드 등
+└── NetworkSimulator.cs  ← 가상 클라이언트 시뮬레이션
+```
+
+---
+
+## 5.11 ExampleChatServer — 전체 구조 다이어그램
+
+```mermaid
+graph TD
+    NC[NetworkSimulator\n가상 클라이언트들] -->|InboundCommands.Enqueue| CW[ChatWorker\n워커 스레드 N개]
+    CW -->|cmd 실행| CS[ChatServer Actor\n사용자/방 관리]
+    CS -->|AddUser| R[Room Actor\n방 내 사용자 목록]
+    CS -->|DeliverMessage| U[User Actor\n메시지 전달]
+    R -->|BroadcastSystem| U
+    R -->|DoAsyncAfter - 15s| R
+    CS -->|DoAsyncAfter - 5s| CS
+```
+
+---
+
+## 5.12 ChatServer — 최상위 Actor
+
+### 코딩 컨벤션
+
+ChatServer는 두 종류의 메서드를 명확히 구분합니다:
+
+```csharp
+public sealed class ChatServer : AsyncExecutable
+{
+    // ── 외부 진입점 (public Handle*) ──────────────────────
+    // 규칙: DoAsync로 큐에 넣기만 한다
+
+    public void HandleUserConnect(IChatClient client)
+        => DoAsync(() => ProcessUserConnect(client));
+
+    public void HandleRoomJoin(string userId, string roomId)
+        => DoAsync(() => ProcessRoomJoin(userId, roomId));
+
+    public void HandleRoomChat(string userId, string roomId, string content)
+        => DoAsync(() => ProcessRoomChat(userId, roomId, content));
+
+    // ── 실제 처리 (private Process*) ─────────────────────
+    // 규칙: ChatServer 큐에서 직렬 실행, 여기서 상태 변경
+
+    private void ProcessUserConnect(IChatClient client)
+    {
+        // ★ _users 딕셔너리 — lock 없이 안전!
+        var user = new User(client);
+        _users[user.UserId] = user;
+        BroadcastSystemToAll(MessageType.UserConnect, $"{user.Username}님이 접속하셨습니다.");
+    }
+
+    private void ProcessRoomJoin(string userId, string roomId)
+    {
+        if (_users.TryGetValue(userId, out var user) &&
+            _rooms.TryGetValue(roomId, out var room))
+        {
+            // ★ Room Actor에게 메시지 패싱!
+            room.AddUser(user);  // room.DoAsync(() => room.ProcessAddUser(user))
+        }
+    }
+}
+```
+
+---
+
+## 5.13 서버 생명주기
+
+```csharp
+public void Start()
+{
+    // 1. 기본 방 생성 (Actor 큐로!)
+    DoAsync(CreateDefaultRooms);
+
+    // 2. 워커 스레드 시작
+    _dispatcher = new JobDispatcher<ChatWorker>(_workerCount);
+    _ = _dispatcher.RunWorkerThreadsAsync();
+
+    // 3. Heartbeat 시작 (자기복제 패턴)
+    DoAsync(StatsHeartbeat);   // 5초마다 통계 출력
+    DoAsync(IdleScanHeartbeat); // 10초마다 유휴 사용자 체크
+}
+
+public void Stop()
+{
+    Console.WriteLine("[Server] 종료 시작");
+    _stopped = true;
+
+    DoAsync(ForceCleanupAllRooms);
+
+    // 자기 큐 drain 대기 (ValueTask 를 Task 로 바꿔 한 번만 차단)
+    DisposeAsync().AsTask().Wait();
+
+    // v2.1: 남은 작업 drain → 타이머 스레드 정지 → 워커 정지까지 한 번에.
+    System.StopAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    Console.WriteLine("[Server] 종료 완료");
+}
+```
+
+> **셧다운이 한 줄로 줄어든 이유.**
+> v2.0 까지 이 자리에는 세 줄이 있었습니다.
+>
+> ```csharp
+> _dispatcher?.Dispose();          // 워커 정지
+> TimerRegistry.DisposeAll();      // 비-워커 스레드가 만든 TimerQueue 정리
+> // (+ 상황에 따라 AsyncExecutable.AcceptingWork = false)
+> ```
+>
+> 지금은 타이머를 `JobSystem` 이 소유하므로 정리할 `TimerQueue` 가 애초에 없고
+> (`TimerRegistry` 는 `[Obsolete]` no-op 으로만 남아 있습니다 — 3.9 참고),
+> `StopAsync` 하나가 **드레인 → 타이머 스레드 정지 → 이 시스템에 붙은 디스패처 정지**를
+> 순서대로 처리합니다.
+>
+> `AsyncExecutable` 을 상속한 클래스는 `System` 프로퍼티로 자기가 속한 `JobSystem` 에
+> 바로 접근할 수 있습니다. 반환값이 `false` 면 타임아웃 안에 다 비우지 못했다는 뜻이니
+> 로그를 남겨 두는 편이 좋습니다.
+>
+> ```csharp
+> if (!await System.StopAsync(TimeSpan.FromSeconds(10)))
+>     JobLog.Warn("일부 작업이 남은 채로 종료되었습니다");
+> ```
+>
+> 6장의 `AdvancedMmorpgServer` 도 같은 형태입니다.
+
+---
+
+## 5.14 자기복제 Heartbeat 패턴
+
+```csharp
+private void StatsHeartbeat()
+{
+    if (_stopped) return;  // ← 종료 체크 (자기복제 탈출)
+
+    // 실제 작업: 통계 출력
+    Console.WriteLine($"사용자 {_users.Count}명 / 방 {_rooms.Count}개");
+
+    // 자기 자신을 5초 후에 다시 예약
+    DoAsyncAfter(_statsPeriod, StatsHeartbeat);
+}
+
+private void IdleScanHeartbeat()
+{
+    if (_stopped) return;
+
+    // 각 사용자에게 유휴 체크 요청
+    foreach (var user in _users.Values)
+        user.CheckIdleAndDisconnect(this, _idleThresholdMs);
+
+    DoAsyncAfter(_idleScanPeriod, IdleScanHeartbeat);
+}
+```
+
+> **지금은 `DoAsyncEvery` 로 쓰는 편이 낫습니다.**
+> ```csharp
+> private ITimerHandle? _stats;
+> private ITimerHandle? _idleScan;
+>
+> public void StartHeartbeats()
+>     => DoAsync(() =>
+>     {
+>         _stats    = DoAsyncEvery(_statsPeriod,    PrintStats);
+>         _idleScan = DoAsyncEvery(_idleScanPeriod, ScanIdleUsers);
+>     });
+>
+> public void StopHeartbeats()   // _stopped 플래그 대신 진짜 취소
+> {
+>     _stats?.Cancel();
+>     _idleScan?.Cancel();
+> }
+> ```
+> 위의 자기복제 패턴에는 두 가지 문제가 있습니다. ① `PrintStats` 가 예외를 던지면
+> 마지막 줄에 도달하지 못해 heartbeat 가 **영원히** 멈춥니다. ② `_stopped` 플래그는
+> "발화는 하되 아무것도 안 함"이므로, 셧다운 시 타이머가 계속 새 작업을 만들어
+> 드레인이 끝나지 않습니다. `DoAsyncEvery` + `Cancel()` 은 둘 다 해결합니다 (3.5).
+
+---
+
+## 5.15 Room — 방 Actor
+
+```csharp
+public sealed class Room : AsyncExecutable
+{
+    private readonly Dictionary<string, User> _users = [];
+
+    // ── 외부 진입점 ───────────────────────────────────────
+
+    public void AddUser(User user) => DoAsync(() => ProcessAddUser(user));
+    public void RemoveUser(string userId) => DoAsync(() => ProcessRemoveUser(userId));
+    public void BroadcastChat(string senderId, string content)
+        => DoAsync(() => ProcessBroadcastChat(senderId, content));
+
+    // ── 실제 처리 ─────────────────────────────────────────
+
+    private void ProcessAddUser(User user)
+    {
+        if (!_users.TryAdd(user.UserId, user)) return;
+
+        Console.WriteLine($"[Room {_roomId}] 입장: {user.Username}");
+        BroadcastSystem(MessageType.RoomJoin, $"{user.Username}님이 입장하셨습니다.");
+        user.NoteRoomJoined(_roomId);  // ← User Actor에게 메시지 패싱!
+    }
+
+    private void ProcessBroadcastChat(string senderId, string content)
+    {
+        if (!_users.TryGetValue(senderId, out var sender)) return;
+
+        sender.TouchActivity();
+
+        var message = new ChatMessage(
+            Guid.NewGuid(), MessageType.RoomChat,
+            sender.Username, null, _roomId, content, DateTimeOffset.UtcNow);
+
+        // ★ 모든 User Actor에게 메시지 전달
+        foreach (var user in _users.Values)
+            user.DeliverMessage(message);  // 각 User의 DoAsync 호출
+    }
+
+    // ── Heartbeat (자기복제) ──────────────────────────────
+
+    private void Heartbeat(TimeSpan period)
+    {
+        if (_stopped) return;
+
+        if (_users.Count > 0)
+        {
+            BroadcastSystem(MessageType.RoomChat,
+                $"현재 {_name} 방에 {_users.Count}명이 있습니다.");
+        }
+
+        // 다음 heartbeat 예약
+        DoAsyncAfter(period, () => Heartbeat(period));
+    }
+}
+```
+
+---
+
+## 5.16 User — 사용자 Actor
+
+```csharp
+public sealed class User : AsyncExecutable
+{
+    private long _lastActivityTickMs;  // lock 없이 안전한 필드
+
+    // ── 외부 진입점 ───────────────────────────────────────
+
+    public void DeliverMessage(ChatMessage message)
+        => DoAsync(() => ProcessDeliverMessage(message));
+
+    public void TouchActivity()
+        => DoAsync(() => _lastActivityTickMs = Environment.TickCount64);
+
+    public void CheckIdleAndDisconnect(ChatServer server, long thresholdMs)
+        => DoAsync(() => ProcessCheckIdleAndDisconnect(server, thresholdMs));
+
+    // ── 실제 처리 ─────────────────────────────────────────
+
+    private void ProcessDeliverMessage(ChatMessage message)
+    {
+        _lastActivityTickMs = Environment.TickCount64;
+        // 네트워크 전송 (User Actor 큐에서 직렬 실행 → 다른 Actor 안 막음!)
+        _client.SendMessage(message);
+    }
+
+    private void ProcessCheckIdleAndDisconnect(ChatServer server, long thresholdMs)
+    {
+        long idle = Environment.TickCount64 - _lastActivityTickMs;
+        if (idle > thresholdMs)
+        {
+            Console.WriteLine($"{Username} 유휴 {idle}ms — 자동 종료");
+            // ★ Actor → Actor 메시지 패싱
+            server.HandleUserDisconnect(UserId);
+        }
+    }
+}
+```
+
+---
+
+## 5.17 GetSnapshot 패턴 — 안전한 읽기
+
+외부에서 상태를 읽어야 할 때 사용하는 패턴입니다:
+
+```csharp
+// Room.cs
+public RoomSnapshot GetSnapshot()
+{
+    using var ev = new ManualResetEventSlim(false);
+    RoomSnapshot? result = null;
+
+    DoAsync(() =>
+    {
+        // Room 큐 안에서 실행 → _users 안전하게 읽기!
+        result = new RoomSnapshot(_roomId, _name, _users.Keys.ToList());
+        ev.Set();  // 완료 신호!
+    });
+
+    ev.Wait();  // 완료 신호 대기
+    return result!;
+}
+```
+
+단계별 동작:
+
+```
+외부 스레드             Room Actor 큐
+      │
+      ├─ DoAsync(람다)
+      │   → 큐에 람다 추가
+      │
+      └─ ev.Wait()  ─────────── (대기 중...)
+                                    │
+                     큐에서 람다 실행
+                     result = 스냅샷
+                     ev.Set()  ──────────► 대기 해제!
+      │
+      └─ return result!
+```
+
+### 지금은 AskSync 를 쓰세요
+
+같은 일을 라이브러리가 해 줍니다. 그리고 **훨씬 중요한 차이가 하나 있습니다.**
+
+```csharp
+// Room.cs 를 v2.1 스타일로
+public RoomSnapshot GetSnapshot()
+    => AskSync(() => new RoomSnapshot(_roomId, _name, _users.Keys.ToList()),
+               TimeSpan.FromSeconds(2));
+```
+
+```
+직접 만든 ManualResetEventSlim 버전   vs   AskSync
+
+  ev.Wait() 는 무한 대기                    timeout 필수 → 영구 정지 없음
+  큐에 못 들어가도 그냥 멈춘다              거부되면 JobRejectedException
+  actor 안에서 부르면 조용히 데드락 ★       actor 안에서 부르면 즉시 예외 ★
+```
+
+★ 이 줄이 핵심입니다. `AskSync` 는 첫 줄에서 `JobDiagnostics.GuardBlockingWait` 를 부릅니다.
+
+```
+❌ 잘못된 사용:
+void ProcessSomething()  // ChatServer 큐 안에서 실행 중
+{
+    var snap = room.GetSnapshot();
+    // 예전: ChatServer 큐가 ev.Wait 에서 멈춤 → Room 의 작업을 처리해 줄 스레드가
+    //       바로 지금 멈춰 있는 이 스레드 → 조용한 데드락, 원인 파악 매우 어려움
+    // 지금: InvalidOperationException — "actor 'ChatServer' 안에서 AskSync 를 불렀다"
+}
+
+✅ 올바른 사용:
+// 외부 스레드(메인, 콘솔 명령, 통계 수집 등)에서 호출
+var snapshot = server.GetSnapshot();
+
+✅ actor 안에서 다른 actor 의 데이터가 필요하다면 — 메시지 패싱
+private void ProcessSomething()
+{
+    room.RequestSnapshot(this);   // room 이 결과를 이쪽 큐로 DoAsync 해 준다
+}
+```
+
+이 가드는 `JobSystemOptions.DetectBlockingWaitOnWorker` 로 켜고 끕니다 (DEBUG 기본 on).
+
+---
+
+## 5.18 ChatWorker — 워커 스레드
+
+```csharp
+public class ChatWorker : IRunnable
+{
+    // IO 스레드/시뮬레이션이 명령을 여기에 push
+    public static readonly ConcurrentQueue<Action> InboundCommands = new();
+
+    public static long TotalProcessed => Interlocked.Read(ref _totalProcessed);
+    private static long _totalProcessed;
+
+    private long _localProcessed;
+    private long _lastLogTick;
+
+    public bool Run(CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested) return false;
+
+        if (InboundCommands.TryDequeue(out var cmd))
+        {
+            try
+            {
+                cmd();           // 여기서 ChatServer.HandleX 실행
+                _localProcessed++;
+                Interlocked.Increment(ref _totalProcessed);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"명령 실행 실패: {ex.Message}");
+            }
+        }
+        else
+        {
+            Thread.Sleep(1);  // 큐 비어있으면 양보
+        }
+
+        // ThreadLocal TickCount로 주기 로그
+        long now = ThreadContext.TickCount;
+        if (now - _lastLogTick >= 5000)
+        {
+            _lastLogTick = now;
+            Console.WriteLine($"[Worker] tick={now}ms 처리={_localProcessed}건");
+        }
+
+        return true;
+    }
+}
+```
+
+> **이 워커는 v2.1 에서는 필요 없습니다.**
+> `InboundCommands` + `TryDequeue` + `Thread.Sleep(1)` 조합은 라이브러리에 ready 큐와
+> 시그널 대기가 없던 시절의 우회책입니다. 지금은:
+>
+> ```csharp
+> // 워커: 사용자 루프 없음. 유휴 시 CPU 0%, 유입 지연은 마이크로초.
+> _dispatcher = new JobDispatcher(_workerCount, new JobDispatcherOptions { System = _system });
+> _ = _dispatcher.RunWorkerThreadsAsync();
+>
+> // 외부(IO/시뮬레이션) 스레드: 중계 큐 대신
+> _system.Post(() => server.HandleRoomChat(userId, roomId, content));
+>
+> // 세션별 순서 보장이 필요하면 Sequencer 가 알아서 Post 한다 (4장)
+> new Sequencer<string>(_system, handler: HandleOnePacket);
+> ```
+>
+> `Thread.Sleep(1)` 폴링은 워커 8개면 초당 8,000회 깨어나고, Windows 타이머 해상도
+> 때문에 1~15ms 의 유입 지연을 만듭니다. `ExampleChatServer` 는 옛 방식의 참고용으로
+> 남아 있고, 이관된 형태는 6장의 `AdvancedMmorpgServer` 에서 볼 수 있습니다.
+
+---
+
+## 5.19 전체 메시지 흐름
+
+실제 채팅 메시지가 처리되는 과정을 따라가봅시다:
+
+```
+클라이언트: "안녕!"을 general 방에 보냄
+
+①  NetworkSimulator (또는 실제 IO 스레드)
+     ChatWorker.InboundCommands.Enqueue(
+         () => server.HandleRoomChat("user1", "general", "안녕!"))
+
+②  ChatWorker.Run()
+     InboundCommands.TryDequeue() → cmd 꺼내기
+     cmd()  →  server.HandleRoomChat("user1", "general", "안녕!")
+
+③  ChatServer.HandleRoomChat
+     DoAsync(() => ProcessRoomChat("user1", "general", "안녕!"))
+     → ChatServer 큐에 추가
+     → ChatWorker 스레드가 Flush 실행
+     → ProcessRoomChat 실행
+
+④  ProcessRoomChat (ChatServer 큐 안)
+     room = _rooms["general"]
+     room.BroadcastChat("user1", "안녕!")
+     → Room 큐에 추가
+
+⑤  Room.ProcessBroadcastChat (Room 큐 안)
+     sender = _users["user1"]
+     sender.TouchActivity()
+     메시지 생성
+     for each user in _users:
+         user.DeliverMessage(message)
+         → 각 User 큐에 추가
+
+⑥  User.ProcessDeliverMessage (User 큐 안)
+     _client.SendMessage(message)
+     → 실제 네트워크 전송 (여기서만 네트워크 IO!)
+```
+
+---
+
+## 5.20 Actor 간 격리의 장점
+
+```
+Room 전체에 100명이 있을 때 채팅 처리:
+
+전통적 방법 (lock):
+  for each user:
+    lock(user)
+    send()
+    unlock(user)
+  → 직렬! 100명 차례로 전송
+
+Actor 방법:
+  for each user:
+    user.DeliverMessage()  → 각 User 큐에 추가 (즉시 반환!)
+  → Room은 즉시 다음 작업으로!
+  → 100명의 User Actor가 병렬로 전송!
+  → 느린 클라이언트(네트워크 지연)가 다른 사람에게 영향 없음!
+```
+
+---
+
+## 5.21 ExampleChatServer — 핵심 학습 포인트
+
+```
+ChatServer 예제에서:
+✓ 세 Actor(ChatServer, Room, User) 협업 구조
+✓ Handle*/Process* 코딩 컨벤션
+✓ 주기 작업 — 예제는 자기복제, 새 코드는 DoAsyncEvery + ITimerHandle
+✓ 외부 읽기 — 예제는 ManualResetEventSlim, 새 코드는 AskSync
+✓ Actor → Actor 메시지 패싱 (server.HandleUserDisconnect)
+✓ 워커 스레드에서 ThreadContext.TickCount로 주기 로그
+✓ actor 큐 안에서의 동기 대기는 데드락 — 이제 AskSync 가 예외로 잡아 준다
+✓ 셧다운은 System.StopAsync 한 번 (TimerRegistry.DisposeAll 은 이제 no-op)
+✓ 이 예제의 InboundCommands 중계 큐는 v2.0 스타일이다
+  (이관된 형태는 6장)
+```
+
+---
+
+*[← 제4장: Sequencer와 설정·모니터링·로깅](./chapter04.md) | [↑ 목차](./README.md) | [→ 제6장: MMORPG 서버의 기본 구조와 고급 패턴](./chapter06.md)*

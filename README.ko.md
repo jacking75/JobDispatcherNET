@@ -181,7 +181,7 @@ services.AddJobDispatcher(o => o.WorkerCount = 8);
 | [Pitfalls](docs/pitfalls.md) | 이 모델에서 hang 으로 이어지는 실수들 |
 | [ADR](docs/adr/README.md) | 설계가 이렇게 된 이유 |
 | [Benchmarks](docs/benchmarks.md) | 수치 재현 방법 |
-| [Book (한국어 13장)](Book/README.md) | 기초부터 훑는 전체 가이드 |
+| [Book (한국어 7장)](Book/README.md) | 기초부터 훑는 전체 가이드 |
 
 ---
 

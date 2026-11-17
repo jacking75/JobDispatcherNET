@@ -1,636 +1,1130 @@
-# Chapter 06: JobDispatcher와 IRunnable — 전용 워커 스레드
+# 제6장: MMORPG 서버의 기본 구조와 고급 패턴
 
-## 6.1 왜 전용 OS 스레드가 필요한가?
+ExampleMmorpgServer의 존, 플레이어, 전투와 공간 인덱스를 먼저 분석한다. 이어서 AdvancedMmorpgServer의 JobSystem 소유 구조, NPC AI, 세션 순서 보장, 최적화와 종료 흐름을 비교한다.
 
-.NET의 `ThreadPool`은 편리하지만 게임 서버에 맞지 않는 부분이 있습니다:
+## 6.1 ExampleMmorpgServer — 프로젝트 구조
 
 ```
-ThreadPool의 특성:
-──────────────────────────────────────────────────────────
-✓ 작업이 끝나면 스레드 반환 → 다음 작업에 다른 스레드가 올 수 있음
-✓ 스레드 수 자동 조절
-✗ ThreadLocal 값이 작업 간에 유지 안 됨!
-  (다른 스레드가 오면 다른 ThreadLocal)
-✗ 긴 블로킹 작업이 풀을 굶긴다 (스레드 주입은 초 단위로 느리다)
-✗ 스레드 우선순위 제어 어려움
-
-전용 OS 스레드의 특성:
-──────────────────────────────────────────────────────────
-✓ 항상 같은 스레드 → ThreadLocal이 유지됨!
-✓ 블로킹해도 다른 워크로드를 굶기지 않음
-✓ IsBackground = true로 프로세스 종료 시 자동 중단
-✓ 스레드 이름·우선순위·스택 크기 지정 가능 (디버깅·튜닝 편리)
+ExampleMmorpgServer/
+├── Program.cs          ← 시뮬레이션 진입점
+├── GameServer.cs       ← 서버 컨테이너
+├── GameWorker.cs       ← IRunnable 워커
+├── GameZone.cs         ← 존 Actor (플레이어 집합)
+├── PlayerActor.cs      ← 플레이어 단위 Actor
+├── Player.cs           ← 플레이어 데이터 모델
+├── Packets.cs          ← 패킷 정의
+└── SpatialIndex.cs     ← 공간 인덱스 (범위 쿼리)
 ```
 
 ---
 
-## 6.2 두 가지 디스패처
-
-v2.1 부터 디스패처는 **두 종류**입니다. 공통 부분(시작·감시·재기동·정지)은
-`JobDispatcherBase`에 있고, 워커 루프의 본문만 다릅니다.
-
-```
-JobDispatcherBase (abstract)
-   ├── JobDispatcher        ← 비제네릭. 사용자 루프 없음.
-   │                          워커는 할 일이 없으면 시그널을 기다리며 블록한다.
-   │                          작업이 전부 "actor 작업 / 타이머 발화 / JobSystem.Post"
-   │                          로 들어오는 서버에 적합. (권장 기본값)
-   │
-   └── JobDispatcher<T>     ← 제네릭. T : IRunnable, new()
-                              워커마다 T 인스턴스를 만들고 Run() 을 반복 호출한다.
-                              워커에 자체 루프가 필요할 때 (게임 틱 루프 등).
-```
-
-```csharp
-// ① 비제네릭 — 이제 대부분의 서버가 쓸 형태
-_dispatcher = new JobDispatcher(workerThreads, new JobDispatcherOptions
-{
-    System = _system,
-    RestartFailedWorkers = true,
-});
-_ = _dispatcher.RunWorkerThreadsAsync();
-
-// ② 제네릭 — 워커에 자체 루프가 필요할 때
-await using var dispatcher = new JobDispatcher<TestWorkerThread>(4);
-_ = dispatcher.RunWorkerThreadsAsync();
-```
-
-### 비제네릭 워커 루프 — 폴링 없는 유휴 대기
-
-```csharp
-public sealed class JobDispatcher : JobDispatcherBase
-{
-    protected override void WorkerLoop(int slot, CancellationToken cancellationToken)
-    {
-        var idleWait = Math.Max(1, Options.IdleWaitMs);
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            if (PumpReadyQueue() == 0)      // 할 일이 있으면 처리하고 다시 확인
-                System.WaitForWork(idleWait);  // 없으면 시그널이 올 때까지 블록
-        }
-    }
-}
-```
-
-`JobSystem.WaitForWork`는 `Monitor.Wait`로 잠들고, 새 작업이 들어오면 producer 가
-`Monitor.Pulse`로 깨웁니다.
-
-```csharp
-internal void WaitForWork(int timeoutMs)
-{
-    Interlocked.Increment(ref _waiters);   // ★ 큐를 보기 "전에" 대기자로 등록한다
-    try
-    {
-        lock (_signal)
-        {
-            if (!_readyQueue.IsEmpty) return;   // 들어가기 직전에 일이 생겼다면 바로 나간다
-            Monitor.Wait(_signal, timeoutMs);
-        }
-    }
-    finally { Interlocked.Decrement(ref _waiters); }
-}
-```
-
-대기자 등록을 먼저 하는 이유는 lost-wakeup 방지입니다. producer 는 `_waiters == 0` 이면
-`Pulse`를 생략하는데, 워커가 "대기하러 들어가는 중"인 순간에 그 판단이 내려지면 아무도 깨우지
-않은 채 잠들 수 있기 때문입니다.
-
-```
-v2.0 (모든 예제의 IRunnable):        v2.1 (비제네릭 JobDispatcher):
-
-while (true) {                        while (true) {
-    if (queue.TryDequeue(out var c))      if (PumpReadyQueue() == 0)
-        c();                                  WaitForWork(20);
-    else                              }
-        Thread.Sleep(1);
-}                                     · 유휴 시 CPU 0%, 깨우기는 시그널
-                                      · 유입 지연 = 시그널 지연 (마이크로초)
-· 워커 8개 → 초당 8,000회 깨어남
-· Windows 타이머 해상도 때문에
-  실제로는 1~15ms 유입 지연
-```
-
----
-
-## 6.3 IRunnable 인터페이스
-
-```csharp
-public interface IRunnable : IDisposable
-{
-    /// <summary>
-    /// 전용 워커 스레드에서 반복 호출됩니다.
-    /// true 반환: 계속 실행 / false 반환: 이 워커 종료
-    /// </summary>
-    bool Run(CancellationToken cancellationToken);
-}
-```
-
-`JobDispatcher<T>`는 워커마다 `new T()`를 만들고, **ready 큐를 먼저 드레인한 뒤** `Run()`을
-호출합니다.
-
-```csharp
-protected override void WorkerLoop(int slot, CancellationToken cancellationToken)
-{
-    var runner = new T();
-    try
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            PumpReadyQueue();                    // 타이머 발화·Scheduled actor 를 먼저 처리
-            if (!runner.Run(cancellationToken))  // 그다음 사용자 루프
-                break;
-        }
-    }
-    finally
-    {
-        try { runner.Dispose(); }
-        catch (Exception ex) { System.Logger.Error($"Worker slot #{slot} runner disposal failed", ex); }
-    }
-}
-```
-
-사용 예시:
-
-```csharp
-public class GameTickWorker : IRunnable
-{
-    private long _lastTick;
-
-    public bool Run(CancellationToken cancellationToken)
-    {
-        if (cancellationToken.IsCancellationRequested)
-            return false;
-
-        long now = ThreadContext.TickCount;     // 워커가 매 반복 갱신해 준다
-        if (now - _lastTick >= 50)
-        {
-            _lastTick = now;
-            StepSimulation();
-        }
-
-        // 유휴 대기는 짧게. 순수 actor 워크로드라면 애초에 비제네릭 JobDispatcher 를 쓸 것.
-        cancellationToken.WaitHandle.WaitOne(1);
-        return true;
-    }
-
-    public void Dispose() { }
-}
-```
-
-> `IRunnable`을 쓰기 전에 한 번 자문해 보세요. **"내 워커에 정말 자체 루프가 필요한가?"**
-> 패킷 처리와 타이머 발화만 있다면 비제네릭 `JobDispatcher` 가 더 빠르고 코드도 없습니다.
-> 예전 예제들이 `IRunnable` + `InboundCommands` + `Thread.Sleep(1)` 을 손으로 만들던 이유는
-> 그때는 그 방법밖에 없었기 때문입니다 (6.11 참조).
-
----
-
-## 6.4 JobDispatcherOptions — 워커 설정
-
-```csharp
-public sealed record JobDispatcherOptions
-{
-    public static readonly JobDispatcherOptions Default = new();
-
-    /// <summary>워커가 예외로 죽으면 자동 재기동. 기본 true.</summary>
-    public bool RestartFailedWorkers { get; init; } = true;
-
-    /// <summary>슬롯당 최대 재기동 횟수. 기본 5. 초과 시 그 슬롯은 정지.</summary>
-    public int MaxRestartsPerWorker { get; init; } = 5;
-
-    /// <summary>재기동 간 대기 (지수 백오프 시작값). 기본 1초.</summary>
-    public TimeSpan RestartBackoff { get; init; } = TimeSpan.FromSeconds(1);
-
-    /// <summary>재기동 후 이만큼 정상 동작하면 재기동 예산을 회복. 기본 5분. Zero 면 비활성.</summary>
-    public TimeSpan RestartCountResetAfter { get; init; } = TimeSpan.FromMinutes(5);
-
-    /// <summary>한 반복에서 ready 큐를 최대 몇 개까지 처리할지. 기본 256.</summary>
-    public int MaxReadyDrainPerTick { get; init; } = 256;
-
-    /// <summary>유휴 워커가 시그널을 기다리는 최대 ms. 비제네릭 디스패처 전용. 기본 20.</summary>
-    public int IdleWaitMs { get; init; } = 20;
-
-    /// <summary>워커 스레드 우선순위. 기본 Normal.</summary>
-    public ThreadPriority ThreadPriority { get; init; } = ThreadPriority.Normal;
-
-    /// <summary>백그라운드 스레드로 띄울지. 기본 true (프로세스를 붙잡지 않음).</summary>
-    public bool BackgroundThreads { get; init; } = true;
-
-    /// <summary>워커 스택 크기(byte). 0 이면 플랫폼 기본값.</summary>
-    public int MaxStackSize { get; init; }
-
-    /// <summary>이 워커들이 서비스할 시스템. null 이면 JobSystem.Default.</summary>
-    public JobSystem? System { get; init; }
-}
-```
-
-> `MaxTimerDrainPerTick` 은 `MaxReadyDrainPerTick` 으로 이름이 바뀌었습니다. 타이머 전용 큐가
-> 사라지고 공용 ready 큐로 합쳐졌기 때문입니다. 옛 이름도 `[Obsolete]` 로 남아 그대로 동작합니다.
-
-지수 백오프 계산:
-
-```
-재기동 1회: 1초 × 2^0 = 1초 대기
-재기동 2회: 1초 × 2^1 = 2초 대기
-재기동 3회: 1초 × 2^2 = 4초 대기
-재기동 4회: 1초 × 2^3 = 8초 대기
-재기동 5회: 1초 × 2^4 = 16초 대기
-→ 6회 시도: 최대 횟수 초과 → 그 슬롯은 정지
-   (단, RestartCountResetAfter 만큼 건강하게 돌았다면 카운트가 0 으로 회복된다 — 6.8)
-```
-
----
-
-## 6.5 JobDispatcherBase 구조
-
-```csharp
-public abstract class JobDispatcherBase : IDisposable, IAsyncDisposable
-{
-    private readonly Thread[] _threads;             // 전용 OS 스레드들
-    private readonly int[] _restartCounts;          // 슬롯별 재기동 횟수
-    private readonly long[] _lastStartTimestamps;   // 슬롯별 마지막 기동 시각 (예산 회복 판정)
-    private readonly CancellationTokenSource _cts = new();
-    private TaskCompletionSource? _allWorkersDone;
-    private int _completedWorkers;
-    private int _disposed;
-    private int _started;                           // 중복 시작 가드
-
-    protected JobDispatcherBase(int workerCount, JobDispatcherOptions? options)
-    {
-        if (workerCount < 1)
-            throw new ArgumentOutOfRangeException(nameof(workerCount), "must be >= 1");
-
-        Options = options ?? JobDispatcherOptions.Default;
-        System  = Options.System ?? JobSystem.Default;
-        WorkerCount = workerCount;
-        _threads = new Thread[workerCount];
-        _restartCounts = new int[workerCount];
-        _lastStartTimestamps = new long[workerCount];
-
-        System.AttachDispatcher(this);   // ★ system.StopAsync 가 나를 정지시킬 수 있게 등록
-    }
-
-    public JobDispatcherOptions Options { get; }
-    public JobSystem System { get; }
-    public int WorkerCount { get; }
-    public int LiveWorkerCount { get; }              // 살아 있는 스레드 수
-
-    protected CancellationToken StoppingToken => _cts.Token;
-    protected abstract void WorkerLoop(int slot, CancellationToken cancellationToken);
-    protected int PumpReadyQueue();
-}
-```
-
-`AttachDispatcher` 가 중요합니다. 디스패처는 자기를 소유한 `JobSystem`에 등록되고,
-`system.StopAsync()` 한 번이 타이머 스레드와 이 디스패처를 함께 정리합니다.
-사용자가 디스패처를 따로 `Dispose` 할 필요가 없어집니다.
-
----
-
-## 6.6 RunWorkerThreadsAsync — 워커 시작 (1회 제한)
-
-```csharp
-public Task RunWorkerThreadsAsync()
-{
-    // ★ 두 번 부르면 예외. 예전에는 조용히 워커가 2N 개 떴다 (P0-5)
-    if (Interlocked.Exchange(ref _started, 1) != 0)
-        throw new InvalidOperationException(
-            "RunWorkerThreadsAsync has already been called on this dispatcher.");
-
-    ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-    _allWorkersDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    for (var slot = 0; slot < WorkerCount; slot++)
-        StartWorkerOnSlot(slot, isRestart: false);
-
-    return _allWorkersDone.Task;   // 모든 워커가 종료되면 완료되는 Task
-}
-
-private void StartWorkerOnSlot(int slot, bool isRestart)
-{
-    var name = isRestart
-        ? $"JobWorker-{System.Name}-{slot}-r{_restartCounts[slot]}"
-        : $"JobWorker-{System.Name}-{slot}";
-
-    var thread = Options.MaxStackSize > 0
-        ? new Thread(() => RunWorker(slot), Options.MaxStackSize)
-        : new Thread(() => RunWorker(slot));
-
-    thread.IsBackground = Options.BackgroundThreads;
-    thread.Name = name;                       // 시스템 이름이 들어가 디버깅이 쉽다
-    thread.Priority = Options.ThreadPriority;
-
-    _threads[slot] = thread;
-    _lastStartTimestamps[slot] = Stopwatch.GetTimestamp();
-    thread.Start();
-}
-```
-
-> **왜 1회 가드가 필요했나 (P0-5)**
-> 예전에는 `RunWorkerThreadsAsync()` 를 두 번 부르면 `_allWorkersDone` 이 덮어써지고 스레드가
-> `2 × WorkerCount` 개 떴습니다. 첫 번째 Task 는 영원히 완료되지 않고, 워커 수는 설정의 두 배가
-> 되는데 아무 경고도 없었습니다. "시작 코드가 두 경로에서 불리는" 흔한 실수가 조용한 자원 낭비로
-> 이어지던 자리입니다.
-
----
-
-## 6.7 RunWorker — 워커의 생명주기
-
-```csharp
-private void RunWorker(int slot)
-{
-    var exitedNormally = false;
-
-    // ① 스레드 컨텍스트 표시 — ExecutionMode.Scheduled 판정과 진단에 쓰인다
-    ThreadContext.IsWorkerThread = true;
-    ThreadContext.CurrentSystem = System;
-    System.RegisterWorker();               // system.LiveWorkerCount / HasWorkers 에 반영
-
-    try
-    {
-        WorkerLoop(slot, _cts.Token);      // ② 실제 루프 (비제네릭 / 제네릭 구현체)
-        exitedNormally = true;
-    }
-    catch (OperationCanceledException)
-    {
-        exitedNormally = true;             // 취소는 정상 종료
-    }
-    catch (Exception ex)
-    {
-        // ★ 어느 actor 를 돌리다 죽었는지까지 남긴다 (예전에는 스택만 남았다)
-        var running = ThreadContext.CurrentExecuter;
-        var where = running is null ? string.Empty : $" while running actor '{running.Name}'";
-        System.Logger.Error($"Worker slot #{slot} crashed{where}", ex);
-        AsyncExecutable.RaiseGlobalError(ex);
-    }
-    finally
-    {
-        ThreadContext.CurrentExecuter = null;
-        ThreadContext.IsWorkerThread = false;
-        ThreadContext.CurrentSystem = null;
-        System.UnregisterWorker();
-    }
-
-    // ③ 비정상 종료면 supervisor 가 재기동을 시도
-    if (!exitedNormally && Options.RestartFailedWorkers
-        && Volatile.Read(ref _disposed) == 0 && !_cts.IsCancellationRequested)
-    {
-        if (TryRestart(slot))
-            return;                        // 새 스레드가 이 슬롯을 이어받음
-    }
-
-    if (Interlocked.Increment(ref _completedWorkers) == WorkerCount)
-        _allWorkersDone?.TrySetResult();
-}
-```
-
-각 반복의 타임라인:
-
-```
-비제네릭 JobDispatcher:              제네릭 JobDispatcher<T>:
-
-[PumpReadyQueue]                     [PumpReadyQueue]
-   │ TickCount 갱신                     │ TickCount 갱신
-   │ ready 큐에서 최대 256개               │ ready 큐에서 최대 256개
-   │  (Scheduled actor / 타이머 발화 /      │
-   │   JobSystem.Post 로 넣은 Action)      ▼
-   ▼                                  [runner.Run(ct)]
-[처리한 게 0 이면 WaitForWork]            false 반환 시 이 워커만 종료
-```
-
-> **v2.0 에서 사라진 줄**
-> 예전 워커 종료 경로에는 `ThreadContext.Timer.Dispose()` 가 있었습니다. 이 한 줄이
-> P0-2 — "워커가 죽으면 그 스레드의 타이머가 전부 사라진다" — 의 직접 원인이었습니다.
-> 타이머가 시스템 소유가 된 지금은 워커 종료가 타이머에 아무 영향도 주지 않습니다.
-
----
-
-## 6.8 워커 수퍼바이저 — 자동 재기동과 예산 회복
-
-```csharp
-private bool TryRestart(int slot)
-{
-    // ★ 이 슬롯이 충분히 오래 건강했다면 재기동 예산을 되돌려준다
-    if (Options.RestartCountResetAfter > TimeSpan.Zero
-        && Stopwatch.GetElapsedTime(_lastStartTimestamps[slot]) >= Options.RestartCountResetAfter)
-    {
-        Interlocked.Exchange(ref _restartCounts[slot], 0);
-    }
-
-    var attempts = Interlocked.Increment(ref _restartCounts[slot]);
-    if (attempts > Options.MaxRestartsPerWorker)
-    {
-        System.Logger.Error(
-            $"Worker slot #{slot} exceeded max restarts ({Options.MaxRestartsPerWorker}) — permanently down");
-        return false;
-    }
-
-    System.Metrics.OnWorkerRestart();     // WorkerRestarts 메트릭 +1
-    var backoff = TimeSpan.FromMilliseconds(
-        Options.RestartBackoff.TotalMilliseconds * Math.Pow(2, attempts - 1));
-    System.Logger.Warn(
-        $"Restarting worker slot #{slot} (attempt {attempts}/{Options.MaxRestartsPerWorker}) after {backoff.TotalMilliseconds:F0}ms");
-
-    Thread.Sleep(backoff);
-
-    if (Volatile.Read(ref _disposed) != 0 || _cts.IsCancellationRequested)
-        return false;
-
-    StartWorkerOnSlot(slot, isRestart: true);
-    return true;
-}
-```
-
-예산 회복이 왜 필요한가:
-
-```
-회복이 없던 v2.0:
-
-  1월 3일  워커 #2 크래시 ×5  → 예산 소진, 슬롯 #2 영구 정지
-  1월 4일 ~ 6월    정상 운영... 하지만 워커는 계속 7/8 개
-                   아무도 눈치채지 못한다 (로그는 5개월 전 것)
-
-회복이 있는 v2.1 (기본 5분):
-
-  마지막 재기동 후 5분간 살아 있었다면 → 그 슬롯의 카운트를 0 으로
-  → "가끔 한 번씩 나는 크래시" 와 "지금 폭주 중인 크래시" 를 구분할 수 있다
-```
-
-수퍼바이저 동작 흐름:
+## 6.2 ExampleMmorpgServer — 전체 구조
 
 ```mermaid
-flowchart TD
-    A[워커 종료] --> B{정상 종료?}
-    B -->|Yes| C[완료 카운트 증가]
-    B -->|No - 크래시| D{재기동 정책 켜져 있음?}
-    D -->|No| C
-    D -->|Yes| E{Dispatcher 살아있음?}
-    E -->|No| C
-    E -->|Yes| R{마지막 기동 후 RestartCountResetAfter 경과?}
-    R -->|Yes| S[재기동 카운트 0 으로 회복]
-    R -->|No| F
-    S --> F{재기동 횟수 한도 이내?}
-    F -->|No - 한도 초과| G[영구 정지 로그]
-    G --> C
-    F -->|Yes| H[지수 백오프 대기]
-    H --> I[새 스레드로 재기동]
-    I --> J[본 스레드 종료, 카운트 증가 안 함]
-    C --> K{모든 워커 완료?}
-    K -->|Yes| L[allWorkersDone 완료]
+graph TD
+    SIM[시뮬레이션/네트워크] -->|InboundCommands| GW[GameWorker x4]
+    GW -->|cmd| GS[GameServer\n패킷 라우팅]
+    GS -->|HandleX| GZ[GameZone Actor\n플레이어 관리]
+    GZ -->|Move/Attack/...| PA1[PlayerActor-1]
+    GZ -->|Move/Attack/...| PA2[PlayerActor-2]
+    GZ -->|ReceiveDamage| PA1
+    GZ -->|ReceiveDamage| PA2
+    PA1 -->|자기복제| PA1
+    GZ -->|5s heartbeat| GZ
 ```
 
 ---
 
-## 6.9 TryStop / Dispose — 워커 종료
+## 6.3 GameZone — 존 Actor
+
+존의 핵심 역할은 **플레이어 관리**와 **공격 라우팅**입니다.
 
 ```csharp
-public bool TryStop(TimeSpan joinTimeout)
+public class GameZone : AsyncExecutable
 {
-    if (Interlocked.Exchange(ref _disposed, 1) != 0)
-        return true;                      // 이미 정지됨
+    private readonly Dictionary<string, PlayerActor> _actors = [];
+    public readonly SpatialIndex Spatial;
 
-    System.DetachDispatcher(this);
+    // ── 플레이어 입장/퇴장 ────────────────────────────────
 
-    _cts.Cancel();                        // 모든 워커 루프에 종료 신호
-    System.SignalWork();                  // 시그널 대기 중인 워커를 깨운다
+    public void EnterZone(Player player, float spawnX, float spawnY)
+        => DoAsync(() => ProcessEnterZone(player, spawnX, spawnY));
 
-    var allStopped = true;
-    foreach (var thread in _threads)
+    private void ProcessEnterZone(Player player, float spawnX, float spawnY)
     {
-        if (thread is not { IsAlive: true }) continue;
+        // ① PlayerActor 생성 및 등록
+        var actor = new PlayerActor(player, this);
+        _actors[player.PlayerId] = actor;
 
-        System.SignalWork();
-        if (thread.Join(joinTimeout)) continue;
+        player.X = spawnX;
+        player.Y = spawnY;
+        Spatial.Add(player);  // 공간 인덱스에 추가
 
-        allStopped = false;
-        System.Logger.Error(
-            $"Worker thread '{thread.Name}' did not stop within {joinTimeout.TotalMilliseconds:F0}ms. " +
-            "A job is probably blocking (a lock, a synchronous wait, or an infinite loop).");
+        // ② 자동 회복 시작
+        actor.StartRegen();
+
+        Console.WriteLine($"[존] {player.Name} 입장 ({spawnX:F1},{spawnY:F1})");
     }
 
-    _cts.Dispose();
-    return allStopped;                    // ★ 실제로 다 멈췄는지 호출자가 알 수 있다
+    public void LeaveZone(string playerId)
+        => DoAsync(() => ProcessLeaveZone(playerId));
+
+    private void ProcessLeaveZone(string playerId)
+    {
+        if (!_actors.Remove(playerId, out var actor)) return;
+
+        // spatial 제거는 actor 자기 큐에서 — 잔여 Move/Damage 작업과 직렬화된다.
+        actor.Despawn();  // ← PlayerActor에게 Despawn 메시지 전달 (즉시 반환)
+    }
+}
+```
+
+> **여기서 `actor.DisposeAsync().Wait()` 을 부르면 안 됩니다.**
+> `ProcessLeaveZone` 은 GameZone 의 큐 안에서 실행됩니다. 그 안에서 `PlayerActor.Despawn()`
+> 을 부르면, 이 스레드가 이미 GameZone 을 flush 중이므로 `PlayerActor` 는
+> `ThreadContext.ExecuterQueue` 에 실려 **이 flush 가 끝난 뒤에** 처리됩니다.
+> 그 상태에서 `DisposeAsync().Wait()` 로 드레인을 기다리면, 그 큐를 비워 줄 스레드가
+> 바로 지금 멈춰 있는 이 스레드이므로 영구 대기입니다.
+>
+> 큐 드레인을 기다려야 한다면 **actor 큐 밖에서** 하세요. 실제 `GameZone.DisposeAsync` 는
+> 외부 스레드에서 `Despawn` 을 일괄 전송한 뒤 각 `PlayerActor` 를 드레인합니다.
+> 더 간단한 방법은 이 장의 `AdvancedMmorpgServer` 예제처럼 `system.StopAsync()` / `system.DrainAsync()` 에 맡기는 것입니다.
+
+---
+
+## 6.4 공격 처리 흐름 — Actor 간 메시지 패싱
+
+근접 공격이 처리되는 과정을 단계별로 봅시다:
+
+```csharp
+// GameZone
+public void HandleMeleeAttack(string attackerId, string targetId)
+    => DoAsync(() => ProcessMeleeAttack(attackerId, targetId));
+
+private void ProcessMeleeAttack(string attackerId, string targetId)
+{
+    // ① 공격자 Actor 찾기 (GameZone 큐 안 → _actors 안전)
+    if (!_actors.TryGetValue(attackerId, out var attacker)) return;
+    if (!_actors.TryGetValue(targetId, out _)) return;
+
+    // ② 공격자 Actor에게 "공격해!" 메시지 전달
+    attacker.MeleeAttack(targetId, meleeRange: 3.0f);
 }
 
-public void Dispose() => TryStop(TimeSpan.FromSeconds(5));
-```
+// PlayerActor
+public void MeleeAttack(string targetId, float meleeRange)
+    => DoAsync(() => ProcessMeleeAttack(targetId, meleeRange));
 
-`Dispose()`는 `Join` 타임아웃을 조용히 무시하던 예전 동작 대신, 멈추지 않은 스레드 이름과
-원인 힌트를 로그에 남깁니다. 종료 성공 여부까지 필요하면 `TryStop`을 쓰세요.
-
-**대부분의 경우 이것을 직접 부를 필요가 없습니다.** `system.StopAsync()` 가
-등록된 디스패처들을 알아서 정리합니다.
-
----
-
-## 6.10 실제 사용 패턴
-
-```csharp
-// 1. 가장 단순한 형태 — JobSystem.Default 위에서 워커 4개
-await using var dispatcher = new JobDispatcher(4);
-_ = dispatcher.RunWorkerThreadsAsync();
-
-// 2. 명시적 시스템 + 수퍼바이저 옵션 (권장)
-var system = new JobSystem(new JobSystemOptions { Name = "game" });
-var dispatcher2 = new JobDispatcher(8, new JobDispatcherOptions
+private void ProcessMeleeAttack(string targetId, float meleeRange)
 {
-    System = system,
-    RestartFailedWorkers = true,
-    MaxRestartsPerWorker = 5,
-    RestartBackoff = TimeSpan.FromSeconds(1),
-    RestartCountResetAfter = TimeSpan.FromMinutes(5),
-});
-_ = dispatcher2.RunWorkerThreadsAsync();
+    if (_despawned || !_player.IsAlive) return;
 
-// 3. 자체 루프가 필요할 때.
-//    RunWorkerThreadsAsync 는 스레드를 띄우고 곧바로 반환하며, 두 번 호출하면 예외다.
-//    모든 워커가 끝날 때까지 기다리고 싶으면 "첫 호출이 돌려준" Task 를 보관해 두었다가 await 한다.
-await using var dispatcher3 = new JobDispatcher<GameTickWorker>(4);
-var workersDone = dispatcher3.RunWorkerThreadsAsync();
-// ... 종료 시점에
-// await workersDone;
+    // ③ 공격자 스냅샷 생성 (불변 데이터!)
+    var snapshot = new AttackerSnapshot(
+        _player.PlayerId, _player.Name,
+        _player.X, _player.Y, _player.Attack);
 
-// 5. 종료 — 시스템 단위로 한 번에
-await system.StopAsync(TimeSpan.FromSeconds(10));
+    // ④ GameZone에게 데미지 전달 요청
+    _zone.SendMeleeDamage(targetId, snapshot, meleeRange);
+}
 
-// 6. 살아있는 워커 수 모니터링
-Console.WriteLine($"활성 워커: {system.LiveWorkerCount} / {dispatcher2.WorkerCount}");
+// GameZone
+public void SendMeleeDamage(string targetId, AttackerSnapshot snapshot, float meleeRange)
+    => DoAsync(() =>
+    {
+        // ⑤ 대상 Actor 찾기 (GameZone 큐 안 → 안전!)
+        if (_actors.TryGetValue(targetId, out var target))
+            target.ReceiveMeleeDamage(snapshot, meleeRange);
+    });
+
+// 대상 PlayerActor
+public void ReceiveMeleeDamage(AttackerSnapshot attacker, float meleeRange)
+    => DoAsync(() => ProcessReceiveMeleeDamage(attacker, meleeRange));
+
+private void ProcessReceiveMeleeDamage(AttackerSnapshot attacker, float meleeRange)
+{
+    if (_despawned || !_player.IsAlive) return;
+
+    float dist = _player.DistanceTo(attacker.X, attacker.Y);
+    if (dist > meleeRange) return;  // ← 서버사이드 거리 검증!
+
+    int damage = _player.TakeDamage(attacker.Attack);
+    if (!_player.IsAlive)
+        HandleDeath(attacker.Name);
+}
+```
+
+전체 흐름:
+
+```
+클라이언트 패킷: ATTACK target=player2
+
+GameWorker → server.HandleMeleeAttack("player1", "player2")
+    │
+    ▼
+GameZone Actor 큐:
+  ProcessMeleeAttack("player1", "player2")
+  → attacker.MeleeAttack("player2", 3.0f)
+    │
+    ▼
+PlayerActor-1(player1) 큐:
+  ProcessMeleeAttack("player2", 3.0f)
+  → 스냅샷 생성 (불변!)
+  → zone.SendMeleeDamage("player2", snapshot, 3.0f)
+    │
+    ▼
+GameZone Actor 큐:
+  target = _actors["player2"]
+  → target.ReceiveMeleeDamage(snapshot, 3.0f)
+    │
+    ▼
+PlayerActor-2(player2) 큐:
+  ProcessReceiveMeleeDamage(snapshot, 3.0f)
+  → 거리 검증
+  → TakeDamage()
+  → HP 차감 (lock 없이!)
+  → SendPacket("DAMAGE|50|30")
 ```
 
 ---
 
-## 6.11 IO 스레드와 워커 스레드의 분리
-
-게임 서버의 고전적인 요구사항입니다. **소켓 스레드는 소켓만, 워커 스레드는 로직만.**
-
-```
-[네트워크 IO 스레드들]            [워커 스레드들]
-       │                              │
-       │ 패킷 수신                     │ ready 큐 드레인
-       ▼                              │
- 세션 Sequencer.Enqueue(line)         │
-       │                              ▼
-       └──(CAS 로 1회)──► JobSystem.Post(drain) ──► 워커가 drain 실행
-                                        │
-                                        ▼
-                                world.HandleMove(...)  → actor 큐로
-```
-
-v2.1 은 이 패턴에 필요한 조각을 라이브러리가 전부 제공합니다.
+## 6.5 AttackerSnapshot — 불변 데이터의 중요성
 
 ```csharp
-// ① Sequencer 가 워커 풀에 직접 drain 을 예약한다 (7장)
-_packetSequencer = new Sequencer<string>(
-    server.System,                 // ← JobSystem.Post 로 스케줄
-    handler: HandleOnePacket,
-    onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex));
-
-// ② 그냥 Action 하나를 워커에서 돌리고 싶을 때
-system.Post(() => world.ReloadConfig());
-
-// ③ 비-워커 스레드가 actor 의 leader 가 되는 것 자체를 막고 싶을 때
-new JobOptions { Mode = ExecutionMode.Scheduled }
+// 불변(readonly) 구조체 — 스레드 간 전달 안전!
+public readonly record struct AttackerSnapshot(
+    string PlayerId, string Name,
+    float X, float Y, int Attack);
 ```
 
+왜 스냅샷을 쓰나요?
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│  IO 스레드와 워커 스레드 분리의 이점                     │
-├─────────────────────────────────────────────────────────┤
-│  IO 스레드: 순수 I/O — 네트워크 읽기/쓰기만 담당        │
-│  워커 스레드: 순수 로직 — 게임 로직만 담당              │
-│                                                          │
-│  → IO 스레드가 게임 로직에 의해 막히지 않음             │
-│  → Actor의 Flush가 항상 워커 스레드에서 실행            │
-│  → ThreadContext 값이 항상 정확                         │
-└─────────────────────────────────────────────────────────┘
+직접 Player 객체 전달 시:
+
+PlayerActor-1 큐에서:
+  snap = player1 (직접 참조 전달)
+  zone.SendMeleeDamage(playerId2, player1_ref, range)
+
+GameZone 큐에서:
+  target.ReceiveMeleeDamage(player1_ref, range)
+
+PlayerActor-2 큐에서:
+  player1_ref.X 읽기  ← 이 시점에 player1이 이동했을 수 있음!
+  → Race Condition!
+
+스냅샷 전달 시:
+
+PlayerActor-1 큐에서:
+  snap = new AttackerSnapshot(
+      player1.X,  ← 지금 이 순간의 값을 복사!
+      player1.Y,
+      player1.Attack)
+
+이후 player1이 어디로 이동해도 snap의 값은 변하지 않음
+→ 완전 안전!
+```
+
+---
+
+## 6.6 범위 공격 처리
+
+```csharp
+// 범위 공격 (AoE) 처리
+public void AreaAttack(float centerX, float centerY, float radius, float maxCastRange)
+    => DoAsync(() => ProcessAreaAttack(centerX, centerY, radius, maxCastRange));
+
+private void ProcessAreaAttack(float centerX, float centerY, float radius, float maxCastRange)
+{
+    if (_despawned || !_player.IsAlive) return;
+
+    // 시전 거리 검증
+    float distToCenter = _player.DistanceTo(centerX, centerY);
+    if (distToCenter > maxCastRange) return;
+
+    var snapshot = new AttackerSnapshot(...);
+
+    // GameZone에게 범위 데미지 fan-out 위임!
+    _zone.DispatchAreaDamage(snapshot, centerX, centerY, radius);
+}
+
+// GameZone
+public void DispatchAreaDamage(
+    AttackerSnapshot attacker, float centerX, float centerY, float radius)
+    => DoAsync(() => ProcessDispatchAreaDamage(attacker, centerX, centerY, radius));
+
+private void ProcessDispatchAreaDamage(
+    AttackerSnapshot attacker, float centerX, float centerY, float radius)
+{
+    // ① 공간 인덱스로 범위 내 플레이어 검색
+    var targets = Spatial.QueryRange(centerX, centerY, radius);
+
+    // ② 각 대상에게 AoE 데미지 전달
+    foreach (var targetPlayer in targets)
+    {
+        if (_actors.TryGetValue(targetPlayer.PlayerId, out var targetActor))
+        {
+            targetActor.ReceiveAreaDamage(attacker, centerX, centerY, radius);
+        }
+    }
+}
+```
+
+---
+
+## 6.7 PlayerActor의 자기복제 Regen
+
+```csharp
+// 자동 회복 시작 (GameZone이 EnterZone 후 호출)
+public void StartRegen() => DoAsync(RegenTick);
+
+private void RegenTick()
+{
+    if (_despawned) return;  // ← Despawn 시 체인 자동 종료!
+
+    if (_player.IsAlive && _player.Hp < _player.MaxHp)
+    {
+        int before = _player.Hp;
+        _player.Hp = Math.Min(_player.MaxHp, _player.Hp + RegenAmount);
+        int healed = _player.Hp - before;
+
+        if (healed > 0)
+        {
+            _player.SendPacket?.Invoke($"HP_UPDATE|{_player.Hp}|{_player.MaxHp}");
+        }
+    }
+
+    // 자기복제!
+    DoAsyncAfter(RegenInterval, RegenTick);  // 3초 후 다시 실행
+}
+```
+
+> **v2.1 스타일로 바꾼다면:**
+> ```csharp
+> private ITimerHandle? _regen;
+>
+> public void StartRegen()
+>     => DoAsync(() => _regen = DoAsyncEvery(RegenInterval, RegenTick));
+>
+> private void RegenTick()      // 재예약 코드가 사라진다
+> {
+>     if (_player.IsAlive && _player.Hp < _player.MaxHp) { ... }
+> }
+>
+> private void ProcessDespawn()
+> {
+>     _despawned = true;
+>     _regen?.Cancel();          // _despawned 플래그로 "발화는 하되 무시" 하지 않는다
+> }
+> ```
+> 이 장의 `AdvancedMmorpgServer` 가 정확히 이 형태로 이관되어 있습니다.
+
+---
+
+## 6.8 사망과 부활 처리
+
+```csharp
+// ReceiveMeleeDamage 안에서 호출됨 (자기 큐 안)
+private ITimerHandle? _respawnTimer;
+
+private void HandleDeath(string killerName)
+{
+    _player.SendPacket?.Invoke($"DEATH|{killerName}");
+
+    // 5초 후 자동 부활 예약! 반환된 핸들을 보관해 두면 Despawn 시 취소할 수 있다.
+    _respawnTimer = DoAsyncAfter(RespawnDelay, ProcessRespawn);
+}
+
+private void ProcessRespawn()
+{
+    if (_despawned) return;
+
+    float oldX = _player.X, oldY = _player.Y;
+    _player.Hp = _player.MaxHp;
+    _player.X = Random.Shared.NextSingle() * 200f;
+    _player.Y = Random.Shared.NextSingle() * 200f;
+
+    // 공간 인덱스 갱신
+    _zone.Spatial.UpdatePosition(_player, oldX, oldY);
+
+    _player.SendPacket?.Invoke($"RESPAWN|{_player.X:F1}|{_player.Y:F1}|{_player.Hp}");
+}
+```
+
+사망 후 타임라인:
+
+```
+t=0:   ProcessReceiveMeleeDamage
+         → HP = 0
+         → HandleDeath() 호출 (직접, 큐 안)
+         → DoAsyncAfter(5s, ProcessRespawn)
+
+t=5s:  ProcessRespawn()
+         → HP 회복
+         → 위치 랜덤 배치
+         → Spatial 갱신
+         → 클라이언트에 RESPAWN 패킷
+
+t=8s:  RegenTick() (3초 주기 자동 실행)
+         → HP 30 회복...
+```
+
+---
+
+## 6.9 SpatialIndex — 공간 인덱스
+
+```csharp
+public class SpatialIndex
+{
+    // 그리드 기반 공간 분할
+    // 각 셀: ConcurrentDictionary (여러 스레드에서 동시 접근 가능)
+    private readonly ConcurrentDictionary<(int cx, int cy), ConcurrentDictionary<string, Player>>
+        _grid = new();
+
+    // 범위 쿼리: centerX, centerY에서 radius 이내의 플레이어 목록
+    public List<Player> QueryRange(float centerX, float centerY, float radius) { ... }
+
+    // 위치 갱신: 셀이 바뀌면 이전 셀에서 제거 후 새 셀에 추가
+    public void UpdatePosition(Player player, float oldX, float oldY) { ... }
+}
+```
+
+왜 `ConcurrentDictionary`를 쓰나요?
+
+```
+SpatialIndex는 여러 Actor가 동시에 접근합니다:
+
+PlayerActor-1 큐: UpdatePosition(player1, ...)
+PlayerActor-2 큐: UpdatePosition(player2, ...)
+GameZone 큐:      QueryRange(centerX, centerY, ...)
+
+→ 각기 다른 스레드에서 동시 실행 가능
+→ ConcurrentDictionary의 내부 버킷 lock이 경합 최소화
+→ (개별 PlayerActor 내부 상태는 Actor 큐가 보호)
+```
+
+---
+
+## 6.10 PrintStatus — GetSnapshot 패턴
+
+`GameZone.GetSnapshot()` 은 5.17 과 같은 `ManualResetEventSlim` 패턴으로 구현되어 있습니다.
+새로 쓴다면 `AskSync` 한 줄입니다:
+
+```csharp
+public ZoneSnapshot GetSnapshot()
+    => AskSync(() => new ZoneSnapshot(_name, _actors.Values.Select(a => a.Snapshot()).ToList()),
+               TimeSpan.FromSeconds(2));
+```
+
+`AskSync` 는 타임아웃이 필수이고, actor 큐 안에서 호출하면 데드락 대신 예외를 던집니다 (5.17).
+
+```csharp
+public void PrintStatus()
+{
+    // ★ 메인/콘솔 스레드에서 호출할 것. actor 작업 안에서는 금지.
+    var snap = _zone.GetSnapshot();
+
+    Console.WriteLine("========== 서버 상태 ==========");
+    Console.WriteLine($"[{snap.Name}] 플레이어: {snap.Players.Count}명");
+    foreach (var p in snap.Players)
+    {
+        Console.WriteLine($"  - {p.Name} ({p.X:F1},{p.Y:F1}) " +
+                          $"HP:{p.Hp}/{p.MaxHp} {(p.IsAlive ? "생존" : "사망")}");
+    }
+}
+```
+
+---
+
+## 6.11 ExampleMmorpgServer — 핵심 학습 포인트
+
+```
+MmorpgServer 예제에서:
+✓ PlayerActor = 플레이어 단위 Actor (병렬!)
+✓ GameZone Actor = 전체 존 관리 (직렬!)
+✓ 공격 라우팅: 공격자 Actor → GameZone → 대상 Actor
+✓ AttackerSnapshot = 불변 데이터로 안전한 스레드 간 전달
+✓ 공간 인덱스: ConcurrentDictionary로 다중 Actor 접근 허용
+✓ 주기/지연: 예제는 자기복제, 새 코드는 DoAsyncEvery + ITimerHandle.Cancel()
+✓ 서버사이드 검증: 거리, 이동 속도 등
+✓ actor 큐 안에서 다른 actor 의 드레인을 기다리면 데드락
+  → Despawn 은 메시지로 보내고, 드레인은 큐 밖(또는 system.StopAsync)에서
+```
+
+---
+
+기본 MMORPG 예제의 전투와 상태 관리 흐름을 확인했다. 이제 고급 예제와 비교하며 현재 API를 적용한 구조와 최적화를 살펴본다.
+
+## 6.12 ExampleMmorpgServer와의 차이점
+
+`AdvancedMmorpgServer` 는 v2.1 API 로 **이관이 끝난** 유일한 샘플입니다. 5장의 채팅 서버와 이 장 앞부분의 MMORPG 예제가
+"예전 방식"의 기록이라면, 이 고급 예제는 "지금 권장하는 방식"을 보여 준다.
+
+```
+ExampleMmorpgServer (v2.0 스타일)   AdvancedMmorpgServer (v2.1)
+────────────────────────────────   ──────────────────────────────────────────
+기본 PlayerActor                    DoAsync<TState>로 클로저 없음
+옵션 없는 JobDispatcher<GameWorker>  JobSystem + 비제네릭 JobDispatcher
+GameWorker.cs (IRunnable +          GameWorker.cs 삭제 — 워커 루프 자체가 없음
+  InboundCommands + Sleep(1))
+NPC 없음                            NpcActor — DoAsyncEvery 로 도는 AI tick
+Sequencer 없음                      Sequencer(system, ...) 로 세션별 순서 보장
+자기복제 타이머 + _despawned 플래그   ITimerHandle 보관 → Despawn 시 Cancel()
+ManualResetEventSlim 스냅샷          AskSync 스냅샷
+4단계 수동 셧다운 + Thread.Sleep(200) system.StopAsync / DrainAsync
+설정 파일 없음                       config.json (포트 25100)
+NetworkServer 없음                   실제 TCP 네트워크 서버
+```
+
+---
+
+## 6.13 GameServer — JobSystem 소유와 셧다운
+
+이 서버는 **자기만의 `JobSystem`** 을 만듭니다. 워커·타이머 스레드·메트릭·셧다운 게이트가
+전부 그 안에 들어 있으므로, 종료가 한 줄이 됩니다.
+
+```csharp
+public sealed class GameServer : IDisposable
+{
+    private readonly JobSystem _system;
+    private readonly GameWorld _world;
+    private readonly NetworkServer _network;
+    private JobDispatcher? _dispatcher;
+
+    public GameServer(ServerConfig config)
+    {
+        _config = config;
+
+        // 이 서버의 워커·타이머·메트릭을 소유하는 시스템 하나.
+        _system = new JobSystem(new JobSystemOptions
+        {
+            Name = "game",
+            TimerPrecision = TimerPrecision.Coarse,
+            MaxJobDuration = TimeSpan.FromMilliseconds(50),   // 50ms 넘는 작업은 경고
+        });
+
+        _world = new GameWorld(config, _system);
+        _network = new NetworkServer(this, config.Server.Port);
+    }
+
+    public void Start()
+    {
+        // 사용자 루프가 없는 비제네릭 디스패처: 워커는 할 일이 없으면 시그널을 기다린다.
+        // 예전에 필요했던 IRunnable + Thread.Sleep(1) 워커는 사라졌다.
+        _dispatcher = new JobDispatcher(_config.Server.WorkerThreads, new JobDispatcherOptions
+        {
+            System = _system,
+            RestartFailedWorkers = true,
+            MaxRestartsPerWorker = 5,
+            RestartBackoff = TimeSpan.FromSeconds(1),
+        });
+        _ = _dispatcher.RunWorkerThreadsAsync();
+
+        _world.SpawnInitialNpcs();
+        _network.Start();
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        // ① 외부 입력 차단. 내부 종료 작업은 아직 actor 들이 필요하다.
+        _network.Stop();
+
+        // ② 전부 despawn + 타이머 체인 취소 → 시스템이 정적 상태에 도달할 수 있게 만든다.
+        _world.Stop();
+
+        // ③ 남은 것을 드레인하고, 타이머 스레드와 워커를 정지.
+        var drained = _system.StopAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+        if (!drained)
+            JobLog.Warn("[Server] some work was still in flight at shutdown");
+
+        _system.Dispose();
+    }
+}
+```
+
+이 순서가 중요한 이유:
+
+```
+① 네트워크 정지
+   → IO 스레드가 Sequencer 에 새 패킷을 넣지 않는다
+   → 이미 들어온 패킷과 disconnect 마커는 그대로 처리된다 (4.6)
+
+② World.Stop
+   → 모든 NpcActor / PlayerActor 에 Despawn 전송
+   → 각 actor 가 자기 타이머 핸들을 Cancel()
+   → ★ 이게 없으면 주기 타이머가 계속 새 작업을 만들어 드레인이 끝나지 않는다
+
+③ system.StopAsync
+   → in-flight 작업 + ready 큐 + 대기 타이머가 0 이 될 때까지 대기
+   → AcceptingWork = false
+   → 타이머 스레드 정지
+   → 이 시스템에 붙은 디스패처들 정지 (워커 Join)
 ```
 
 > **v2.0 에서는 이랬다**
-> 위의 세 조각이 전부 없었기 때문에, 모든 예제가 `public static ConcurrentQueue<Action>
-> InboundCommands` 같은 중계 큐를 손으로 만들고 `IRunnable.Run` 에서 `TryDequeue` +
-> `Thread.Sleep(1)` 로 돌렸습니다. 신규 사용자가 가장 많이 걸려 넘어지던 지점이기도 합니다.
-> `AdvancedMmorpgServer` 에서는 이 수동 큐(`GameWorker.cs`)가 통째로 삭제되었습니다.
-> `ExampleChatServer`/`ExampleMmorpgServer` 는 "예전 방식"의 참고 자료로 남아 있습니다.
+> ```csharp
+> AsyncExecutable.AcceptingWork = false;   // 프로세스 전역 static
+> _network.Stop();
+> _world.Stop();                            // 내부에 Thread.Sleep(200)
+> _dispatcher?.Dispose();
+> TimerRegistry.DisposeAll();
+> AsyncExecutable.AcceptingWork = true;     // 다음 인스턴스(테스트)를 위해 복구 ←?!
+> ```
+> 마지막 줄이 전역 static 게이트의 어색함을 그대로 보여줍니다. 프로세스에 서버가 둘이면
+> 서로의 셧다운을 건드리게 되죠. 지금은 게이트가 `JobSystem` 안에 있어 복구가 필요 없습니다.
 
 ---
 
-## 6.12 정리
+## 6.14 GameWorld — Scheduled 모드와 드레인
+
+```csharp
+public sealed class GameWorld : AsyncExecutable
+{
+    private const int WorldQueueCapacity = 10_000;
+
+    public GameWorld(ServerConfig cfg, JobSystem system)
+        : base(new JobOptions
+        {
+            Name = "World",
+            System = system,
+            MaxQueueSize = WorldQueueCapacity,
+            DropPolicy = DropPolicy.Reject,
+
+            // 월드는 콘솔 스레드(status/metrics)에서도 찔린다. Scheduled 모드로 두면
+            // 그런 호출자가 월드의 leader 가 되어 비-워커 스레드에서 게임 로직을 돌리는 일이 없다.
+            Mode = ExecutionMode.Scheduled,
+
+            OnDropped = static (actor, reason) => JobLog.Warn(
+                $"[World] job refused ({reason}), queue={actor.RemainingTaskCount}"),
+        })
+    { ... }
+}
+```
+
+`Mode = ExecutionMode.Scheduled` 는 v2.1 에서 추가된 옵션입니다 (2.3). 이 한 줄이
+"첫 호출자가 그 자리에서 actor 를 돌린다"는 기본 동작의 부작용 —
+**호출자 hijack** — 을 막습니다.
+
+### Stop — Thread.Sleep 대신 실제 드레인
+
+```csharp
+public void Stop()
+{
+    _isStopping = true;
+
+    DoAsync(static w =>
+    {
+        foreach (var s in w._sessions.Values) s.Close();
+        w._sessions.Clear();
+        foreach (var na in w._npcs.Values)    na.Despawn();   // 내부에서 tick 타이머 Cancel
+        foreach (var pa in w._players.Values) pa.Despawn();   // 내부에서 resync 타이머 Cancel
+    }, this);
+
+    // despawn 과 그로 인해 파생된 작업이 전부 끝날 때까지 기다린다.
+    if (!System.DrainAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult())
+        JobLog.Warn("[World] world did not fully quiesce before shutdown");
+}
+```
 
 ```
-이번 장에서 배운 것
-──────────────────────────────────────────────
-✓ JobDispatcher (비제네릭) = 사용자 루프 없음, 시그널 기반 유휴 대기
-✓ JobDispatcher<T> = IRunnable 자체 루프가 필요할 때
-✓ 공통 기반 JobDispatcherBase = 시작·감시·재기동·정지
-✓ JobDispatcherOptions = 재기동/백오프/예산회복/유휴대기/우선순위/스택
-✓ RunWorkerThreadsAsync 는 1회만 (두 번 호출 시 예외)
-✓ RunWorker = 컨텍스트 등록 → WorkerLoop → 크래시 시 actor 이름까지 로그
-✓ 수퍼바이저 = 지수 백오프 재기동 + RestartCountResetAfter 예산 회복
-✓ TryStop(timeout) 은 실제 종료 여부를 bool 로 알려준다
-✓ IO 분리는 Sequencer / JobSystem.Post / ExecutionMode.Scheduled 로
+v2.0:  Thread.Sleep(200);        // "이 정도면 되겠지"
+v2.1:  System.DrainAsync(5s)     // in-flight == 0 && ready == 0 && pendingTimers == 0
+                                 // 실제로 정적 상태가 됐는지 확인하고, 안 되면 경고
+```
+
+### GetSnapshot — AskSync
+
+```csharp
+/// <summary>월드 자기 큐에서 계산되는 일관된 읽기.</summary>
+public WorldSnapshot GetSnapshot()
+{
+    try
+    {
+        return AskSync(BuildSnapshot, TimeSpan.FromSeconds(2));
+    }
+    catch (TimeoutException)
+    {
+        JobLog.Warn("[World] snapshot timed out");
+        return new WorldSnapshot(0, 0, 0, 0, 0, RemainingTaskCount);
+    }
+}
+```
+
+`AskSync` 는 actor 작업 안에서 호출되면 예외를 던지므로(`JobDiagnostics.GuardBlockingWait`),
+이 메서드가 "워커를 멈춰 세우고 actor 를 기다리는" 데드락이 되는 일은 구조적으로 없습니다.
+예전 샘플의 `ManualResetEventSlim` + `ev.Wait()` 조합은 같은 실수를 조용한 행으로 만들었습니다.
+
+---
+
+## 6.15 NpcActor — DoAsyncEvery 로 도는 AI tick
+
+NPC는 스스로 AI를 실행하는 Actor입니다.
+
+```csharp
+public sealed class NpcActor : AsyncExecutable
+{
+    private const int NpcQueueCapacity = 128;   // tick 1개 + 다수 공격자 피격 흡수
+
+    private volatile bool _despawned;
+    private ITimerHandle? _tickTimer;      // ★ AI tick 핸들
+    private ITimerHandle? _respawnTimer;   // ★ 부활 타이머 핸들
+
+    public NpcActor(Npc npc, GameWorld world, TimeSpan tickInterval)
+        : base(new JobOptions
+        {
+            Name = $"Npc#{npc.Id}",
+            System = world.System,
+            MaxQueueSize = NpcQueueCapacity,
+            DropPolicy = DropPolicy.Reject,
+        })
+    { ... }
+
+    // ① Start: 자기 큐 안에서 주기 타이머를 무장한다
+    public void Start()
+        => DoAsync<NpcActor>(static a => a.ProcessStart(), this);
+
+    private void ProcessStart()
+    {
+        if (_despawned) return;
+
+        // 첫 틱을 0~interval 사이로 흩어서 NPC 50마리가 같은 ms 에 몰리지 않게 한다
+        var jitter = TimeSpan.FromMilliseconds(
+            Random.Shared.Next(0, Math.Max(1, (int)_tickInterval.TotalMilliseconds)));
+
+        _tickTimer = DoAsyncEvery(_tickInterval, Tick, jitter);
+    }
+
+    // ② Tick: AI 메인 루프 — 재예약 코드가 없다!
+    private void Tick()
+    {
+        if (_despawned) return;
+        if (_world.IsStopping) return;
+        if (!_npc.IsAlive) return;      // 죽은 NPC 는 그냥 아무것도 안 한다
+
+        long now = NowMs();
+        float dt = ...;
+
+        switch (_state)
+        {
+            case AiState.Idle:   TickIdle(now, dt); break;
+            case AiState.Chase:  TickChase(now, dt); break;
+            case AiState.Attack: TickAttack(now, dt); break;
+            case AiState.Flee:   TickFlee(now, dt); break;
+        }
+    }
+
+    // ③ Despawn: 플래그가 아니라 실제 취소
+    private void ProcessDespawn()
+    {
+        if (_despawned) return;
+        _despawned = true;
+
+        _tickTimer?.Cancel();
+        _respawnTimer?.Cancel();
+
+        Aoi.LeaveWorldNpc(_world.Spatial, _npc);
+    }
+}
+```
+
+### 자기복제 → 주기 타이머로 바꾸면서 사라진 문제들
+
+```
+v2.0 (Tick 마지막 줄에서 DoAsyncAfter(_tickInterval, Tick)):
+
+  ① Tick 안에서 예외가 한 번 나면 → 재예약 줄에 도달 못 함 → 그 NPC 영구 정지
+  ② 죽었을 때 체인을 끊고, Respawn 에서 다시 시작해야 했다 (상태 두 벌 관리)
+  ③ 종료 시 _despawned 플래그로 "발화는 하되 무시" → 타이머가 계속 작업을 만든다
+  ④ 워커가 크래시로 재기동되면 그 스레드에 걸린 tick 체인이 통째로 사라졌다 (P0-2)
+
+v2.1 (DoAsyncEvery + ITimerHandle):
+
+  ① 예외가 나도 다음 틱이 온다
+  ② 죽으면 Tick 이 곧바로 return 할 뿐, 체인은 계속 돈다 → Respawn 이 재무장할 필요 없음
+  ③ Despawn 에서 Cancel() → 진짜로 멈춘다 → DrainAsync 가 끝난다
+  ④ 타이머는 시스템 소유 스레드에 있으므로 워커 재기동과 무관하다
+```
+
+`Respawn` 에 재무장 코드가 없다는 점을 확인해 보세요:
+
+```csharp
+private void Respawn()
+{
+    if (_despawned) return;
+    _npc.Hp = _npc.MaxHp;
+    ...
+    // 주기 tick 은 계속 돌고 있었고, 죽어 있는 동안 아무것도 하지 않았을 뿐이다.
+    // 다시 무장할 것이 없다.
+}
 ```
 
 ---
 
-*[← Chapter 05](./chapter05.md) | [→ Chapter 07: Sequencer — 패킷 순서 보장](./chapter07.md)*
+## 6.16 AI 상태 머신
+
+```
+NPC AI 상태 전환:
+
+                ┌─────────────────────────────┐
+                │         IDLE                │
+                │  (Wander / 플레이어 탐지)   │
+                └──────────────┬──────────────┘
+                               │ 플레이어 AggroRange 진입
+                               ▼
+                ┌─────────────────────────────┐
+                │         CHASE               │◄──────────┐
+                │  (플레이어 추적)            │           │
+                └──────────────┬──────────────┘    공격   │
+                               │ AttackRange 진입  범위 벗 │어남
+                               ▼
+                ┌─────────────────────────────┐
+                │         ATTACK              │
+                │  (공격 쿨다운마다 공격)     │
+                └──────────────┬──────────────┘
+                               │ HP < FleeHpRatio
+                               ▼
+                ┌─────────────────────────────┐
+                │         FLEE                │
+                │  (4초간 도주)               │
+                └──────────────┬──────────────┘
+                               │ 4초 경과
+                               ▼
+                            IDLE로 복귀
+```
+
+코드로 보면:
+
+```csharp
+private void TickChase(long now, float dt)
+{
+    var target = _world.GetEntity(_targetId);
+    if (target is null || !target.IsAlive)
+    {
+        _state = AiState.Idle; _targetId = -1; return;
+    }
+
+    float d = _npc.DistanceTo(target.X, target.Y);
+
+    // 너무 멀어지면 포기
+    if (d > _npc.AggroRange * ChaseGiveUpRangeFactor)
+    {
+        _state = AiState.Idle; _targetId = -1; return;
+    }
+
+    // 공격 범위 안에 들어왔으면 공격 상태로
+    if (d <= _npc.AttackRange)
+    {
+        _state = AiState.Attack; return;
+    }
+
+    // 플레이어 방향으로 이동
+    float dx = target.X - _npc.X, dy = target.Y - _npc.Y;
+    float len = MathF.Sqrt(dx * dx + dy * dy);
+    if (len < 0.001f) return;
+    float step = _npc.MoveSpeed * dt;
+    MoveTo(_npc.X + dx / len * step, _npc.Y + dy / len * step);
+}
+```
+
+---
+
+## 6.17 ReceiveDamage — DoAsync\<TState\> 최적화
+
+```csharp
+// ❌ 일반 방법 — 클로저 생성
+public void ReceiveDamage_Slow(AttackerSnapshot atk, float meleeRange)
+    => DoAsync(() => ProcessReceiveDamage(atk, meleeRange));
+//             ↑ this, atk, meleeRange 캡처 → 클로저 힙 할당!
+
+// ✅ 최적화 방법 — 클로저 없음
+public void ReceiveDamage(AttackerSnapshot atk, float meleeRange)
+    => DoAsync<(NpcActor A, AttackerSnapshot Atk, float R)>(
+        // static 람다 → 힙 할당 0
+        static t => t.A.ProcessReceiveDamage(t.Atk, t.R),
+        // ValueTuple → Job<T> 풀에서 재사용
+        (this, atk, meleeRange));
+```
+
+이게 중요한 이유:
+
+```
+NPC가 50마리, 매 틱 각 NPC가 1~5번 공격 받는다면:
+
+초당 250~1250번 ReceiveDamage 호출
+
+일반 방법:
+  그만큼의 클로저 객체 생성
+  → GC 압박 → 게임 틱 불규칙
+
+DoAsync<TState> 방법:
+  Job<(NpcActor, AttackerSnapshot, float)> 풀에서 재사용
+  → 0 추가 할당 → 부드러운 틱
+```
+
+거부됐을 때도 `Job` 은 풀로 돌아옵니다 (2.21). NPC 큐가 128 로 제한되어 있어 몰매를 맞는
+NPC 는 실제로 거부가 발생하는데, 그 경로에서 풀이 새지 않습니다.
+
+---
+
+## 6.18 PlayerActor — 이동 속도 검증과 AOI 타이머
+
+```csharp
+private void ProcessMove(float newX, float newY)
+{
+    if (_despawned || !_player.IsAlive) return;
+
+    var oldX = _player.X;
+    var oldY = _player.Y;
+
+    // ★ 이동 속도 제한 — 속임 클라이언트 방어!
+    var dx = newX - oldX, dy = newY - oldY;
+    var dist = MathF.Sqrt(dx * dx + dy * dy);
+    var maxStep = _player.MoveSpeed * 0.5f;   // 0.5초 분량
+
+    if (dist > maxStep && dist > 0.0001f)
+    {
+        var k = maxStep / dist;               // 최대 이동 거리로 클리핑
+        newX = oldX + dx * k;
+        newY = oldY + dy * k;
+    }
+
+    // 월드 경계 클리핑
+    _player.X = Math.Clamp(newX, 0, _world.Width);
+    _player.Y = Math.Clamp(newY, 0, _world.Height);
+
+    Aoi.PlayerMoved(_world.Spatial, _player, oldX, oldY);   // 섹터 이동 + 시야 갱신
+}
+```
+
+AOI 재동기화도 주기 타이머입니다:
+
+```csharp
+private void ProcessEnterWorld()
+{
+    if (_despawned) return;
+    Aoi.EnterWorld(_world.Spatial, _player);
+
+    // 자기 재예약 대신 주기 타이머 하나. Despawn 에서 핸들 하나만 취소하면 된다.
+    if (_world.AoiResyncInterval > TimeSpan.Zero)
+        _resyncTimer = DoAsyncEvery(_world.AoiResyncInterval, ResyncTick);
+}
+```
+
+---
+
+## 6.19 세션 — Sequencer 가 워커 풀에 직접 예약
+
+```csharp
+public sealed class ClientSession
+{
+    private readonly Sequencer<string> _packetSequencer;
+
+    public ClientSession(long connId, TcpClient tcp, GameServer server, ...)
+    {
+        // ★ JobSystem 을 넘기는 생성자 — drain 이 system.Post 로 워커에 예약된다.
+        //   예전에 필요했던 수동 InboundCommands 큐가 사라졌다.
+        _packetSequencer = new Sequencer<string>(
+            server.System,
+            handler: HandleOnePacket,
+            onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex));
+    }
+
+    // 수신 IO 스레드 — push 만 하고 즉시 반환
+    private void RecvLoop()
+    {
+        // ... 개행 단위로 파싱
+        _packetSequencer.Enqueue(line);
+    }
+
+    // 워커 스레드 — 도착 순서대로, 세션당 한 번에 하나씩
+    private void HandleOnePacket(string line)
+    {
+        if (ReferenceEquals(line, DisconnectMarker))
+        {
+            if (PlayerId != 0)
+                _server.World.RemovePlayer(PlayerId);
+            return;
+        }
+        PacketHandler.Handle(_server, this, line);
+    }
+}
+```
+
+```
+IO Thread (NetRecv-N)          워커 풀
+       │                          │
+       │ Enqueue(line)            │
+       ▼                          │
+  Sequencer ──CAS 1회──► system.Post(Drain) ──► 워커가 Drain 실행
+                                                  handler(line1)
+                                                  handler(line2)   ← 도착 순서 보장
+                                                  ...
+                                                     │
+                                                     ▼
+                                            world.HandleClientMove(...)
+                                                     │
+                                                     ▼
+                                             PlayerActor 큐
+```
+
+### 유령 플레이어를 막는 disconnect 마커
+
+```csharp
+private void HandleDisconnect()
+{
+    if (Interlocked.Exchange(ref _closeNotified, 1) != 0) { Close(); return; }
+
+    // 이미 도착한 패킷들 뒤에 마커를 넣는다 → RemovePlayer 가 마지막에 실행된다
+    if (!_packetSequencer.Enqueue(DisconnectMarker) && PlayerId != 0)
+    {
+        // false = 이미 Stop 된 sequencer (서버 셧다운) → 직접 정리
+        _server.World.RemovePlayer(PlayerId);
+    }
+
+    Close();   // 내부에서 _packetSequencer.Stop()
+}
+```
+
+`Close()` 는 곧바로 `Stop()` 을 부릅니다. v2.0 에서는 이 조합이 **마커를 잃을 수 있었고**
+(P0-4, 4.6), 그 결과 접속이 끊긴 플레이어가 월드에 남았습니다. 지금은 `Stop()` 이
+"새 항목만 거부"이므로 마커는 반드시 처리됩니다. 그리고 `Enqueue` 의 반환값을 확인해
+거부된 경우의 대체 경로까지 두었습니다.
+
+---
+
+## 6.20 config.json으로 서버 설정
+
+```json
+{
+  "server": {
+    "port": 25100,
+    "workerThreads": 8,
+    "aoiResyncIntervalMs": 3000
+  },
+  "world": {
+    "name": "AdvancedField",
+    "width": 1000.0,
+    "height": 1000.0,
+    "spatialCellSize": 64.0
+  },
+  "npc": {
+    "totalCount": 50,
+    "tickIntervalMs": 200,
+    "respawnSeconds": 8.0,
+    "types": [ { "kind": "Slime", "weight": 4, "maxHp": 60, ... } ]
+  }
+}
+```
+
+```csharp
+var config = ServerConfig.Load(configPath);   // 기본 "config.json"
+var server = new GameServer(config);
+server.Start();
+```
+
+> 포트가 9100 에서 **25100** 으로 바뀌었습니다. 이 저장소의 개발용 포트 대역
+> (TCP 25001–25199) 규칙에 맞춘 것으로, 테스트 클라이언트도 같은 포트를 씁니다.
+
+---
+
+## 6.21 NPC 초기 분산 전략
+
+NPC 50마리가 동시에 첫 Tick을 실행하면 한꺼번에 워커 큐에 몰립니다.
+`DoAsyncEvery` 의 `initialDelay` 인자로 분산합니다:
+
+```csharp
+var jitter = TimeSpan.FromMilliseconds(
+    Random.Shared.Next(0, Math.Max(1, (int)_tickInterval.TotalMilliseconds)));
+
+_tickTimer = DoAsyncEvery(_tickInterval, Tick, jitter);
+//                        ↑ 주기       ↑ 첫 발화까지의 지연
+```
+
+200ms 틱 간격, NPC 50마리의 경우:
+
+```
+분산 없음:              분산 있음 (0~200ms 랜덤 initialDelay):
+
+t=0ms: 50개 NPC Tick    t=3ms:   1개 NPC
+        → 큐 폭주!      t=11ms:  1개 NPC
+                        t=24ms:  2개 NPC
+                        ...
+                        t=198ms: 1개 NPC  → 고르게 분산
+
+한 번 분산되면 그 위상이 계속 유지된다 —
+주기 타이머는 "예정 시각 + period" 로 재무장하므로 드리프트가 없다 (3.5).
+```
+
+---
+
+## 6.22 콘솔 명령 — 상태와 메트릭
+
+```csharp
+static void PrintStatus(GameServer s)
+{
+    var snap = s.World.GetSnapshot();     // AskSync — 월드 큐에서 계산된 일관 스냅샷
+    Console.WriteLine($"[상태] 세션 {snap.SessionCount} / 플레이어 {snap.LivePlayerCount}/{snap.TotalPlayerCount} " +
+                      $"/ NPC {snap.LiveNpcCount}/{snap.TotalNpcCount} / WorldQueue {snap.WorldQueueDepth}");
+}
+
+static void PrintMetrics(GameServer s)
+{
+    var m = s.System.Metrics.Snapshot();  // ★ 인스턴스 메트릭
+    Console.WriteLine(
+        $"[metrics] executed={m.TotalJobsExecuted} dropped={m.TotalJobsDropped} failed={m.TotalJobsFailed} " +
+        $"inFlight={m.InFlightJobs} pendingTimers={m.PendingTimerJobs} ready={m.ReadyQueueDepth} " +
+        $"jobPool={m.ActiveJobPoolSize} workers={m.LiveWorkers} restarts={m.WorkerRestarts}");
+}
+```
+
+이 두 명령은 콘솔 입력 스레드(비-워커)에서 실행됩니다. `GetSnapshot` 이 `AskSync` 이고
+월드가 `ExecutionMode.Scheduled` 이므로, 콘솔 스레드가 게임 로직을 실행하는 일은 없습니다.
+
+---
+
+## 6.23 고급 패턴 요약
+
+```mermaid
+graph LR
+    subgraph 최적화
+        A1[DoAsync&lt;TState&gt; 클로저 없음] --> O1[GC 압박 감소]
+        A2[JobOptions.MaxQueueSize] --> O2[OOM 방지]
+        A3[DoAsyncEvery initialDelay 분산] --> O3[큐 폭주 방지]
+    end
+    subgraph 안전성
+        B1[AttackerSnapshot 불변 데이터] --> S1[Race Condition 없음]
+        B2[Sequencer - system 생성자] --> S2[패킷 순서 + 유령 플레이어 방지]
+        B3[ExecutionMode.Scheduled] --> S3[호출자 hijack 방지]
+        B4[AskSync + 데드락 가드] --> S4[조용한 행 대신 예외]
+    end
+    subgraph 운영
+        C1[JobDispatcherOptions 수퍼바이저] --> M1[워커 자동 재기동]
+        C2[system.StopAsync / DrainAsync] --> M2[검증된 우아한 종료]
+        C3[system.Metrics.Snapshot] --> M3[운영 모니터링]
+        C4[MaxJobDuration 워치독] --> M4[느린 작업 추적]
+    end
+```
+
+---
+
+## 6.24 핵심 학습 포인트
+
+```
+AdvancedMmorpgServer에서:
+✓ JobSystem 하나가 워커·타이머·메트릭·셧다운 게이트를 소유한다
+✓ 비제네릭 JobDispatcher — IRunnable 도, InboundCommands 도, Sleep(1) 도 없다
+✓ ExecutionMode.Scheduled 로 비-워커 호출자의 hijack 차단
+✓ DoAsync<TState>: hot path에서 클로저 할당 0
+✓ JobOptions: World 10,000 / Player 256 / NPC 128 로 큐 제한 + OnDropped(reason)
+✓ NpcActor AI: DoAsyncEvery 로 도는 상태 머신, Despawn 에서 Cancel()
+✓ Sequencer(system, ...): 세션별 패킷 순서 + disconnect 마커 보장
+✓ AskSync: 데드락 가드가 붙은 일관 스냅샷
+✓ 셧다운: 네트워크 정지 → World.Stop(취소+드레인) → system.StopAsync
+✓ 포트는 개발 대역 25100
+```
+
+---
+
+*[← 제5장: 콘솔과 채팅 서버 예제 분석](./chapter05.md) | [↑ 목차](./README.md) | [→ 제7장: 실전 패턴과 모범 사례](./chapter07.md)*

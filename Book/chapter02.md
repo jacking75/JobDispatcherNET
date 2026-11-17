@@ -1,277 +1,1107 @@
-# Chapter 02: Actor 모델과 직렬 실행의 마법
+# 제2장: AsyncExecutable 실행 코어와 작업 풀링
 
-## 2.1 "직렬 실행"이 뭔가요?
+Actor의 기반인 AsyncExecutable을 통해 작업 접수부터 직렬 실행, 결과 회수와 종료까지 추적한다. 이어서 큐에 담기는 JobEntry와 작업 객체 풀링을 분석해 실행 흐름과 할당 비용을 함께 이해한다.
 
-직렬(Serial) 실행이란 한 번에 하나씩 순서대로 처리하는 것입니다.
+## 2.1 전체 구조 미리보기
+
+`AsyncExecutable`은 JobDispatcherNET의 심장입니다. 코드를 읽기 전에 전체 구조를 파악합시다:
 
 ```
-병렬(Parallel) 실행:       직렬(Serial) 실행:
-┌──────────────────┐       ┌──────────────────┐
-│ 작업1 ────────── │       │ 작업1            │
-│ 작업2 ────────── │       │       ▼          │
-│ 작업3 ────────── │       │     작업2         │
-│ (동시에!)        │       │       ▼          │
-└──────────────────┘       │     작업3         │
-                           │ (순서대로!)       │
-                           └──────────────────┘
+AsyncExecutable 클래스
+──────────────────────────────────────────────────────────
+필드:
+  _queue       : ConcurrentQueue<JobEntry>  ← 작업들이 들어오는 큐
+  _system      : JobSystem                  ← 워커·타이머·메트릭의 소유자
+  _options     : JobOptions                 ← 큐 크기 제한, 실행 모드 등
+  _remainingTaskCount : int                 ← 큐 대기 + 실행 중 작업 수
+  _faulted     : int                        ← 연속 실패로 격리된 상태인가
+
+공개 API (작업 등록):
+  DoAsync(Action)                   ← 작업 등록 (람다), bool 반환
+  DoAsync<TState>(action, state)    ← 작업 등록 (클로저 없이!)
+  DoAsyncAfter(delay, action)       ← 지연 작업 등록 → ITimerHandle
+  DoAsyncEvery(period, action)      ← 주기 작업 등록 → ITimerHandle
+
+공개 API (결과 받기 / 비동기):
+  Ask<TResult>(func)                ← 결과를 Task<TResult>로 회수
+  AskSync<TResult>(func, timeout)   ← 논-actor 호출자용 동기 회수
+  RunAsync(Func<Task>)              ← await 하는 작업
+  AskAsync<TResult>(Func<Task<T>>)  ← await 하면서 결과도 반환
+
+공개 API (상태 조회):
+  Name / System                     ← 이름, 소속 JobSystem
+  RemainingTaskCount                ← 큐 깊이 조회
+  MaxObservedQueueDepth             ← 관측된 최대 큐 깊이
+  IsFaulted / ClearFault()          ← 연속 실패 격리 상태
+
+재정의 지점:
+  protected virtual void OnJobError(Exception)   ← actor 단위 오류 처리
+
+정적 API:
+  OnError                           ← 프로세스 전역 예외 폴백
+  AcceptingWork                     ← [Obsolete] → system.AcceptingWork
+
+내부 메서드:
+  Admit(JobEntry, fromTimer)        ← 입장 판정 + 큐 등록 + leader 결정
+  Flush()                           ← 큐를 비우는 핵심 루프
+──────────────────────────────────────────────────────────
 ```
 
-직렬 실행이면 같은 데이터에 동시에 접근하는 일이 없으므로 lock이 필요 없습니다!
+> **v2.0 에서 바뀐 점**
+> 예전에는 큐가 `Channel<JobEntry>` 였고, 큐 크기 제한도 채널의 bounded 옵션이 담당했습니다.
+> 지금은 **unbounded `ConcurrentQueue<JobEntry>` + 카운터 CAS** 조합입니다. 왜 바꿨는지는 2.3에서
+> 설명합니다 (P0-1 버그).
 
 ---
 
-## 2.2 큐(Queue)가 직렬 실행을 만드는 원리
-
-JobDispatcherNET에서 모든 Actor는 자기만의 **작업 큐**(`ConcurrentQueue<JobEntry>`)를 가집니다.
-외부에서 작업을 넣으면(DoAsync), Actor는 큐에서 하나씩 꺼내 처리합니다.
-
-```
-                   외부 스레드들
-         Thread-A    Thread-B    Thread-C
-            │            │           │
-            │ DoAsync()  │ DoAsync() │ DoAsync()
-            ▼            ▼           ▼
-         ┌────────────────────────────────┐
-         │   ConcurrentQueue<JobEntry>    │
-         │  ┌────────┐┌────────┐┌──────┐ │
-         │  │ 작업 1 ││ 작업 2 ││작업3 │ │
-         │  └───┬────┘└───┬────┘└──┬───┘ │
-         └──────┼─────────┼────────┼─────┘
-                │         │        │
-                ▼ (순서대로)        │
-         ┌──────────────────────────┐
-         │       Flush 루프         │
-         │  작업1 실행               │
-         │  작업2 실행  ← 하나씩!   │
-         │  작업3 실행               │
-         └──────────────────────────┘
-```
-
-여러 스레드가 동시에 DoAsync를 호출해도, 큐 안에서 순서가 정해지고 하나씩 실행됩니다.
-"동시에 실행하는 스레드는 최대 하나"라는 보장은 큐 자체가 아니라 **입장 카운터의 CAS** 가
-만듭니다 (3.3에서 자세히).
-
----
-
-## 2.3 AsyncExecutable 기본 사용법
-
-모든 Actor는 `AsyncExecutable`을 상속합니다.
+## 2.2 DoAsync — 가장 기본적인 진입점
 
 ```csharp
-// 이렇게 만들면 됩니다!
-public class Player : AsyncExecutable
+public bool DoAsync(Action action)
 {
-    private int _hp = 100;      // lock 없이 안전하게 쓸 수 있는 필드
+    ArgumentNullException.ThrowIfNull(action);
 
-    // ✅ 외부에서 호출하는 진입점 — DoAsync로 큐에 넣기만 합니다
-    public void TakeDamage(int damage)
-        => DoAsync(() => ProcessTakeDamage(damage));
+    // 1) 입장 자격 검사: 셧다운 중인가 / Dispose 됐나 / faulted 인가
+    if (!TryReserve(out var reason))
+        return Refuse(reason);      // 메트릭 +1, OnDropped 콜백, false 반환
 
-    // ✅ 실제 처리 — 항상 이 Actor의 큐에서 직렬 실행됩니다
-    private void ProcessTakeDamage(int damage)
-    {
-        _hp -= damage;           // lock 없이 안전! (직렬 실행 보장)
-        Console.WriteLine($"HP: {_hp}");
-        if (_hp <= 0)
-            ProcessDie();
-    }
-
-    private void ProcessDie()
-    {
-        Console.WriteLine("사망!");
-    }
+    // 2) 람다를 Job 객체로 포장 (풀에서 재사용!) 후 실제 등록
+    return Admit(Job.Rent(action), fromTimer: false);
 }
 ```
 
----
-
-## 2.4 큐 기반 직렬 실행의 증명
-
-코드로 직접 확인해봅시다:
+`TryReserve`는 세 가지를 봅니다:
 
 ```csharp
-var player = new Player();
-
-// 10개 스레드에서 동시에 데미지를 입힙니다
-var tasks = Enumerable.Range(0, 10)
-    .Select(i => Task.Run(() => player.TakeDamage(10)))
-    .ToArray();
-
-await Task.WhenAll(tasks);
-// 결과: HP = 0 (정확히 100 - 10*10)
-// lock 없이도 정확합니다!
-```
-
-```
-시간 ─────────────────────────────────────────────────────►
-
-Thread-1: TakeDamage(10) → DoAsync → 큐에 넣기 끝
-Thread-2: TakeDamage(10) → DoAsync → 큐에 넣기 끝
-Thread-3: TakeDamage(10) → DoAsync → 큐에 넣기 끝
-...
-
-         큐: [데미지10][데미지10][데미지10]...[데미지10]
-              ↑ 순서대로 처리 →
-
-HP: 100 → 90 → 80 → 70 → 60 → 50 → 40 → 30 → 20 → 10 → 0
-         (한 번에 하나씩, 결과가 정확합니다!)
-```
-
----
-
-## 2.5 코딩 컨벤션 — Handle/Process 패턴
-
-JobDispatcherNET 예제들은 일관된 코딩 패턴을 따릅니다:
-
-```csharp
-public class SomeActor : AsyncExecutable
+private bool TryReserve(out DropReason reason)
 {
-    // ────────────────────────────────────────────────────
-    // 외부 진입점 (public)
-    // 규칙: "큐에 넣기만 하고 즉시 반환"
-    // ────────────────────────────────────────────────────
-
-    public void HandleSomething(int value)
-        => DoAsync(() => ProcessSomething(value));
-    //            ↑ 딱 이것만! 실제 처리는 private로 분리
-
-    // ────────────────────────────────────────────────────
-    // 실제 처리 (private)
-    // 규칙: "Actor 큐에서 직렬 실행, 여기서 상태 변경"
-    // ────────────────────────────────────────────────────
-
-    private void ProcessSomething(int value)
-    {
-        // 여기서 안전하게 상태를 바꿀 수 있습니다
-        _someState = value;
-    }
+    if (!_system.AcceptingWork) { reason = DropReason.ShuttingDown; return false; }
+    if (Volatile.Read(ref _completed) != 0) { reason = DropReason.Disposed;  return false; }
+    if (Volatile.Read(ref _faulted)   != 0) { reason = DropReason.Faulted;   return false; }
+    reason = default;
+    return true;
 }
 ```
 
-왜 이렇게 나누나요?
+**반환값 `bool`을 절대 무시하지 마세요.** `false`는 "이 작업은 실행되지 않는다"는 뜻입니다
+(큐 만원 / 셧다운 중 / Dispose 됨 / actor 격리됨). 어느 쪽인지는 `JobOptions.OnDropped` 콜백이
+받는 `DropReason`으로 알 수 있습니다 (4장).
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Handle* vs Process* 분리의 이유                         │
-├─────────────────────────────────────────────────────────┤
-│  1. 디버거 스택트레이스가 명확해집니다                   │
-│     "HandleMove → DoAsync → Flush → ProcessMove"        │
-│                                                          │
-│  2. grep으로 찾기 쉽습니다                               │
-│     "ProcessMove를 grep → 실제 처리 로직 바로 찾기"     │
-│                                                          │
-│  3. 의도가 명확합니다                                    │
-│     Handle = "접수만 함"                                │
-│     Process = "실제 처리"                               │
-└─────────────────────────────────────────────────────────┘
-```
+간단해 보이지만 실제 마법은 `Admit`에 있습니다.
 
 ---
 
-## 2.6 Actor 간 메시지 패싱
+## 2.3 Admit — 직렬 실행의 핵심 로직
 
-Actor끼리 서로에게 메시지를 보낼 수 있습니다. 이것이 진짜 Actor 모델입니다:
+`Admit`이 가장 중요한 메서드입니다. 단계별로 이해해봅시다:
 
 ```csharp
-public class Room : AsyncExecutable  // Room도 Actor!
+private bool Admit(JobEntry task, bool fromTimer)
 {
-    private List<Player> _players = new();
-
-    // Room Actor에게 채팅 메시지 전달을 부탁합니다
-    public void BroadcastChat(string message)
-        => DoAsync(() => ProcessBroadcastChat(message));
-
-    private void ProcessBroadcastChat(string message)
+    // ─── 단계 1: 입장 판정 = 카운터 CAS ─────────────────────
+    int current;
+    while (true)
     {
-        // Room 큐 안에서 실행 — _players 접근 안전!
-        foreach (var player in _players)
+        current = Volatile.Read(ref _remainingTaskCount);
+
+        // 큐 한도 초과? → 이 자리에서 거부하고 Job 은 풀로 반납
+        if (_maxQueueSize != 0 && current >= _maxQueueSize)
         {
-            // Player Actor의 큐에 메시지 전달을 넣습니다
-            player.ReceiveMessage(message);  // player의 DoAsync 호출
+            task.Discard();
+            return Refuse(DropReason.QueueFull);
+        }
+
+        // current 가 그대로일 때만 current+1 로 확정 (경쟁이 있으면 재시도)
+        if (Interlocked.CompareExchange(ref _remainingTaskCount, current + 1, current) == current)
+            break;
+    }
+
+    _system.OnJobAdmitted();     // in-flight 계수 (드레인 판정에 사용)
+    _queue.Enqueue(task);        // unbounded 큐 → 여기서는 절대 실패하지 않는다
+
+    // ─── 단계 2: 내가 leader 인가? ──────────────────────────
+    if (current != 0)
+        return true;             // 이미 누군가 이 actor 를 flush 중 → 큐에만 넣고 끝
+
+    // ─── 단계 3: leader 는 어디에서 실행할 것인가 ───────────
+    if (fromTimer)
+    {
+        if (_system.HasWorkers) { _system.Schedule(this); return true; }  // 워커에게 넘김
+        _system.WarnTimerFallbackOnce();   // 워커가 없다 → 타이머 스레드에서 직접 실행
+        RunFlushLoop();
+        return true;
+    }
+
+    if (_mode == ExecutionMode.Scheduled && !ThreadContext.IsWorkerThread && _system.HasWorkers)
+    {
+        _system.Schedule(this);  // 비-워커 스레드는 ready 큐에 넣기만 하고 반환
+        return true;
+    }
+
+    if (ThreadContext.CurrentExecuter is not null)
+    {
+        // 이 스레드는 지금 다른 actor 를 flush 중 → 재귀 대신 나중 처리
+        ThreadContext.ExecuterQueue.Enqueue(this);
+        return true;
+    }
+
+    RunFlushLoop();              // LeaderFlush: 내가 이 자리에서 큐를 비운다
+    return true;
+}
+```
+
+### 왜 "카운터가 먼저"인가 — P0-1 버그 이야기
+
+v2.0 의 `DoTask`는 순서가 반대였습니다. **먼저 카운터를 올리고, 그다음 채널에 쓰고, 실패하면
+카운터를 되돌렸습니다.** 그 사이에는 "카운터에는 있는데 큐에는 없는 유령 작업"이 존재합니다.
+
+```
+MaxQueueSize = 1 인 actor
+
+L(leader) : job1 실행 중, 큐에 job2 대기            count = 2
+Q(다른 스레드): Increment → count = 3
+Q            : 채널 쓰기 실패 (가득)
+   --- 여기서 Q 가 OS 에 선점됨 ---
+L            : job1 끝, Decrement → 2 (≠0, 계속)
+L            : job2 실행, Decrement → 1 (≠0, 계속)
+L            : 큐 읽기 실패 → 스핀
+Q            : Decrement → count = 0
+L            : 카운터를 다시 보지 않으므로 → 영원히 스핀 (코어 1개 소모!)
+M(새 producer): Increment 0→1 → 자기가 leader 라 판단 → L 과 동시에 같은 actor 실행
+                → "한 번에 하나씩" 이라는 직렬 실행 보장이 무너진다
+```
+
+지금 구조에서는 이 창 자체가 없습니다.
+
+```
+카운터 CAS 가 통과했다  ⇒  이 작업은 반드시 큐에 들어간다 (unbounded 라서 쓰기가 실패하지 않음)
+카운터 CAS 가 실패했다  ⇒  큐에는 아무것도 넣지 않았고, Job 은 풀로 반납됐다
+
+즉 카운터와 큐가 어긋날 수 없다 = 카운터가 곧 진실(source of truth)
+```
+
+거부된 `Job`은 사용자에게 넘기지 않고 `task.Discard()`로 라이브러리가 풀에 반납합니다
+(작업 폐기는 2.21절 참조). `OnDropped` 콜백이 `JobEntry`를 받지 않게 바뀐 이유가 이것입니다.
+
+이 로직을 다이어그램으로 보면:
+
+```mermaid
+flowchart TD
+    A[Admit 호출] --> B{count < MaxQueueSize?}
+    B -->|No| C[Job.Discard + Refuse - QueueFull]
+    B -->|Yes| D[CAS count → count+1]
+    D --> E[queue.Enqueue]
+    E --> F{CAS 직전 count == 0?}
+    F -->|No - 이미 leader 있음| G[반환 — 그 leader 가 처리]
+    F -->|Yes - 내가 leader| H{타이머에서 온 작업?}
+    H -->|Yes| I{워커가 있나?}
+    I -->|Yes| J[system.Schedule - 워커가 flush]
+    I -->|No| K[경고 1회 + 타이머 스레드에서 flush]
+    H -->|No| L{Scheduled 모드 && 비-워커 스레드?}
+    L -->|Yes| J
+    L -->|No| M{이 스레드가 다른 actor flush 중?}
+    M -->|Yes| N[ExecuterQueue 에 넣고 반환]
+    M -->|No| O[RunFlushLoop — 내가 직접 비운다]
+```
+
+### ExecutionMode — 누가 actor 코드를 실행하는가
+
+```
+LeaderFlush (기본값)
+  idle actor 에 처음 작업을 넣은 스레드가 그 자리에서 Flush 를 돌린다.
+  → 지연이 가장 짧다. 워커 안에서 actor → actor 호출할 때 최적.
+  → 단점: 소켓 IO 스레드나 ThreadPool 스레드가 호출자면 그 스레드가 게임 로직을 돌린다.
+
+Scheduled
+  비-워커 스레드의 호출은 actor 를 JobSystem 의 ready 큐에 넣기만 하고 즉시 반환.
+  워커가 꺼내서 Flush 한다. (워커 스레드에서의 호출은 여전히 즉시 flush)
+  → 네트워크·ThreadPool 진입점에서 접근하는 actor 에는 이쪽을 권장.
+```
+
+```csharp
+// 콘솔 스레드와 IO 스레드가 직접 찌르는 월드 actor
+public GameWorld(ServerConfig cfg, JobSystem system)
+    : base(new JobOptions
+    {
+        Name = "World",
+        System = system,
+        MaxQueueSize = 10_000,
+        Mode = ExecutionMode.Scheduled,   // ← 호출자 hijack 방지
+    })
+```
+
+---
+
+## 2.4 Flush — 큐를 비우는 핵심 루프
+
+```csharp
+internal void Flush()
+{
+    var spinner = new SpinWait();
+    var iterations = 0;
+    var executed = 0;
+
+    while (true)
+    {
+        if (_queue.TryDequeue(out var job))
+        {
+            spinner = new SpinWait();
+            iterations = 0;
+
+            ExecuteJob(job);                     // 실행 + 메트릭 + 예외 처리
+
+            _system.OnJobRetired();
+            var remaining = Interlocked.Decrement(ref _remainingTaskCount);
+
+            if (remaining == 0)
+            {
+                SignalDrained();                 // DisposeAsync 대기 해제
+                return;
+            }
+
+            if (++executed >= _maxJobsPerFlush && _system.HasWorkers)
+            {
+                // 공정성: 한 actor 가 워커를 영원히 독점하지 못하게 되돌려준다
+                _system.Schedule(this);
+                return;
+            }
+        }
+        else
+        {
+            // ★ 카운터가 진실이다. 0 이면 예약을 들고 있는 producer 가 없다는 뜻이므로
+            //   기다릴 것이 없다. v2.0 루프에는 이 탈출구가 없어서 무한 스핀했다.
+            if (Volatile.Read(ref _remainingTaskCount) == 0)
+            {
+                SignalDrained();
+                return;
+            }
+
+            // 카운터는 양수인데 큐가 비었다 = producer 가 CAS 와 Enqueue 사이에 있다.
+            // 아주 짧은 순간이므로 스핀으로 기다린다.
+            if (++iterations >= MaxFlushSpinIterations)
+            {
+                Thread.Yield();
+                iterations = 0;
+                spinner = new SpinWait();
+            }
+            else
+            {
+                spinner.SpinOnce();
+            }
         }
     }
 }
 ```
 
-```
-Chat 이벤트 발생
-      │
-      ▼
-room.BroadcastChat("안녕!")      ← 큐에 넣기
-      │
-      ▼
-[Room 큐에서 실행]
-ProcessBroadcastChat("안녕!")
-  │
-  ├─► player1.ReceiveMessage("안녕!")   ← player1 큐에 넣기
-  ├─► player2.ReceiveMessage("안녕!")   ← player2 큐에 넣기
-  └─► player3.ReceiveMessage("안녕!")   ← player3 큐에 넣기
-                │
-                ▼
-         각 Player 큐에서
-         직렬 실행됨
-```
-
-Room은 _players 목록에 lock 없이 접근하고, 각 Player에게 메시지를 보낼 때도 lock 없이 안전합니다. **모든 상태 접근이 직렬화됩니다.**
-
----
-
-## 2.7 Actor 모델의 핵심 규칙
+### 두 개의 탈출구
 
 ```
-╔═══════════════════════════════════════════════════════════╗
-║  Actor 모델의 황금률                                      ║
-╠═══════════════════════════════════════════════════════════╣
-║                                                           ║
-║  ✅ Actor 내부 상태는 Actor 자신의 큐에서만 접근한다      ║
-║  ✅ 외부에서는 DoAsync로 메시지를 보내기만 한다          ║
-║  ✅ Actor 간 통신은 DoAsync를 통한 메시지 패싱으로 한다   ║
-║                                                           ║
-║  ❌ Actor 필드를 외부 스레드에서 직접 읽거나 쓰지 않는다 ║
-║  ❌ Actor 메서드 안에서 다른 Actor의 큐를 기다리지 않는다 ║
-║     (데드락 위험!)                                        ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝
+탈출구 ①  작업을 실행한 뒤 Decrement 결과가 0
+          → 큐가 완전히 비었다. 정상 종료.
+
+탈출구 ②  큐 읽기 실패 + 카운터가 0
+          → 카운터를 들고 있는 producer 가 하나도 없다.
+            (있다면 그 producer 가 Enqueue 후 leader 판정을 다시 하므로 안전)
+          → 기다릴 이유가 없다. 종료.
+
+MaxFlushSpinIterations 는 이제 "producer 가 CAS 와 Enqueue 사이에 있는
+수십 ns 를 얼마나 스핀으로 견딜지"만 조절합니다. 예전처럼 무한 스핀의
+안전장치가 아닙니다.
 ```
 
----
+### Flush의 동작 원리
 
-## 2.8 언제 lock이 아직 필요한가?
+```
+           _remainingTaskCount = 3 (큐에 작업 3개)
+                    │
+                    ▼
+          ┌─────────────────────────────────────┐
+          │           Flush 루프                │
+          │                                     │
+          │  ① TryDequeue → job1 → Execute     │
+          │    Decrement → count=2              │
+          │                                     │
+          │  ② TryDequeue → job2 → Execute     │
+          │    Decrement → count=1              │
+          │                                     │
+          │  ③ TryDequeue → job3 → Execute     │
+          │    Decrement → count=0 → return!    │
+          └─────────────────────────────────────┘
 
-Actor 모델이 완벽한 것은 아닙니다. 다음 상황에서는 여전히 주의가 필요합니다:
+만약 ③ 실행 중에 새 작업이 들어오면?
+
+  DoAsync 호출 → CAS 0→1 이 아니라 1→2 (이미 leader 있음) → 큐에만 넣기
+  Flush 는 Decrement 결과가 1 이므로 계속 돌아 그 작업까지 처리
+
+Flush 가 이미 return 한 뒤에 들어오면?
+
+  DoAsync 호출 → CAS 0→1 성공 → "내가 leader" → 새로 Flush 시작
+```
+
+### ExecuteJob — 예외는 actor 를 넘어가지 않는다
 
 ```csharp
-// 예외 상황 1: 여러 Actor가 동시에 접근하는 공유 인덱스
-// ConcurrentDictionary 같은 스레드 안전한 컬렉션을 사용합니다
-private static readonly ConcurrentDictionary<int, Entity> _index = new();
-
-// 예외 상황 2: Actor 외부에서 읽어야 하는 경우
-// 읽기도 큐를 통과시킨다 — Ask(async 호출자) / AskSync(동기 호출자)
-public Task<SomeSnapshot> GetSnapshotAsync()
-    => Ask(() => new SomeSnapshot(/* 현재 상태 복사 */));
-
-public SomeSnapshot GetSnapshot()
-    => AskSync(() => new SomeSnapshot(/* 현재 상태 복사 */), TimeSpan.FromSeconds(2));
-    // ★ AskSync 는 actor 작업 안에서 호출하면 예외를 던진다 (데드락 방지)
+try
+{
+    job.Execute();
+    _system.Metrics.OnExecuted();
+    if (_maxConsecutiveFailures > 0)
+        Volatile.Write(ref _consecutiveFailures, 0);   // 성공하면 연속 실패 카운트 리셋
+}
+catch (Exception ex)
+{
+    _system.Metrics.OnExecuted();
+    _system.Metrics.OnFailed();
+    HandleJobFailure(ex);      // OnJobError(ex) → 필요하면 faulted 전이
+}
 ```
 
-이 패턴들은 Chapter 10에서 채팅 서버 예제로 자세히 다룹니다.
+`HandleJobFailure`는 먼저 **actor 단위 훅**을 부릅니다:
+
+```csharp
+public sealed class PlayerActor : AsyncExecutable
+{
+    // 이 플레이어의 작업이 터졌다 → 프로세스가 아니라 이 세션만 끊는다
+    protected override void OnJobError(Exception exception)
+    {
+        JobLog.Error($"[{Name}] 작업 실패 — 세션 종료", exception);
+        _session.Close();
+    }
+}
+```
+
+재정의하지 않으면 기본 구현이 프로세스 전역 `AsyncExecutable.OnError`로 넘기고, 그것도 없으면
+로거에 씁니다. 그리고 `JobOptions.MaxConsecutiveFailures`를 설정해 두면 연속 N회 실패한 actor 는
+`IsFaulted == true` 가 되어 이후 작업을 `DropReason.Faulted`로 거부합니다 —
+`ClearFault()`를 부를 때까지. 폭주하는 actor 하나가 로그를 채우는 것을 막는 장치입니다.
 
 ---
 
-## 2.9 정리
+## 2.5 DoAsync\<TState\> — 클로저 없는 고성능 버전
+
+```csharp
+// 일반 DoAsync: 람다가 외부 변수를 캡처 → 힙 할당 발생
+testObject.DoAsync(() => testObject.TestFunc1(5));
+//                 ↑ testObject 와 5를 캡처하는 클로저 객체가 매번 생성됨!
+
+// DoAsync<TState>: 클로저 없음 → 할당 없음
+testObject.DoAsync(
+    static t => t.Self.TestFunc1(t.Value),   // static 람다!
+    (Self: testObject, Value: 5));           // 캡처할 값은 전부 state 로
+```
+
+왜 중요할까요?
+
+```
+초당 10만 번 DoAsync 호출이 발생하는 게임 서버라면:
+
+일반 DoAsync:
+  - 클로저 객체 10만 개 생성/소멸
+  - GC 압력 증가
+  - GC 발생 시 수십 ms 멈춤 (게임에서 심각한 문제!)
+
+DoAsync<TState>:
+  - 클로저 없음 → GC 압박 없음
+  - 부드러운 게임 플레이 유지
+```
+
+`state`가 참조형이고 값이 `null`이어도 그대로 핸들러에 전달됩니다. (v2.0 은 `null` 상태를
+`default!`로 바꿔 넘겨서 "값을 지우지 않았는데 null 이 되는" 혼란이 있었습니다 — 2.17절 참조.)
+
+---
+
+## 2.6 DoAsyncAfter / DoAsyncEvery — 지연·주기 실행
+
+```csharp
+// N ms 후 한 번 — 취소 가능한 핸들을 돌려준다
+public ITimerHandle DoAsyncAfter(TimeSpan delay, Action action);
+public ITimerHandle DoAsyncAfter<TState>(TimeSpan delay, Action<TState> action, TState state);
+
+// period 마다 반복 — 핸들을 Cancel 할 때까지
+public ITimerHandle DoAsyncEvery(TimeSpan period, Action action, TimeSpan? initialDelay = null);
+```
+
+```csharp
+public interface ITimerHandle
+{
+    bool Cancel();       // 발화 전이면 true, 이미 발화했으면 false
+    bool IsPending { get; }
+}
+```
+
+타이머는 `JobSystem`이 소유한 **전용 타이머 스레드 1개**가 관리합니다. 발화하면 그 작업은
+actor 의 큐로 들어가고, 워커가 flush 합니다 (3장에서 자세히).
+
+### 주기 작업은 DoAsyncEvery 로
+
+예전에는 "작업이 끝나면서 자기 자신을 다시 예약"하는 자기복제 패턴을 손으로 썼습니다:
+
+```csharp
+// ❌ 옛날 방식 — 한 번이라도 예외가 나면 체인이 영원히 끊긴다
+private void Heartbeat()
+{
+    Console.WriteLine("살아있습니다!");
+    DoAsyncAfter(TimeSpan.FromSeconds(5), Heartbeat);  // 이 줄에 도달하지 못하면 끝
+}
+```
+
+```csharp
+// ✅ 지금 방식 — 예외가 나도 다음 틱이 온다. 정지는 Cancel() 한 번.
+private ITimerHandle? _heartbeat;
+
+public void Start()
+    => DoAsync(() => _heartbeat = DoAsyncEvery(TimeSpan.FromSeconds(5), Heartbeat));
+
+private void Heartbeat()
+{
+    Console.WriteLine("살아있습니다!");
+}
+
+private void ProcessDespawn()
+{
+    _heartbeat?.Cancel();      // 플래그 검사 대신 실제 취소 → GC 도 바로 풀린다
+}
+```
+
+```
+DoAsyncEvery(5s, Heartbeat)
+    │
+    ├─ t=5s   타이머 스레드 → actor 큐 → Heartbeat()
+    ├─ t=10s  ...
+    ├─ t=15s  Heartbeat() 안에서 예외! → 로그만 남고 체인은 그대로 유지
+    ├─ t=20s  ...
+    │
+    └─ handle.Cancel() → 여기서 끝
+```
+
+---
+
+## 2.7 Ask / RunAsync — 결과 회수와 async 작업
+
+### Ask — 결과를 돌려받는 작업
+
+`DoAsync`는 "던지고 잊기"입니다. 결과가 필요하면 `Ask`를 씁니다.
+
+```csharp
+public sealed class DataStore : AsyncExecutable
+{
+    private readonly Dictionary<string, int> _data = [];
+
+    // Dictionary 는 actor 큐 안에서만 접근된다 — lock 없음
+    public Task<int?> GetValueAsync(string key)
+        => Ask(static t => t.Self.Read(t.Key), (Self: this, Key: key));
+
+    private int? Read(string key) => _data.TryGetValue(key, out var v) ? v : null;
+}
+
+// 사용
+var value = await store.GetValueAsync("score");
+```
+
+큐에 들어가지 못하면(만원·셧다운 등) 반환된 Task 가 `JobRejectedException`으로 실패합니다.
+조용히 영원히 기다리는 일은 없습니다.
+
+### AskSync — 논-actor 호출자용 동기 회수
+
+```csharp
+public WorldSnapshot GetSnapshot()
+{
+    try
+    {
+        // 콘솔 명령, 헬스 프로브, Main 등 "async 가 아닌" 호출자용
+        return AskSync(BuildSnapshot, TimeSpan.FromSeconds(2));
+    }
+    catch (TimeoutException)
+    {
+        JobLog.Warn("[World] snapshot timed out");
+        return WorldSnapshot.Empty;
+    }
+}
+```
+
+`AskSync`는 첫 줄에서 `JobDiagnostics.GuardBlockingWait`를 부릅니다. **actor 작업 안에서
+호출하면 예외를 던집니다.** 그 자리에서 블로킹하면 그 스레드가 바로 상대 actor 를 돌려야 할
+스레드이므로 100% 데드락이기 때문입니다. 예전 책이 "주의하세요"라고만 적던 함정을 이제
+라이브러리가 잡아 줍니다 (`JobSystemOptions.DetectBlockingWaitOnWorker`, DEBUG 기본 on).
+
+### RunAsync / AskAsync — await 하는 작업
+
+DB·Redis·HTTP 호출이 있는 작업은 `await` 이 필요합니다.
+
+```csharp
+public Task SaveAsync()
+    => RunAsync(async () =>
+    {
+        var snapshot = BuildSnapshot();     // ① actor 큐 안 (안전)
+        await _db.WriteAsync(snapshot);     // ② await
+        _lastSavedAt = DateTime.UtcNow;     // ③ 다시 actor 큐 안 (안전)
+    });
+
+public Task<int> LoadScoreAsync()
+    => AskAsync(async () => await _db.ReadScoreAsync(_id));
+```
+
+`await` 이후 continuation 이 어디로 돌아오는지는 `JobOptions.AsyncReentrancy`가 정합니다:
+
+```
+Interleaved (기본값)
+  continuation 이 이 actor 의 큐로 되돌아온다. await 중에는 다른 작업이 실행된다.
+  → 처리량이 높다. 단, ② 앞뒤로 다른 작업이 상태를 바꿨을 수 있다는 것을 감안해야 한다.
+  → ConfigureAwait(false) 를 쓰면 이 보장이 깨진다 (ThreadPool 로 돌아감). 쓰지 말 것.
+
+Exclusive
+  async 작업이 끝날 때까지 actor 가 다른 작업을 전혀 실행하지 않는다.
+  → 추론이 가장 쉽다. 단, 느린 await 하나가 actor 전체를 멈춘다.
+```
+
+---
+
+## 2.8 셧다운 — AcceptingWork 와 StopAsync
+
+```csharp
+// ✅ 지금 방식 — 한 줄
+var drained = await system.StopAsync(TimeSpan.FromSeconds(10));
+if (!drained)
+    JobLog.Warn("일부 작업이 남은 채로 종료되었습니다");
+```
+
+`StopAsync`가 하는 일:
+
+```
+1. (옵션 refuseNewWork: true 면) 먼저 AcceptingWork = false
+2. in-flight 작업 + ready 큐 + 대기 타이머가 모두 0 이 될 때까지 대기 (drainTimeout 까지)
+3. AcceptingWork = false
+4. 타이머 스레드 정지
+5. 이 system 에 붙은 dispatcher 들 Dispose (워커 Join)
+```
+
+기본값이 "드레인하면서도 새 작업을 받는" 이유는, 종료 처리 자체가 작업을 만들기 때문입니다
+(예: actor 가 despawn 하면서 이웃에게 알림). 외부 입력을 먼저 차단하고 싶으면
+`StopAsync(timeout, refuseNewWork: true)` 를 쓰거나, 네트워크를 먼저 멈추면 됩니다.
+
+```csharp
+// 게이트만 직접 만지고 싶다면 (system 단위!)
+system.AcceptingWork = false;   // 이후 이 system 의 모든 DoAsync 가 false 반환
+```
+
+> **v2.0 에서 바뀐 점**
+> `AsyncExecutable.AcceptingWork` (프로세스 전역 static)는 `[Obsolete]`입니다. `JobSystem.Default`
+> 로 위임될 뿐이라, 한 프로세스에 job system 이 둘이면 서로의 셧다운 게이트를 건드립니다.
+> 그리고 예전의 4단계 수동 종료 —
+> `AcceptingWork=false` → 각 actor `DisposeAsync` → `dispatcher.Dispose()` →
+> `TimerRegistry.DisposeAll()` — 는 `StopAsync` 한 줄로 대체되었습니다.
+> (`TimerRegistry` 자체가 이제 no-op 입니다. 3장 참조.)
+
+---
+
+## 2.9 DisposeAsync — 개별 actor 의 우아한 종료
+
+```csharp
+public virtual async ValueTask DisposeAsync()
+{
+    // 아직 처리 중인 작업이 있으면
+    if (Volatile.Read(ref _remainingTaskCount) > 0)
+    {
+        var tcs = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        _drainTcs = tcs;
+
+        // 한 번 더 체크 (TOCTOU 방지)
+        if (Volatile.Read(ref _remainingTaskCount) > 0)
+            await tcs.Task.ConfigureAwait(false);   // 큐가 빌 때까지 신호 대기
+    }
+
+    Volatile.Write(ref _completed, 1);   // 이후 DoAsync 는 DropReason.Disposed 로 거부
+    GC.SuppressFinalize(this);
+}
+```
+
+```
+DisposeAsync() 호출
+      │
+      ├─ 큐가 비어있음? → 즉시 완료 표시
+      │
+      └─ 큐에 작업 있음?
+            │
+            ▼
+         _drainTcs 설정 (신호 대기 — 폴링 없음)
+            │
+            │  (Flush 가 마지막 작업을 처리하고 카운터가 0 이 되면)
+            ▼
+         SignalDrained() → _drainTcs.TrySetResult()
+            │
+            ▼
+         _completed = 1 → DisposeAsync 완료
+```
+
+**주의:** 드레인을 해 줄 주체가 있어야 합니다. 워커를 먼저 `Dispose` 한 뒤 actor 를
+`DisposeAsync` 하면 큐를 비울 사람이 없어 영원히 기다립니다. 그래서 요즘 권장 순서는
+"actor 를 하나씩 정리"가 아니라 **`system.StopAsync()` 한 번**입니다. 개별 `DisposeAsync`는
+"이 actor 만 먼저 접겠다"는 국소적인 경우에 쓰세요.
+
+---
+
+## 2.10 RemainingTaskCount / IsFaulted — 큐 모니터링
+
+```csharp
+// 큐 깊이 확인 (모니터링/디버깅용)
+var player = new PlayerActor(p, world);
+Console.WriteLine($"대기 작업: {player.RemainingTaskCount}");
+Console.WriteLine($"관측 최대 깊이: {player.MaxObservedQueueDepth}");
+Console.WriteLine(player);        // "Player#7(queue=3)"
+
+// 실무에서는 이렇게 활용:
+if (player.RemainingTaskCount > 1000)
+    JobLog.Warn($"[{player.Name}] 큐 과부하! ({player.RemainingTaskCount})");
+
+// 연속 실패로 격리된 actor 를 복구
+if (player.IsFaulted)
+{
+    JobLog.Warn($"[{player.Name}] faulted — 원인 확인 후 복구");
+    player.ClearFault();
+}
+```
+
+---
+
+## 2.11 전체 흐름 정리
+
+실제 코드 실행 순서를 처음부터 끝까지 추적해봅시다:
+
+```
+외부 호출: player.TakeDamage(30)
+    │
+    ▼
+TakeDamage(30) {
+    DoAsync(static t => t.Self.ProcessTakeDamage(t.Dmg), (Self: this, Dmg: 30))
+}
+    │
+    ▼
+DoAsync(action, state) {
+    TryReserve()             ← 셧다운/Dispose/faulted 아님 확인
+    job = Job<T>.Rent(...)   ← 풀에서 Job 객체 가져오기
+    Admit(job, fromTimer: false)
+}
+    │
+    ▼
+Admit(job) {
+    CAS 0 → 1                ← 입장 확정 (count 는 이제 진실)
+    queue.Enqueue(job)       ← unbounded, 실패하지 않음
+    current == 0             ← 내가 leader
+    Mode == LeaderFlush,
+    CurrentExecuter == null  ← 이 스레드는 놀고 있음
+    RunFlushLoop()
+}
+    │
+    ▼
+Flush() {
+    job = queue.TryDequeue() ← 방금 넣은 job 꺼내기
+    ExecuteJob(job)          ← ProcessTakeDamage(30) 실행!
+    Decrement()              ← count = 0
+    SignalDrained(); return  ← 큐 비었으므로 종료
+}
+    │
+    ▼
+ProcessTakeDamage(30) {
+    _hp -= 30               ← 안전하게 상태 변경!
+}
+```
+
+---
+
+## 2.12 AsyncExecutable 정리
 
 ```
 이번 장에서 배운 것
 ──────────────────────────────────────────────
-✓ 직렬 실행 = 한 번에 하나씩 순서대로 처리
-✓ actor 마다의 큐 + 입장 CAS 가 직렬 실행을 보장
-✓ Actor = AsyncExecutable을 상속한 클래스
-✓ Handle*(외부 진입) / Process*(실제 처리) 패턴
-✓ Actor 간 통신 = DoAsync를 통한 메시지 패싱
-✓ lock 없이도 데이터 일관성 보장됨
+✓ DoAsync — 람다를 큐에 등록, 반환 bool 을 반드시 확인
+✓ DoAsync<TState> — 클로저 없는 고성능 버전
+✓ Admit — 카운터 CAS 로 입장 판정 (카운터가 곧 진실)
+✓ Flush — 카운터가 0 이면 무조건 탈출, MaxJobsPerFlush 로 공정성
+✓ ExecutionMode — LeaderFlush(기본) vs Scheduled(비-워커 진입점)
+✓ DoAsyncAfter/DoAsyncEvery — ITimerHandle 로 취소 가능, 주기 실행
+✓ Ask/AskSync/RunAsync/AskAsync — 결과 회수와 async 작업
+✓ OnJobError + MaxConsecutiveFailures — actor 단위 오류 격리
+✓ system.StopAsync — 4단계 수동 셧다운을 대체하는 한 줄
+✓ DisposeAsync — 개별 actor 의 신호 기반 드레인
 ```
 
 ---
 
-*[← Chapter 01](./chapter01.md) | [→ Chapter 03: AsyncExecutable — 모든 것의 기반](./chapter03.md)*
+AsyncExecutable의 실행 흐름을 확인했다. 이제 그 큐에 담기는 작업 항목의 구조와 오브젝트 풀링을 살펴본다.
+
+## 2.13 왜 풀링(Pooling)이 필요한가?
+
+게임 서버에서는 매 초 수십만 번의 작업이 발생합니다. 매번 새 객체를 만들면:
+
+```
+초당 100,000번 DoAsync 호출
+        │
+        ▼
+  새 Job 객체 100,000개 생성
+        │
+        ▼
+  GC(가비지 컬렉터)가 100,000개를 수거해야 함
+        │
+        ▼
+  GC 실행 시 게임 서버 수십 ms 멈춤! (STW: Stop-The-World)
+        │
+        ▼
+  플레이어: "렉이다!!!"
+```
+
+풀링(Pooling)이란 객체를 재사용하는 기법입니다. 사용 후 버리지 않고 풀에 돌려놓고, 다음 번에 새로 만들지 않고 풀에서 꺼내 씁니다.
+
+---
+
+## 2.14 JobEntry 클래스 계층 구조
+
+```
+JobEntry (abstract)         ← 모든 작업의 기반
+    │
+    ├── Job                 ← 람다(Action) 기반 작업
+    │                          풀링 지원
+    │
+    └── Job<TState>         ← 제네릭 state 기반 작업
+                               클로저 없이 state 전달
+                               풀링 지원
+```
+
+---
+
+## 2.15 JobEntry 기반 클래스
+
+```csharp
+public abstract class JobEntry
+{
+    /// <summary>작업을 실행한다. 구현체는 실행 후 스스로 풀에 반납한다.</summary>
+    public abstract void Execute();
+
+    /// <summary>실행하지 않고 반납한다 — 거부된 작업, 취소된 타이머용.</summary>
+    internal abstract void Discard();
+}
+```
+
+메서드는 둘뿐입니다. "실행해라"와 "실행하지 말고 반납해라"입니다. 단순함이 핵심입니다.
+
+`Discard()`는 2.21에서 다시 보겠습니다. 큐가 만원이라 거부된 작업이나, 발화 전에 취소된 타이머의
+작업이 **GC로 가지 않고 풀로 되돌아오게** 하는 통로입니다.
+
+---
+
+## 2.16 Job 클래스 — 람다 기반 풀링 작업
+
+```csharp
+public sealed class Job : JobEntry
+{
+    // ───────────────────────────────────────────────
+    // 풀 (ConcurrentBag = 스레드 안전한 가방)
+    // ───────────────────────────────────────────────
+    private static readonly ConcurrentBag<Job> Pool = new();
+    private static long _poolSize;
+
+    /// <summary>
+    /// 풀 최대 크기. 기본 16,384개.
+    /// 초과분은 GC에 맡깁니다 (메모리 무한 증가 방지).
+    /// </summary>
+    public static int MaxPoolSize { get; set; } = 16 * 1024;
+
+    // 인스턴스 필드
+    private Action? _action;
+
+    private Job() { }  // ← 외부에서 new Job() 불가! Rent를 써야 함
+
+    // ───────────────────────────────────────────────
+    // Rent — 풀에서 가져오기 (없으면 새로 만들기)
+    // ───────────────────────────────────────────────
+    public static Job Rent(Action action)
+    {
+        if (Pool.TryTake(out var job))      // 풀에 있으면 꺼내기
+            Interlocked.Decrement(ref _poolSize);
+        else
+            job = new Job();               // 없으면 새로 생성
+
+        job._action = action;
+        return job;
+    }
+
+    // ───────────────────────────────────────────────
+    // Execute — 실행 후 풀에 반납
+    // ───────────────────────────────────────────────
+    public override void Execute()
+    {
+        var action = _action;
+        try
+        {
+            action?.Invoke();
+        }
+        finally
+        {
+            Recycle();
+        }
+    }
+
+    // 실행하지 않고 반납 (거부된 작업 / 취소된 타이머)
+    internal override void Discard() => Recycle();
+
+    private void Recycle()
+    {
+        _action = null;  // 람다 참조 해제 (메모리 누수 방지)
+
+        // 풀 크기가 한도 미만이면 반납, 초과면 GC에 맡김
+        if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
+        {
+            Interlocked.Increment(ref _poolSize);
+            Pool.Add(this);  // 풀에 반납!
+        }
+    }
+}
+```
+
+풀의 동작을 그림으로:
+
+```
+처음 시작: Pool = []
+
+첫 번째 DoAsync:
+  Rent() → Pool이 비어있음 → new Job() 생성
+  Execute() → 실행 후 Pool.Add(job) → Pool = [job1]
+
+두 번째 DoAsync:
+  Rent() → Pool.TryTake() → job1 재사용!
+  Execute() → 실행 후 Pool.Add(job1) → Pool = [job1]
+
+세 번째 DoAsync:
+  같은 job1 재사용...
+  (GC에게 할당 없음!)
+```
+
+---
+
+## 2.17 Job\<TState\> — 클로저 없는 풀링 작업
+
+```csharp
+public sealed class Job<TState> : JobEntry
+{
+    private static readonly ConcurrentBag<Job<TState>> Pool = new();
+    private static long _poolSize;
+
+    public static int MaxPoolSize { get; set; } = 16 * 1024;
+
+    private Action<TState>? _action;
+    private TState? _state;
+
+    private Job() { }
+
+    public static Job<TState> Rent(Action<TState> action, TState state)
+    {
+        if (Pool.TryTake(out var job))
+            Interlocked.Decrement(ref _poolSize);
+        else
+            job = new Job<TState>();
+
+        job._action = action;
+        job._state = state;
+        return job;
+    }
+
+    public override void Execute()
+    {
+        var action = _action;
+        var state = _state;
+        try
+        {
+            // state 가 참조형이고 null 이어도 그대로 넘긴다.
+            action?.Invoke(state!);
+        }
+        finally
+        {
+            Recycle();
+        }
+    }
+
+    internal override void Discard() => Recycle();
+
+    private void Recycle()
+    {
+        _action = null;
+        _state = default;  // state 참조도 해제!
+        if (Interlocked.Read(ref _poolSize) < MaxPoolSize)
+        {
+            Interlocked.Increment(ref _poolSize);
+            Pool.Add(this);
+        }
+    }
+}
+```
+
+### null state 에 대한 주의 (v2.0 에서 고친 것)
+
+예전 구현은 `_state is { } s` 로 검사해서, **state 가 null 이면 `default!` 를 넘겼습니다.**
+값 형식에는 차이가 없지만 참조형에서는 의미가 꼬입니다 — "null 을 의도적으로 넘긴 경우"와
+"넘길 게 없는 경우"를 구분할 수 없었습니다.
+
+```csharp
+// TState 자체가 참조형이고 값이 null 인 경우 — 이제 핸들러가 그 null 을 그대로 받는다
+string? nothing = null;
+actor.DoAsync<string?>(static s => Handle(s), nothing);   // Handle(null) 이 호출된다
+```
+
+---
+
+## 2.18 Job vs Job\<TState\> 비교
+
+```
+방법 1: 일반 DoAsync (람다)
+─────────────────────────────────────────────────
+
+player.DoAsync(() => player.Move(newX, newY));
+
+내부 처리:
+  1. () => player.Move(newX, newY)
+     ↑ 이 람다가 newX, newY를 "캡처"합니다
+     → 클로저(Closure) 객체 생성 (힙 할당!)
+  2. Job.Rent(closure) → Job 객체 대여
+  3. Job 안에 클로저 저장
+
+할당 발생: 클로저 1개 + (풀에 Job 없을 경우) Job 1개
+
+
+방법 2: DoAsync<TState> (state 전달)
+─────────────────────────────────────────────────
+
+player.DoAsync<(float X, float Y)>(
+    static (state) => player.Move(state.X, state.Y),
+    (newX, newY));   // state를 명시적으로 전달
+
+내부 처리:
+  1. static 람다 → 클로저 없음! (힙 할당 없음)
+  2. (newX, newY)는 ValueTuple → 스택 할당
+  3. Job<(float, float)>.Rent(staticLambda, (newX,newY))
+     → Job<T> 객체 대여 (풀에서)
+
+할당 발생: 0개! (모두 풀에서 재사용)
+```
+
+---
+
+## 2.19 ConcurrentBag의 특성
+
+풀로 `ConcurrentBag<T>`를 쓴 이유는 무엇일까요?
+
+```
+ConcurrentBag의 특징:
+──────────────────────────────────────────────
+✓ 스레드 안전 (여러 스레드에서 동시 Add/TryTake 가능)
+✓ LIFO에 가까운 동작 (최근에 반납된 것이 먼저 나옴)
+  → CPU 캐시 친화적 (최근 객체가 캐시에 남아있을 가능성)
+✓ lock보다 가벼운 인터로크 방식 내부 구현
+──────────────────────────────────────────────
+주의:
+△ 순서 보장 없음 (풀이니 순서는 상관없음)
+△ 크기 조회가 상대적으로 비쌈 (→ 별도 _poolSize 카운터 사용)
+```
+
+---
+
+## 2.20 풀 크기 튜닝
+
+```csharp
+// 기본값: 16,384개
+// 게임 서버 환경에 맞게 조정 가능
+
+// 예: 동시 in-flight 작업이 최대 50,000개라면
+Job.MaxPoolSize = 50_000;
+
+// 메트릭으로 현재 풀 상태 확인
+Console.WriteLine($"Job 풀 현재 크기: {Job.PoolSize}");
+```
+
+```
+풀 크기 설정 가이드:
+──────────────────────────────────────────────────────────
+너무 작으면:   풀이 자주 비어서 new Job() 생성 → GC 압박
+너무 크으면:   사용 안 하는 Job 객체가 메모리 차지
+
+권장: 동시 처리 작업 수의 1.5~2배
+      (예: 초당 최대 동시 작업 10,000개 → MaxPoolSize = 20,000)
+──────────────────────────────────────────────────────────
+```
+
+---
+
+## 2.21 Discard — 거부된 작업도 풀로 돌아온다
+
+작업이 항상 실행되는 것은 아닙니다. 큐가 만원이면 거부되고, 예약된 타이머는 발화 전에
+취소될 수 있습니다. 이때 `Execute()`는 호출되지 않으므로, 그냥 두면 그 `Job` 인스턴스는
+풀로 돌아오지 못하고 GC 대상이 됩니다.
+
+```csharp
+// AsyncExecutable.Admit — 큐 한도 초과 판정
+if (_maxQueueSize != 0 && current >= _maxQueueSize)
+{
+    task.Discard();                       // ← 실행하지 않고 풀에 반납
+    return Refuse(DropReason.QueueFull);
+}
+```
+
+```csharp
+// TimerService.TimerEntry — 취소되었을 때
+public void DiscardJob() => Interlocked.Exchange(ref _job, null)?.Discard();
+```
+
+```
+거부가 초당 수천 건 발생하는 상황 (악성 클라이언트, 패킷 폭주):
+
+Discard 가 없다면:   거부된 Job 수천 개/초가 그대로 GC 대상 → 풀링의 의미 상실
+Discard 가 있으면:   거부돼도 풀 크기가 유지됨 → 정상 경로의 할당도 계속 0
+```
+
+> **v2.0 에서 바뀐 점**
+> 예전에는 `OnDropped` 콜백이 거부된 `JobEntry`를 사용자에게 그대로 넘겼습니다. 사용자가 그
+> 참조를 붙들고 있으면 라이브러리가 이미 재사용 중인 인스턴스를 건드리게 됩니다. 지금은
+> 콜백 시그니처가 `Action<AsyncExecutable, DropReason>`으로 바뀌어 **작업 자체는 밖으로
+> 나가지 않고**, 라이브러리가 `Discard()`로 회수합니다.
+
+---
+
+## 2.22 실전 예시 — AdvancedMmorpgServer의 활용
+
+`AdvancedMmorpgServer`의 `NpcActor`에서 실제 사용 예를 봅시다:
+
+```csharp
+public sealed class NpcActor : AsyncExecutable
+{
+    // hot path — 많은 플레이어가 동시에 이 NPC를 공격할 수 있음!
+    public void ReceiveDamage(AttackerSnapshot atk, float meleeRange)
+        => DoAsync<(NpcActor A, AttackerSnapshot Atk, float R)>(
+            // ① static 람다 → 클로저 없음
+            static t => t.A.ProcessReceiveDamage(t.Atk, t.R),
+            // ② ValueTuple로 state 전달 → 힙 할당 없음
+            (this, atk, meleeRange));
+```
+
+이렇게 하면:
+- 100마리 플레이어가 동시에 같은 NPC를 공격해도
+- 클로저 할당이 0개
+- 풀에서 `Job<(NpcActor, AttackerSnapshot, float)>` 재사용
+
+---
+
+## 2.23 작업 항목과 풀링 정리
+
+```
+이번 장에서 배운 것
+──────────────────────────────────────────────
+✓ JobEntry = 작업 항목의 추상 기반 클래스 (Execute / Discard)
+✓ Job = 람다 기반, ConcurrentBag 풀링
+✓ Job<TState> = state 전달, 클로저 없음 (null state 도 그대로 전달)
+✓ Rent() → 풀에서 대여 / Execute() → 실행 후 반납
+✓ Discard() → 실행하지 않고 반납 (거부·취소 경로에서도 풀 유지)
+✓ 풀 크기 한도로 메모리 무한 증가 방지
+✓ hot path는 DoAsync<TState>로 GC 압박 최소화
+```
+
+---
+
+*[← 제1장: JobDispatcherNET 입문과 Actor 모델](./chapter01.md) | [↑ 목차](./README.md) | [→ 제3장: 타이머와 워커 스레드의 실행 구조](./chapter03.md)*

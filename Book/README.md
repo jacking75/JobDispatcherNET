@@ -19,34 +19,17 @@
 
 ## 목차
 
-### 1부: 개념 이해
-| 챕터 | 제목 | 핵심 내용 |
-|------|------|-----------|
-| [Chapter 01](./chapter01.md) | 들어가며 — 왜 JobDispatcherNET인가? | 멀티스레딩 문제, Actor 모델 소개 |
-| [Chapter 02](./chapter02.md) | Actor 모델과 직렬 실행의 마법 | 핵심 원리, 큐 기반 직렬화 |
-| [Chapter 03](./chapter03.md) | AsyncExecutable — 모든 것의 기반 | DoAsync, 입장 CAS, Flush, Ask/RunAsync |
+이 책은 개념 이해부터 라이브러리 내부 구조, 서버 예제와 실전 적용까지 총 7개 장으로 구성한다.
 
-### 2부: 라이브러리 내부 구조
 | 챕터 | 제목 | 핵심 내용 |
 |------|------|-----------|
-| [Chapter 04](./chapter04.md) | JobEntry와 오브젝트 풀링 | Job, Job\<T\>, ConcurrentBag 풀, Discard |
-| [Chapter 05](./chapter05.md) | 타이머 서비스와 ThreadContext | 시스템당 타이머 스레드, 취소·주기 타이머 |
-| [Chapter 06](./chapter06.md) | JobDispatcher와 IRunnable | 전용 OS 스레드, 시그널 대기, 수퍼바이저 |
-| [Chapter 07](./chapter07.md) | Sequencer — 패킷 순서 보장 | IO 스레드 분리, CAS 드레인, Stop/Abort |
-| [Chapter 08](./chapter08.md) | 설정·모니터링·로깅 | JobOptions, JobSystemOptions, JobMetrics |
-
-### 3부: 예제 프로젝트 실전 분석
-| 챕터 | 제목 | 핵심 내용 |
-|------|------|-----------|
-| [Chapter 09](./chapter09.md) | ExampleConsoleApp — 기본기 익히기 | DoAsync, DoAsyncAfter, 워커 패턴 |
-| [Chapter 10](./chapter10.md) | ExampleChatServer — Actor 기반 채팅 서버 | ChatServer/Room/User Actor 협업 |
-| [Chapter 11](./chapter11.md) | ExampleMmorpgServer — MMORPG 게임 서버 | GameZone, PlayerActor, 공간 인덱스 |
-| [Chapter 12](./chapter12.md) | AdvancedMmorpgServer — 고급 패턴 | JobSystem, NPC AI, Sequencer, StopAsync |
-
-### 4부: 종합
-| 챕터 | 제목 | 핵심 내용 |
-|------|------|-----------|
-| [Chapter 13](./chapter13.md) | 실전 패턴과 모범 사례 | 설계 원칙, 함정 피하기, 체크리스트 |
+| [제1장](./chapter01.md) | JobDispatcherNET 입문과 Actor 모델 | 멀티스레딩 문제, Actor 모델, 직렬 실행, 기본 사용법과 메시지 패싱 |
+| [제2장](./chapter02.md) | AsyncExecutable 실행 코어와 작업 풀링 | DoAsync, 입장 CAS, Flush, Ask/RunAsync, JobEntry와 오브젝트 풀링 |
+| [제3장](./chapter03.md) | 타이머와 워커 스레드의 실행 구조 | TimerService, 지연·주기 실행, ThreadContext, JobDispatcher와 IRunnable |
+| [제4장](./chapter04.md) | Sequencer와 설정·모니터링·로깅 | 패킷 순서 보장, IO 스레드 분리, 큐 제한, 오류 격리, 설정과 운영 관찰 |
+| [제5장](./chapter05.md) | 콘솔과 채팅 서버 예제 분석 | ExampleConsoleApp의 기본 API부터 ChatServer·Room·User Actor 협업까지 |
+| [제6장](./chapter06.md) | MMORPG 서버의 기본 구조와 고급 패턴 | ExampleMmorpgServer와 AdvancedMmorpgServer, 전투·공간 인덱스·NPC AI·세션 처리 |
+| [제7장](./chapter07.md) | 실전 패턴과 모범 사례 | 설계 원칙, 안전한 상태 읽기, 비동기 작업, 흔한 함정과 운영 체크리스트 |
 
 ---
 

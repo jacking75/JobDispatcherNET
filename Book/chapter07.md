@@ -1,410 +1,603 @@
-# Chapter 07: Sequencer — 패킷 순서 보장
+# 제7장: 실전 패턴과 모범 사례
 
-## 7.1 문제: 왜 순서가 깨질 수 있나?
+앞선 장에서 익힌 실행 원리와 서버 예제를 실전 설계 원칙으로 정리한다. 안전한 상태 읽기와 비동기 작업, 흔한 함정, 성능 점검과 운영 모니터링 기준을 함께 살펴본다.
 
-여러 스레드가 같은 Actor에 작업을 보낼 때, 순서가 뒤집힐 수 있습니다.
+## 7.1 핵심 설계 원칙
 
 ```
-실제 발생 가능한 문제:
-────────────────────────────────────────────────────────
-
-[IO 스레드 1]         [IO 스레드 2]
-      │                     │
-      ▼                     ▼
-  패킷: EnterZone      패킷: Move
-      │                     │
-      ▼                     ▼
-  zone.DoAsync(EnterZone)   zone.DoAsync(Move)
-
-이 두 DoAsync가 거의 동시에 실행된다면?
-
-DoAsync 내부 (입장 CAS → 큐 쓰기 순):
-  Thread-1: CAS 성공(count=1) ──────────────────── Enqueue(EnterZone)
-  Thread-2:   CAS 성공(count=2) ── Enqueue(Move)
-
-actor 큐에 들어간 순서: [Move, EnterZone]  ← 뒤집힘!
-
-※ actor 는 "한 번에 하나씩"은 보장하지만 "두 producer 중 누가 먼저 넣는지"는
-   보장하지 않습니다. 이건 어떤 큐 구현을 쓰든 마찬가지입니다.
-
-결과:
-  Zone이 Move를 먼저 처리 → EnterZone을 나중에 처리
-  → 아직 입장하지 않은 플레이어가 이동? 버그!
+╔══════════════════════════════════════════════════════════════╗
+║     JobDispatcherNET 설계의 황금 원칙                        ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  1. Actor 내부 상태는 자기 큐에서만 읽고 쓴다                ║
+║  2. 외부에서는 DoAsync로 메시지만 보낸다                     ║
+║  3. 읽기도 큐를 통과시킨다 (Ask / AskSync)                   ║
+║  4. 스레드 간 전달 데이터는 불변(readonly)으로 만든다        ║
+║  5. hot path는 DoAsync<TState>로 클로저를 없앤다             ║
+║  6. 큐 크기는 항상 제한하고, 반환값 false 를 처리한다        ║
+║  7. 주기 작업은 DoAsyncEvery 로 만들고 핸들을 보관한다       ║
+║  8. 셧다운은 system.StopAsync 한 번으로 한다                 ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## 7.2 Sequencer의 설계 아이디어
+## 7.2 패턴 1: Handle/Process 분리
 
-`Sequencer<T>`는 이 문제를 해결합니다:
+```csharp
+// ✅ 권장
+public class Player : AsyncExecutable
+{
+    // 외부 진입점 — 큐에 넣기만
+    public bool TakeDamage(int damage)
+        => DoAsync(static t => t.Self.ProcessTakeDamage(t.Damage), (Self: this, Damage: damage));
+
+    // 실제 처리 — 직렬 실행 보장
+    private void ProcessTakeDamage(int damage)
+    {
+        _hp -= damage;
+        if (_hp <= 0) ProcessDie();
+    }
+}
+
+// ❌ 피해야 할 패턴
+public class Player : AsyncExecutable
+{
+    // 외부 진입점과 실제 처리가 섞임
+    public void TakeDamage(int damage)
+    {
+        DoAsync(() => {
+            _hp -= damage;
+            // ... 긴 처리 로직이 람다 안에 모두 들어감
+        });
+    }
+}
+```
+
+분리의 이점:
 
 ```
-Sequencer의 역할:
+grep ProcessTakeDamage → 실제 처리 로직 즉시 찾기
+디버거 스택: TakeDamage → ProcessTakeDamage (명확!)
+단위 테스트: ProcessTakeDamage()를 직접 테스트 가능
+static 람다로 바꾸기 쉬움 → 클로저 할당 제거
+```
+
+---
+
+## 7.3 패턴 2: Ask / AskSync — 안전한 외부 읽기
+
+```csharp
+public class Zone : AsyncExecutable
+{
+    private readonly List<Player> _players = new();
+
+    // ✅ async 호출자 — Task 로 받는다
+    public Task<ZoneSnapshot> GetSnapshotAsync()
+        => Ask(() => new ZoneSnapshot(_players.Select(p => p.ToSnapshot()).ToList()));
+
+    // ✅ 동기 호출자(콘솔 명령, 헬스 프로브, Main) — 타임아웃 필수
+    public ZoneSnapshot GetSnapshot()
+        => AskSync(() => new ZoneSnapshot(_players.Select(p => p.ToSnapshot()).ToList()),
+                   TimeSpan.FromSeconds(2));
+
+    // ❌ 위험한 읽기 — 외부 스레드와 Race Condition!
+    public int PlayerCount => _players.Count;
+}
+```
+
+```
+Ask 가 손수 만든 TaskCompletionSource 보다 나은 점
 ──────────────────────────────────────────────────────────
+· 핸들러가 예외를 던지면 Task 가 그 예외로 실패한다
+· 큐에 못 들어가면 JobRejectedException 으로 실패한다
+  (직접 만든 TCS 는 이 경우 영원히 완료되지 않는다)
+· AskSync 는 타임아웃이 필수이고, actor 안에서 호출하면 예외를 던진다
+```
 
-1. 여러 IO 스레드가 Enqueue() → 내부 ConcurrentQueue에 순서대로 보관
-2. CAS(Compare-And-Swap)로 단 하나의 스레드만 "드레인 권한"을 획득
-3. 권한 획득자가 scheduleDrain 콜백 → 워커에게 drain 작업을 넘김
-4. 워커가 Drain() 실행 → handler를 순서대로 호출
-5. Drain 종료 후 남은 항목 있으면 다시 scheduleDrain
+주의사항:
 
-──────────────────────────────────────────────────────────
-보장 ①: 같은 Sequencer의 항목은 Enqueue 순서대로 처리된다
-보장 ②: 어느 순간에도 handler 를 실행 중인 스레드는 최대 1개다
-보장 ③: Enqueue 가 true 를 반환했다면 그 항목은 반드시 처리된다
-        (Stop() 이 곧바로 뒤따라도 — 이것이 v2.1 에서 고쳐진 P0-4)
+```
+AskSync 는 반드시 Actor 큐 밖에서 호출!
+
+✅ 메인 스레드 / 콘솔 명령 스레드에서 호출
+✅ 별도 통계 수집 스레드에서 호출
+❌ 다른 Actor의 큐 안에서 호출 → InvalidOperationException
+   (JobSystemOptions.DetectBlockingWaitOnWorker 가 잡아 준다)
 ```
 
 ---
 
-## 7.3 Sequencer 코드 분석
+## 7.4 패턴 3: Actor→Actor 메시지 패싱
 
 ```csharp
-public sealed class Sequencer<T>
+// ✅ 올바른 패턴
+public class Server : AsyncExecutable
 {
-    private readonly ConcurrentQueue<T> _queue = new();   // ← 스레드 안전 큐
-    private readonly Action<T> _handler;                   // ← 항목 처리자
-    private readonly Action<Action> _scheduleDrain;        // ← drain을 워커에 예약
-    private readonly Action<Exception>? _onError;
-    private int _drainScheduled;   // 0: 드레인 없음, 1: 드레인 예약됨
-    private int _stopped;          // 0: 실행 중, 1: 새 항목 거부
-    private int _aborted;          // 1: 남은 항목까지 폐기
-
-    /// <param name="handler">항목 하나를 처리. 직렬로, drain 을 실행하는 스레드에서 호출된다.</param>
-    /// <param name="scheduleDrain">drain 작업을 워커 스레드에 넘기는 함수.</param>
-    /// <param name="onError">handler 가 예외를 던졌을 때. 기본은 로깅.</param>
-    public Sequencer(
-        Action<T> handler,
-        Action<Action> scheduleDrain,
-        Action<Exception>? onError = null)
+    private void ProcessUserChat(string userId, string content)
     {
-        ArgumentNullException.ThrowIfNull(handler);
-        ArgumentNullException.ThrowIfNull(scheduleDrain);
-        _handler = handler;
-        _scheduleDrain = scheduleDrain;
-        _onError = onError;
-    }
-
-    /// <summary>
-    /// ★ 편의 생성자 — drain 을 JobSystem 의 워커 풀에 직접 예약한다.
-    /// 사용자가 중계용 InboundCommands 큐를 손으로 만들 필요가 없어졌다.
-    /// </summary>
-    public Sequencer(JobSystem system, Action<T> handler, Action<Exception>? onError = null)
-        : this(handler, system.Post, onError) { }
-
-    /// <summary>처리 대기 중인 항목 수.</summary>
-    public int PendingCount => _queue.Count;
-
-    /// <summary>Stop() 또는 Abort() 가 호출되었는가.</summary>
-    public bool IsStopped => Volatile.Read(ref _stopped) != 0;
-}
-```
-
-두 번째 생성자가 v2.1 의 실질적인 변화입니다. `scheduleDrain` 을 `system.Post` 로 연결해 주므로,
-세션 클래스가 자기만의 워커 중계 큐를 들고 있을 이유가 사라집니다.
-
----
-
-## 7.4 Enqueue — 항목 추가
-
-```csharp
-/// <returns>큐에 들어갔으면 true, 이미 중단된 sequencer 라 버려졌으면 false.</returns>
-public bool Enqueue(T item)
-{
-    if (Volatile.Read(ref _stopped) != 0)
-        return false;        // ★ 중단 상태 — 호출자가 "버려졌다"는 것을 알 수 있다
-
-    _queue.Enqueue(item);    // ① ConcurrentQueue에 추가 (스레드 안전)
-    TryScheduleDrain();      // ② 드레인 예약 시도
-    return true;
-}
-
-private void TryScheduleDrain()
-{
-    // ③ CAS: _drainScheduled가 0이면 1로 바꾸기 (단 하나만 성공!)
-    if (Interlocked.CompareExchange(ref _drainScheduled, 1, 0) != 0)
-        return;  // 이미 누군가 예약함 → 내 일 없음
-
-    try
-    {
-        // ④ 워커 큐에 Drain 작업 추가
-        _scheduleDrain(Drain);
-    }
-    catch
-    {
-        // 예약 실패 시 CAS를 되돌려서 다음 Enqueue에서 재시도 가능하게
-        Volatile.Write(ref _drainScheduled, 0);
-        throw;
-    }
-}
-```
-
-CAS 동작 원리:
-
-```
-Thread-A와 Thread-B가 동시에 TryScheduleDrain 호출:
-
-_drainScheduled = 0 (초기값)
-
-Thread-A: CompareExchange(ref _drainScheduled, 1, 0)
-Thread-B: CompareExchange(ref _drainScheduled, 1, 0)
-
-두 스레드가 동시에 실행해도:
-  Thread-A가 먼저 성공: _drainScheduled = 1 반환됨, 0 → 1 변경
-  Thread-B: 현재값이 이미 1이므로 실패, 1 반환됨 → return
-
-결과: Thread-A만 scheduleDrain 호출!
-      → 워커 큐에 Drain이 딱 한 번만 추가됨!
-```
-
----
-
-## 7.5 Drain — 순서대로 처리
-
-```csharp
-private void Drain()
-{
-    try
-    {
-        // 큐에 있는 모든 항목 순서대로 처리 (Abort 되면 즉시 중단)
-        while (Volatile.Read(ref _aborted) == 0 && _queue.TryDequeue(out var item))
-        {
-            try
-            {
-                _handler(item);  // 실제 처리!
-            }
-            catch (Exception ex)
-            {
-                if (_onError is not null) _onError(ex);
-                else JobLog.Error("Sequencer handler error", ex);
-            }
-        }
-    }
-    finally
-    {
-        // ① CAS로 드레인 권한 해제
-        Volatile.Write(ref _drainScheduled, 0);
-
-        // ② 마지막 dequeue 와 ① 사이에 들어온 항목도 반드시 실행되어야 한다.
-        //    ★ _stopped 는 일부러 조건에서 뺐다. Stop() 은 "새 항목 거부"이지
-        //      "이미 받은 것을 버려라"가 아니다. 여기에 _stopped 검사가 있던 것이
-        //      세션의 마지막 disconnect 마커를 잃던 원인이었다 (P0-4).
-        if (!_queue.IsEmpty && Volatile.Read(ref _aborted) == 0)
-            TryScheduleDrain();  // ③ 다시 예약
-    }
-}
-```
-
-Drain과 Enqueue 간의 race condition 처리:
-
-```
-Drain 실행 중:
-
-  [큐: A, B, C]
-  Drain: A 처리 → B 처리 → C 처리 → 큐 비었음
-
-           ↑ 이 사이에 Thread-X가 D를 Enqueue!
-
-  Drain finally:
-    _drainScheduled = 0   ← 권한 해제
-    !_queue.IsEmpty?       ← D가 있음!
-    TryScheduleDrain()     ← 다시 예약!
-
-  → D도 처리됨!
-
-
-만약 순서가 반대라면?
-
-  Thread-X가 D를 Enqueue하고 TryScheduleDrain 호출
-  이때 _drainScheduled = 1 (Drain 중) → 예약 실패, 리턴
-
-  Drain finally:
-    _drainScheduled = 0
-    !_queue.IsEmpty?   ← D가 있음! (Drain이 while 루프 끝낸 후)
-    TryScheduleDrain() ← 예약!
-
-  → D도 처리됨!
-```
-
----
-
-## 7.6 Stop 과 Abort — 종료의 두 가지 의미
-
-```csharp
-/// <summary>새 항목만 거부한다. 이미 받은 것은 순서대로 전부 처리된다.</summary>
-public void Stop()
-{
-    if (Interlocked.Exchange(ref _stopped, 1) != 0)
-        return;
-
-    // 플래그를 뒤집는 동안 producer 가 넣었을 수 있다 → 드레인을 확실히 예약한다
-    if (!_queue.IsEmpty && Volatile.Read(ref _aborted) == 0)
-        TryScheduleDrain();
-}
-
-/// <summary>새 항목을 거부하고, 남아 있는 것도 전부 버린다.</summary>
-/// <returns>버린 항목 수.</returns>
-public int Abort()
-{
-    Volatile.Write(ref _stopped, 1);
-    Volatile.Write(ref _aborted, 1);
-
-    var discarded = 0;
-    while (_queue.TryDequeue(out _)) discarded++;
-    return discarded;
-}
-```
-
-```
-Stop()   "문을 닫는다. 안에 있는 손님은 다 받는다."
-         → 정상적인 세션 종료. 마지막 패킷·disconnect 마커까지 처리된다.
-
-Abort()  "문을 닫고 안에 있는 것도 내보낸다."
-         → 소켓이 이미 죽었거나 하드 셧다운. 남은 항목이 절대 실행되면 안 될 때만.
-```
-
-### P0-4 — 유령 플레이어를 만들던 버그
-
-예전 `Drain`의 `finally` 는 재스케줄 조건에 `_stopped == 0` 을 포함했습니다. 그래서 아래
-인터리빙에서 **이미 받아들인 항목이 영원히 처리되지 않았습니다.**
-
-```
-워커 스레드                          IO 스레드                    다른 스레드
-──────────────────────────────────────────────────────────────────────────
-Drain: while 루프 종료
-  (큐가 비었다고 판단)
-                                     Enqueue(DisconnectMarker)
-                                       _stopped == 0 → 큐에 추가 ✔
-                                       TryScheduleDrain
-                                         → _drainScheduled == 1 이므로 return
-                                                                  Stop() → _stopped = 1
-finally:
-  _drainScheduled = 0
-  !_queue.IsEmpty  → true (마커가 있다)
-  _stopped == 0    → false ← ★ 여기서 버려졌다
-  → 재예약 안 함
-
-결과: DisconnectMarker 가 영원히 처리되지 않음
-      → RemovePlayer 가 호출되지 않음
-      → 접속이 끊긴 플레이어가 월드에 남는다 (프로세스 종료까지)
-```
-
-`Enqueue`가 `true`를 돌려줬다는 것은 "받아들였다"는 약속입니다. 그 약속을 `Stop()`이 깨고
-있었습니다. 지금은 조건에서 `_stopped` 를 빼고 `Abort()` 를 별도로 두어, 문서와 구현이
-같은 말을 합니다.
-
-```csharp
-// NetworkServer.cs — 이 순서가 이제 안전하다
-private void HandleDisconnect()
-{
-    // 이미 도착한 패킷들 뒤에 마커를 넣는다
-    if (!_packetSequencer.Enqueue(DisconnectMarker) && PlayerId != 0)
-    {
-        // false = 이미 Stop 된 sequencer (서버 셧다운 중) → 직접 정리
-        _server.World.RemovePlayer(PlayerId);
-    }
-
-    Close();   // 내부에서 _packetSequencer.Stop() 을 부른다
-}
-```
-
-`Enqueue`의 반환값을 확인하는 부분에 주목하세요. 거부됐을 때의 대체 경로가 있어야
-어느 경우에도 플레이어가 남지 않습니다.
-
----
-
-## 7.7 실제 사용 예시 (AdvancedMmorpgServer)
-
-```csharp
-// NetworkServer.cs 에서 — 각 클라이언트 세션마다 Sequencer 생성
-public sealed class ClientSession
-{
-    private readonly Sequencer<string> _packetSequencer;
-
-    public ClientSession(long connId, TcpClient tcp, GameServer server, ...)
-    {
-        // ★ JobSystem 을 넘기는 생성자 — drain 이 워커 풀로 직접 예약된다
-        _packetSequencer = new Sequencer<string>(
-            server.System,
-            handler: HandleOnePacket,
-            onError: ex => JobLog.Error($"[session #{connId}] packet handling failed", ex));
-    }
-
-    // IO(수신) 스레드에서 호출 — push 만 하고 즉시 반환
-    private void RecvLoop()
-    {
-        // ... 한 줄을 파싱할 때마다
-        _packetSequencer.Enqueue(line);
-    }
-
-    // 워커 스레드에서, 도착 순서대로, 한 번에 하나씩 호출된다
-    private void HandleOnePacket(string line)
-    {
-        if (ReferenceEquals(line, DisconnectMarker))
-        {
-            if (PlayerId != 0)
-                _server.World.RemovePlayer(PlayerId);
+        if (!_rooms.TryGetValue(_userRoom[userId], out var room))
             return;
-        }
-        PacketHandler.Handle(_server, this, line);
+
+        // Room Actor에게 메시지 패싱 (즉시 반환!)
+        room.BroadcastChat(userId, content);
+        // room의 DoAsync가 내부적으로 호출됨
+    }
+}
+
+// ❌ 피해야 할 패턴
+public class Server : AsyncExecutable
+{
+    private void ProcessUserChat(string userId, string content)
+    {
+        // Room의 내부 상태를 직접 접근!
+        foreach (var user in room._users)  // ← race condition!
+            user.Send(content);
     }
 }
 ```
 
-> **v2.0 에서는 이랬다**
-> `scheduleDrain: action => GameWorker.InboundCommands.Enqueue(action)` — 사용자가 만든
-> static 중계 큐에 넣고, `IRunnable.Run` 루프가 그것을 꺼내 실행했습니다. 이제
-> `Sequencer(system, handler, onError)` 가 그 배선을 대신합니다.
+actor 안에서 다른 actor 의 **결과가 필요하면** 기다리지 말고 콜백을 요청하세요.
 
----
+```csharp
+// ❌ actor 안에서 결과를 기다린다 → 데드락 (가드가 예외를 던진다)
+private void ProcessSomething() => _ = room.GetSnapshot();
 
-## 7.8 Sequencer 동작 전체 흐름
-
-```mermaid
-sequenceDiagram
-    participant IO1 as IO 스레드1
-    participant IO2 as IO 스레드2
-    participant S as Sequencer
-    participant JS as JobSystem ready 큐
-    participant WR as 워커 스레드
-
-    IO1->>S: Enqueue(EnterZone)
-    S->>S: ConcurrentQueue.Enqueue
-    S->>S: CAS 성공 (_drainScheduled=1)
-    S->>JS: system.Post(Drain)
-
-    IO2->>S: Enqueue(Move)
-    S->>S: ConcurrentQueue.Enqueue
-    S->>S: CAS 실패 (이미 1) → return
-
-    WR->>JS: DrainReady() 에서 Drain 꺼냄
-    WR->>S: Drain() 실행
-    S->>S: handler(EnterZone)
-    S->>S: handler(Move)
-    S->>S: 큐 비었음 → _drainScheduled=0
-    S->>S: 남은 항목 재확인 → 없으면 종료
+// ✅ 결과를 내 큐로 보내 달라고 부탁한다
+private void ProcessSomething() => room.RequestSnapshot(replyTo: this);
 ```
 
 ---
 
-## 7.9 정리
+## 7.5 패턴 4: 주기 작업은 DoAsyncEvery
+
+```csharp
+public class SomeActor : AsyncExecutable
+{
+    private ITimerHandle? _heartbeat;
+
+    public void StartHeartbeat(TimeSpan period)
+        => DoAsync(() => _heartbeat = DoAsyncEvery(period, HeartbeatTick));
+
+    private void HeartbeatTick()
+    {
+        DoWork();     // 재예약 코드가 없다. 예외가 나도 다음 틱이 온다.
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        _heartbeat?.Cancel();      // 플래그가 아니라 진짜 취소
+        await base.DisposeAsync();
+    }
+}
+```
 
 ```
-이번 장에서 배운 것
-──────────────────────────────────────────────
-✓ 여러 IO 스레드에서 같은 Actor에 동시 push 시
-  순서가 뒤집힐 수 있음
-✓ Sequencer<T>로 Enqueue 순서 보장
-✓ CAS(Compare-And-Swap)로 단 하나만 draining
-✓ Sequencer(system, handler, onError) 생성자 =
-  drain 을 워커 풀에 직접 예약 (중계 큐 불필요)
-✓ Enqueue 는 bool 반환 — 거부됐는지 호출자가 알 수 있다
-✓ Drain → 권한 해제 → 남은 항목 체크 → 재예약
-  (새 Enqueue와의 race condition 안전하게 처리)
-✓ Stop() = "새 항목만 거부". 이미 받은 것은 전부 처리된다 (P0-4 수정)
-✓ Abort() = 남은 항목까지 폐기, 버린 개수 반환
+자기복제 패턴(DoAsyncAfter 로 자기 자신 재예약)이 남긴 문제
+──────────────────────────────────────────────────────────
+① 틱 안에서 예외 한 번 → 재예약 줄에 도달 못 함 → 영구 정지 (7.7 함정 6)
+② "끝난 시각 + period" 라서 드리프트가 쌓인다
+③ 종료 시 _stopped 플래그로 "발화는 하되 무시" → 드레인이 끝나지 않는다
 ```
 
 ---
 
-*[← Chapter 06](./chapter06.md) | [→ Chapter 08: 설정·모니터링·로깅](./chapter08.md)*
+## 7.6 패턴 5: 비동기 작업 (DB/Redis/HTTP)
+
+```csharp
+public class Account : AsyncExecutable
+{
+    private int _gold;
+
+    // ✅ actor 큐 안에서 await 한다 — continuation 이 이 actor 의 큐로 돌아온다
+    public Task<bool> PurchaseAsync(int itemId, int price)
+        => AskAsync(async () =>
+        {
+            if (_gold < price) return false;         // ① actor 큐 (안전)
+
+            var ok = await _db.ChargeAsync(_id, price);   // ② await
+
+            if (ok) _gold -= price;                  // ③ 다시 actor 큐 (안전)
+            return ok;
+        });
+}
+```
+
+```
+AsyncReentrancy.Interleaved (기본값)
+  await 중에 이 actor 의 다른 작업이 실행된다 → 처리량이 높다.
+  ③ 시점의 _gold 는 ① 때와 다를 수 있다는 것을 전제로 코드를 쓸 것.
+
+AsyncReentrancy.Exclusive
+  async 작업이 끝날 때까지 actor 가 아무것도 하지 않는다 → 추론이 쉽다.
+  단, 느린 await 하나가 actor 전체를 멈춘다.
+```
+
+---
+
+## 7.7 흔한 함정과 해결책
+
+### 함정 1: 큐 안에서 느린 작업
+
+```csharp
+// ❌ 문제: DoAsync 안에서 Thread.Sleep / 동기 IO
+public void DoSlowWork()
+    => DoAsync(() =>
+    {
+        Thread.Sleep(1000);  // ← 큐 블로킹! 다른 작업이 1초 대기
+        ProcessWork();
+    });
+
+// ✅ 해결 A: 비동기로 (continuation 이 큐로 돌아온다)
+public Task DoSlowWorkAsync()
+    => RunAsync(async () => { await Task.Delay(1000); ProcessWork(); });
+
+// ✅ 해결 B: 나눠서 예약
+public void DoSlowWork()
+{
+    DoAsync(() => ProcessWorkPart1());
+    DoAsyncAfter(TimeSpan.FromSeconds(1), () => ProcessWorkPart2());
+}
+```
+
+`JobSystemOptions.MaxJobDuration` 을 설정해 두면 이런 작업을 로그로 잡아낼 수 있습니다:
+
+```
+[JobDispatcherNET][Warn] Actor 'Npc#42' job ran 137.4ms (limit 50ms)
+```
+
+### 함정 2: 큐 안에서 동기 대기 (데드락)
+
+```csharp
+// ❌ 문제: 그 작업을 처리해 줄 스레드가 바로 지금 멈춰 있는 이 스레드다
+private void ProcessSomething()      // Actor-A 큐 안
+{
+    var snap = actorB.GetSnapshot();       // AskSync → InvalidOperationException
+    var v = actorB.SomethingAsync().Result; // .Result / .Wait() 도 같은 데드락
+}
+
+// ✅ 해결: Actor→Actor 메시지 패싱
+private void ProcessSomething()
+{
+    actorB.RequestData(this);   // actorB 가 결과를 이쪽 큐로 DoAsync 해 준다
+}
+```
+
+`AskSync` 는 이 실수를 예외로 알려주지만, `.Result` / `.Wait()` / `lock` 은
+라이브러리가 막을 수 없습니다. 직접 만든 블로킹 API 앞에는
+`JobDiagnostics.GuardBlockingWait(system, nameof(MyApi))` 를 넣어 두세요.
+
+### 함정 3: 공유 가변 컬렉션
+
+```csharp
+// ❌ 문제: 여러 Actor가 동시 접근
+private List<int> _sharedList = new();  // 스레드 안전하지 않음!
+
+// ✅ 해결 방법 1: ConcurrentDictionary/ConcurrentBag (여러 actor 가 정말 공유해야 할 때)
+private readonly ConcurrentDictionary<int, Entity> _lookup = new();
+
+// ✅ 해결 방법 2: 읽기도 큐 통과
+public Task<List<int>> GetItemsAsync() => Ask(() => new List<int>(_items));
+```
+
+### 함정 4: 셧다운 순서
+
+```csharp
+// ❌ 잘못된 순서
+dispatcher.Dispose();            // 워커 종료
+actor.DisposeAsync().Wait();     // 이미 워커 없음 → 큐를 비울 사람이 없다 → 영구 대기!
+
+// ❌ 예전 방식 (v2.0) — 4단계 수동, 전역 static 게이트
+AsyncExecutable.AcceptingWork = false;
+actor.DisposeAsync().Wait();
+dispatcher.Dispose();
+TimerRegistry.DisposeAll();      // 지금은 no-op
+
+// ✅ 지금 방식 — 한 줄
+_network.Stop();                             // 외부 입력 차단
+_world.Stop();                               // despawn + 타이머 Cancel
+await system.StopAsync(TimeSpan.FromSeconds(10));   // 드레인 → 타이머 → 워커
+```
+
+**`StopAsync` 전에 주기 타이머를 취소해야 합니다.** 취소하지 않으면 타이머가 계속 새 작업을
+만들어 내므로 드레인이 타임아웃까지 갑니다.
+
+### 함정 5: DoAsync 의 반환값 무시 ★
+
+```csharp
+// ❌ 문제: 큐가 만원이어도, 셧다운 중이어도 그냥 지나간다
+public void OnPacket(Packet p) => _actor.DoAsync(() => Handle(p));
+//                                ↑ bool 반환값을 버리고 있다
+
+// ✅ 해결: 거부를 하나의 정상적인 결과로 다룬다
+public void OnPacket(Packet p)
+{
+    if (!_actor.DoAsync(static t => t.Self.Handle(t.P), (Self: this, P: p)))
+    {
+        // 클라이언트에게 백프레셔를 알리거나, 세션을 끊거나, 카운터를 올린다
+        _session.SendBusy();
+    }
+}
+```
+
+`MaxQueueSize` 를 설정해 놓고 반환값을 무시하면, "메모리는 지켰지만 패킷이 조용히
+사라지는" 서버가 됩니다. **어느 쪽이든 눈에 보이게 만드세요** — `OnDropped` 콜백과
+`TotalJobsDropped` 메트릭이 그래서 있습니다.
+
+### 함정 6: 자기복제 타이머 체인이 예외 하나로 죽는다 ★
+
+```csharp
+// ❌ 문제
+private void Tick()
+{
+    UpdateAi();                              // ← 여기서 예외
+    DoAsyncAfter(_interval, Tick);           // ← 도달하지 못함 → 이 NPC 영구 정지
+}
+
+// ✅ 해결: DoAsyncEvery
+_tickTimer = DoAsyncEvery(_interval, Tick);  // 예외가 나도 다음 틱이 온다
+```
+
+굳이 자기복제를 유지해야 한다면 최소한 `try/finally` 로 재예약을 보장하세요. 하지만
+`DoAsyncEvery` 가 드리프트까지 해결해 주므로 그럴 이유가 거의 없습니다.
+
+### 함정 7: 비-워커 스레드가 actor 를 hijack 한다 ★
+
+```csharp
+// 소켓 수신 스레드에서
+void OnPacketReceived(Packet p) => _world.HandleMove(p.Id, p.X, p.Y);
+```
+
+`_world` 가 idle 상태였다면, **이 소켓 스레드가 월드의 leader 가 되어 게임 로직 전체를
+그 자리에서 실행합니다.** 그동안 이 소켓의 수신은 멈춥니다.
+
+```csharp
+// ✅ 해결 A: 그 actor 를 Scheduled 모드로
+new JobOptions { Mode = ExecutionMode.Scheduled, System = system }
+
+// ✅ 해결 B: 워커에 명시적으로 넘긴다
+system.Post(() => _world.HandleMove(p.Id, p.X, p.Y));
+
+// ✅ 해결 C: 세션 단위 순서 보장까지 필요하면 Sequencer
+_sequencer = new Sequencer<Packet>(system, handler: HandleOnePacket);
+```
+
+```
+언제 ExecutionMode.Scheduled 를 쓰나
+──────────────────────────────────────────────────────────
+쓴다:   소켓 IO 스레드 / ThreadPool continuation / ASP.NET 요청 스레드 /
+        콘솔·관리 스레드가 직접 찌르는 actor (보통 월드·존·서버 같은 상위 actor)
+안 쓴다: 워커 안에서 actor → actor 로만 불리는 actor
+        (LeaderFlush 가 지연이 가장 짧다. Scheduled 로 두면 ready 큐를
+         한 번 경유하는 비용만 늘어난다)
+```
+
+### 함정 8: interleaved async 작업에서 ConfigureAwait(false) ★
+
+```csharp
+// ❌ 문제
+public Task SaveAsync()
+    => RunAsync(async () =>
+    {
+        await _db.WriteAsync(_state).ConfigureAwait(false);   // ← actor 를 떠난다
+        _lastSavedAt = DateTime.UtcNow;   // ThreadPool 스레드에서 actor 상태를 건드린다!
+    });
+
+// ✅ 해결: actor 작업 안에서는 ConfigureAwait(false) 를 쓰지 않는다
+public Task SaveAsync()
+    => RunAsync(async () =>
+    {
+        await _db.WriteAsync(_state);     // continuation 이 이 actor 의 큐로 돌아온다
+        _lastSavedAt = DateTime.UtcNow;   // 안전
+    });
+```
+
+`AsyncReentrancy.Interleaved`(기본값)는 actor 전용 `SynchronizationContext` 로 continuation 을
+큐에 되돌립니다. `ConfigureAwait(false)` 는 정확히 그 장치를 끄는 스위치입니다.
+라이브러리 코드에서는 옳은 습관이지만 **actor 작업 본문 안에서는 정반대**입니다.
+(`AsyncReentrancy.Exclusive` 를 쓰면 actor 가 통째로 멈춰 있으므로 continuation 이 어디서
+돌든 안전합니다.)
+
+---
+
+## 7.8 성능 체크리스트
+
+```
+□ hot path에 DoAsync<TState> 사용 (초당 수천 번 이상 호출 시)
+□ MaxQueueSize 설정 (모든 Actor에) + 반환값 false 처리
+□ Job.MaxPoolSize 튜닝 (최대 동시 작업 수 기준)
+□ 주기 작업은 DoAsyncEvery + initialDelay 로 분산
+□ 네트워크/ThreadPool 진입점 actor 는 ExecutionMode.Scheduled
+□ 한 actor 가 워커를 독점하면 JobOptions.MaxJobsPerFlush 설정
+□ 사용자 루프가 필요 없으면 비제네릭 JobDispatcher (Thread.Sleep(1) 폴링 제거)
+□ AsyncExecutable.MaxFlushSpinIterations 튜닝
+  (producer 의 CAS~Enqueue 창을 얼마나 스핀으로 견딜지)
+□ system.Metrics.Snapshot()으로 정기 메트릭 수집
+□ 지연 분포가 필요하면 EnableDetailedMetrics (기본 off — 비용 있음)
+□ IJobLogger를 상용 로거(Serilog 등)로 교체
+```
+
+---
+
+## 7.9 운영 모니터링 체크리스트
+
+```
+정기적으로 확인할 메트릭 (system.Metrics.Snapshot() 또는 meter "JobDispatcherNET")
+──────────────────────────────────────────────────────────────────────────
+□ TotalJobsDropped 증가   → 큐 만원/셧다운/faulted 중 무엇인지 OnDropped 로 구분
+                            (jobdispatcher.jobs.dropped)
+□ TotalJobsFailed 증가    → 예외 로그 확인 (jobdispatcher.jobs.failed)
+□ ActorsFaulted > 0       → MaxConsecutiveFailures 를 넘긴 actor 존재.
+                            원인 조사 후 ClearFault() (jobdispatcher.actors.faulted)
+□ WorkerRestarts 증가     → 워커 크래시. 로그의 "while running actor 'X'" 를 볼 것
+                            (jobdispatcher.worker.restarts)
+□ LiveWorkers < 설정값     → 영구 정지된 슬롯 존재. RestartCountResetAfter 확인
+                            (jobdispatcher.workers.live)
+□ ReadyQueueDepth 상승    → 워커 부족 또는 특정 actor 독점 (jobdispatcher.ready.depth)
+□ InFlightJobs 상승       → 유입 > 처리. 병목 actor 를 RemainingTaskCount 로 찾는다
+                            (jobdispatcher.jobs.inflight)
+□ PendingTimerJobs 상승   → 타이머 예약이 쌓인다. 취소를 빼먹은 곳이 있는지 확인
+                            (jobdispatcher.timers.pending)
+□ TimersDiscarded 급증    → 종료 시 살아 있던 예약이 많다 = Despawn 에서 Cancel 누락
+                            (jobdispatcher.timers.discarded)
+□ ActiveJobPoolSize 급감  → 풀보다 in-flight 가 많다. Job.MaxPoolSize 상향 검토
+                            (jobdispatcher.pool.size)
+□ (상세) job.duration p99 → 느린 작업. MaxJobDuration 경고 로그와 함께 본다
+□ (상세) timer.lag p99    → 타이머 정확도. TimerPrecision 조정 판단 근거
+──────────────────────────────────────────────────────────────────────────
+dotnet-counters monitor --process-id <PID> --counters JobDispatcherNET
+```
+
+---
+
+## 7.10 언제 JobDispatcherNET이 적합한가?
+
+```
+✅ 잘 맞는 경우:
+  - 게임 서버 (특히 MMORPG, 실시간 멀티플레이어)
+  - 플레이어/엔티티 단위의 독립적 상태 관리
+  - lock 없는 고성능 서버가 필요할 때
+  - Actor 모델로 설계하는 시스템
+  - 전용 OS 스레드 위의 결정적인 실행이 중요한 워크로드
+
+⚠️ 주의가 필요한 경우:
+  - 단순 request-response 서버 (ASP.NET Core가 더 적합)
+  - 주로 I/O 바운드 작업 (Task/await가 더 적합)
+  - Actor 경계를 명확히 나누기 어려운 복잡한 트랜잭션
+
+❌ 맞지 않는 경우:
+  - 분산 시스템 (다른 프로세스 간 Actor → Orleans, Akka.NET)
+  - 데이터베이스 트랜잭션 중심 로직
+  - 단일 스레드로 충분한 간단한 앱
+```
+
+---
+
+## 7.11 아키텍처 결정 참고 표
+
+```
+상황                          권장 도구
+────────────────────────────  ──────────────────────────────────
+플레이어 상태 관리            PlayerActor (AsyncExecutable)
+NPC AI 관리                   NpcActor + DoAsyncEvery
+방/존 관리                    Room/Zone Actor (+ ExecutionMode.Scheduled)
+패킷 수신 순서 보장           Sequencer<T>(system, handler)
+워커 풀 (사용자 루프 없음)     JobDispatcher (비제네릭)
+전용 게임 루프 스레드          IRunnable + JobDispatcher<T>
+IO 스레드 → 워커 전달          JobSystem.Post(Action)
+지연 실행                     DoAsyncAfter → ITimerHandle
+주기 실행                     DoAsyncEvery → ITimerHandle
+외부 상태 읽기 (async)         Ask<TResult>
+외부 상태 읽기 (동기)          AskSync<TResult>(func, timeout)
+DB/HTTP 접근                  RunAsync / AskAsync
+큐 폭주 방어                  JobOptions.MaxQueueSize + OnDropped
+한 actor 의 워커 독점 방지     JobOptions.MaxJobsPerFlush
+폭주 actor 격리               JobOptions.MaxConsecutiveFailures
+actor 단위 오류 처리           protected override OnJobError
+워커 자동 복구                JobDispatcherOptions.RestartFailedWorkers
+프로세스 내 격리된 풀 2개      JobSystem 인스턴스 2개
+우아한 종료                   system.StopAsync(drainTimeout)
+서버 간 큐 (분산)             → RabbitMQ, Redis 등 외부 솔루션
+```
+
+---
+
+## 7.12 최종 정리 — 한눈에 보는 JobDispatcherNET
+
+```
+JobDispatcherNET 핵심 컴포넌트
+═══════════════════════════════════════════════════════════
+
+JobSystem ─── 워커·타이머·메트릭·셧다운 게이트의 소유자
+  Default             → 암묵적 프로세스 기본 시스템
+  Post(Action)        → 워커에서 Action 실행
+  StopAsync(timeout)  → 드레인 → 타이머 정지 → 워커 정지
+  DrainAsync(timeout) → 정적 상태가 될 때까지 대기
+  Metrics             → 이 시스템의 카운터
+  AcceptingWork       → 셧다운 게이트
+
+AsyncExecutable ─── 모든 Actor의 기반
+  DoAsync()           → 작업 등록 (bool 반환 — 반드시 확인)
+  DoAsync<T>()        → 클로저 없는 최적화 버전
+  DoAsyncAfter()      → 지연 실행 → ITimerHandle
+  DoAsyncEvery()      → 주기 실행 → ITimerHandle
+  Ask() / AskSync()   → 결과 회수
+  RunAsync() / AskAsync() → await 하는 작업
+  OnJobError()        → actor 단위 오류 처리 (override)
+  IsFaulted / ClearFault() → 연속 실패 격리
+  DisposeAsync()      → 이 actor 만 드레인 후 종료
+
+JobDispatcher ─── 전용 OS 스레드 N개 (사용자 루프 없음)
+  RunWorkerThreadsAsync() → 워커 시작 (1회만)
+  TryStop(timeout)        → 종료 + 성공 여부 반환
+  (내장) 수퍼바이저       → 크래시 자동 재기동 + 예산 회복
+
+JobDispatcher<T> / IRunnable ─── 자체 루프가 필요할 때
+  Run(CancellationToken) → true:계속 / false:종료
+
+Sequencer<T> ─── IO 스레드 → 워커 순서 보장
+  Sequencer(system, handler, onError)
+  Enqueue(T) → bool     → 거부되면 false
+  Stop()                → 새 항목만 거부 (받은 것은 전부 처리)
+  Abort()               → 남은 항목까지 폐기, 버린 수 반환
+
+ITimerHandle ─── 취소 가능한 타이머
+  Cancel() / IsPending
+
+JobOptions ─── Actor 설정
+  Name / System / MaxQueueSize / DropPolicy / OnDropped(actor, reason)
+  Mode(LeaderFlush|Scheduled) / MaxJobsPerFlush
+  MaxConsecutiveFailures / AsyncReentrancy
+
+JobSystemOptions ─── 시스템 설정
+  Name / TimerPrecision / EnableDetailedMetrics / PublishMeter
+  DetectBlockingWaitOnWorker / MaxJobDuration / Logger
+
+JobMetrics ─── 운영 메트릭 (system.Metrics)
+  Snapshot() → 처리/거부/실패/타이머/워커/큐 깊이
+  meter "JobDispatcherNET" 로 자동 노출
+
+JobDiagnostics ─── 데드락 가드
+  GuardBlockingWait / IsInsideActorJob / CurrentActor / IsWorkerThread
+
+IJobLogger ─── 로깅
+  ConsoleJobLogger (기본) / NullJobLogger / 커스텀
+═══════════════════════════════════════════════════════════
+```
+
+---
+
+## 7.13 마무리
+
+JobDispatcherNET은 "락 없는 게임 서버"를 향한 실용적인 도구입니다.
+
+핵심 아이디어는 단순합니다:
+
+> **각 객체가 자신만의 큐를 가지고, 그 큐에서만 상태를 변경한다.**
+
+이 원칙 하나에서 다음 모든 것이 따라옵니다:
+- lock 없는 안전한 상태 관리
+- 객체 간 병렬 처리
+- 데드락 없는 협업
+- 예측 가능한 실행 순서
+
+그리고 v2.1 이 더한 것은 **"그 원칙이 깨지는 지점을 라이브러리가 알려준다"** 입니다.
+큐가 만원이면 이유와 함께 알려주고, actor 안에서 블로킹하면 예외를 던지고, 워커가 죽어도
+타이머는 살아남고, 종료는 실제로 끝났는지 확인해서 알려줍니다.
+
+이 책에서 배운 패턴들을 실제 프로젝트에 적용하면서, 직접 경험을 쌓아나가시길 바랍니다.
+
+---
+
+```
+          감사합니다!
+          ────────────────────────────────────────
+          이 책의 모든 예제는 F:\github\JobDispatcherNET
+          에서 직접 실행해볼 수 있습니다.
+          ────────────────────────────────────────
+```
+
+---
+
+*[← 제6장: MMORPG 서버의 기본 구조와 고급 패턴](./chapter06.md) | [↑ 목차](./README.md)*
